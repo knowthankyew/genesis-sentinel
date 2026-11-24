@@ -669,27 +669,70 @@ func TestPipelineLongServiceNamesDoNotCollideOnTier1JoinKey(t *testing.T) {
 		t.Fatalf("expected both Tier 0 (svcA) and Tier 1-only (svcB) alerts without key collision, got %+v", alerts)
 	}
 
-	// Verify SaveBaseline serializes cleanly under burnMu with concurrent Burn().
+	// Verify SaveBaseline serializes cleanly under burnMu with concurrent Burn():
+	// regardless of lock acquisition order, Burn clears dirtyDisk and deletes baseline.json,
+	// so baseline.json MUST be absent immediately after wg.Wait() without any second Burn().
 	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
-	if err := pipe.SaveBaseline(baselinePath, true); err != nil {
-		t.Fatalf("SaveBaseline: %v", err)
-	}
-	var wg sync.WaitGroup
+	pipe.SurprisalEngine().LearnBaseline(model.TemplateWindow{TemplateID: "t-dirty", Service: "nginx", Level: "INFO", SampleLine: "ok"})
+	var (
+		saveErr error
+		burnErr error
+		wg      sync.WaitGroup
+	)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_ = pipe.SaveBaseline(baselinePath, false)
+		saveErr = pipe.SaveBaseline(baselinePath, false)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = pipe.Burn()
+		_, burnErr = pipe.Burn()
 	}()
 	wg.Wait()
-	// Final Burn after all concurrent writers guarantees baseline.json is gone and stays gone.
-	if _, err := pipe.Burn(); err != nil {
-		t.Fatalf("final Burn: %v", err)
+	if saveErr != nil || burnErr != nil {
+		t.Fatalf("concurrent SaveBaseline/Burn errors: saveErr=%v burnErr=%v", saveErr, burnErr)
 	}
 	if _, err := os.Stat(baselinePath); !os.IsNotExist(err) {
-		t.Fatal("baseline.json survived serialized Burn")
+		t.Fatal("baseline.json reappeared after concurrent SaveBaseline + Burn")
+	}
+}
+
+func TestPipelinePatternSuppressedEventSkippedByTier1(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.SurprisalThreshold = 5.0
+
+	pack := rules.DefaultRulePack()
+	pack.Suppressions = append(pack.Suppressions, rules.Suppression{
+		ID:      "SUP-MAINT",
+		Pattern: "maintenance relay",
+	})
+	ruleEng, err := rules.NewEngine(pack)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	for w := 0; w < 22; w++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID: uint64(w + 1), Timestamp: 1763996000 + int64(w*10),
+			Service: "nginx", Level: "INFO", Message: "GET /healthz HTTP/1.1 200 3ms",
+		})
+		_, _ = pipe.FlushWindow()
+	}
+	baseBefore := pipe.Stats().SurprisalBaselineCases
+
+	// Pattern-suppressed ERROR from an unseen service must neither fire a Tier 1 alert nor learn into baseline.
+	pipe.IngestEvent(model.LogEvent{
+		ID: 8001, Timestamp: 1763997000,
+		Service: "unseen-maint-svc", Level: "ERROR",
+		Message: "maintenance relay connection reset during scheduled window",
+	})
+	alerts, failed := pipe.FlushWindow()
+	if len(alerts) != 0 || len(failed) != 0 {
+		t.Fatalf("expected pattern-suppressed event to produce 0 Tier 1 alerts, got alerts=%+v failed=%+v", alerts, failed)
+	}
+	if got := pipe.Stats().SurprisalBaselineCases; got != baseBefore {
+		t.Fatalf("expected pattern-suppressed event not to enter baseline (%d -> %d)", baseBefore, got)
 	}
 }

@@ -45,19 +45,25 @@ func NewHTTPClient(baseURL string, timeout time.Duration, allowRemote bool) (*HT
 	if err != nil {
 		return nil, fmt.Errorf("parse surprisal-service URL %q: %w", trimmed, err)
 	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("surprisal-service base URL must not contain embedded userinfo or credentials")
+	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported surprisal-service URL scheme %q (expected http or https)", parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return nil, fmt.Errorf("surprisal-service URL %q is missing host", trimmed)
+		return nil, fmt.Errorf("surprisal-service URL is missing host")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, fmt.Errorf("surprisal-service base URL %q must not include query parameters or fragments", trimmed)
+		return nil, fmt.Errorf("surprisal-service base URL must not include query parameters or fragments")
 	}
 	if !allowRemote && !security.IsLoopbackEndpoint(parsed.String()) {
-		return nil, fmt.Errorf("refusing non-loopback surprisal-service URL %q without allow_remote_endpoints=true", parsed.String())
+		return nil, fmt.Errorf("refusing non-loopback surprisal-service URL %q without allow_remote_endpoints=true", parsed.Redacted())
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	if parsed.RawPath != "" {
+		parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	}
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeout
 	}
@@ -71,6 +77,19 @@ func NewHTTPClient(baseURL string, timeout time.Duration, allowRemote bool) (*HT
 func (c *HTTPClient) endpointURL(suffix string) string {
 	u := *c.baseURL
 	u.Path = c.baseURL.Path + suffix
+	if c.baseURL.RawPath != "" {
+		u.RawPath = c.baseURL.RawPath + suffix
+	}
+	return u.String()
+}
+
+func (c *HTTPClient) redactedEndpointURL(suffix string) string {
+	u := *c.baseURL
+	u.User = nil
+	u.Path = c.baseURL.Path + suffix
+	if c.baseURL.RawPath != "" {
+		u.RawPath = c.baseURL.RawPath + suffix
+	}
 	return u.String()
 }
 
@@ -137,17 +156,19 @@ func (c *HTTPClient) VerifyWindow(
 	for _, rf := range selected {
 		refPayload = append(refPayload, datasetRecordPayload{
 			Prompt:     formatFeatureSummaryPrompt(rf),
-			Completion: "[" + sanitizeTag(rf.Nominal[1]) + "] baseline",
+			Completion: "[" + sanitizeTag(rf.Nominal[1]) + "] log_window",
 			Weight:     1.0,
 		})
 	}
 
+	// Send the exact same structural feature summary format for the candidate as for
+	// reference records (and omit raw log sample text) so identical benign windows score
+	// 0.0 nats against ml/src/surprisal-service and raw log contents never leave local RAM.
 	candFeat := ExtractFeatures(w)
-	cleanSample, _ := security.SanitizeUntrustedLogText(w.SampleLine, 256)
 	payload := verifyRequestPayload{
 		ReferenceRecords:      refPayload,
-		Prompt:                formatFeatureSummaryPrompt(candFeat) + " sample=" + cleanSample,
-		CandidateCompletion:   "[" + sanitizeTag(candFeat.Nominal[1]) + "] window",
+		Prompt:                formatFeatureSummaryPrompt(candFeat),
+		CandidateCompletion:   "[" + sanitizeTag(candFeat.Nominal[1]) + "] log_window",
 		MaxTolerableSurprisal: thresholdNats,
 	}
 
@@ -165,7 +186,7 @@ func (c *HTTPClient) VerifyWindow(
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return VerifyResponse{}, fmt.Errorf("post %s: %w", verifyURL, err)
+		return VerifyResponse{}, fmt.Errorf("post %s: %w", c.redactedEndpointURL("/v1/verify/completion"), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -210,8 +231,12 @@ func (c *HTTPClient) VerifyWindow(
 }
 
 func formatFeatureSummaryPrompt(f LogFeatures) string {
+	cleanSvc, _ := security.SanitizeUntrustedLogText(f.Nominal[0], maxServiceFeatureBytes)
+	cleanLvl, _ := security.SanitizeUntrustedLogText(f.Nominal[1], maxLevelFeatureBytes)
+	cleanTmpl, _ := security.SanitizeUntrustedLogText(f.Nominal[2], maxTemplateFeatureBytes)
+	cleanProto, _ := security.SanitizeUntrustedLogText(f.Nominal[3], maxProtoFeatureBytes)
 	return fmt.Sprintf("svc=%s lvl=%s tmpl=%s proto=%s tok=%.2f len=%.2f ent=%.2f sym=%.2f cnt=%.2f",
-		f.Nominal[0], f.Nominal[1], f.Nominal[2], f.Nominal[3],
+		cleanSvc, cleanLvl, cleanTmpl, cleanProto,
 		f.Continuous[0], f.Continuous[1], f.Continuous[2], f.Continuous[3], f.Continuous[4],
 	)
 }

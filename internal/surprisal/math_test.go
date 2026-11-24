@@ -138,3 +138,22 @@ func TestMathSanitizesNonFiniteAndZeroDelta(t *testing.T) {
 		t.Fatalf("expected %v for mismatched nominal values, got %v", NominalMismatchNats, got)
 	}
 }
+
+func TestOverflowSafeMathOnExtremeFiniteRanges(t *testing.T) {
+	// [-1e308, 1e308]: mean=0, MAD=1e308 (must not overflow to MinDeviationFloor).
+	devs := ComputeDeviations([]map[string]float64{{"x": -1e308}, {"x": 1e308}}, []string{"x"})
+	if math.IsNaN(devs["x"]) || math.IsInf(devs["x"], 0) || math.Abs(devs["x"]-1e308)/1e308 > 1e-12 {
+		t.Fatalf("ComputeDeviations([-1e308, 1e308]) = %v, want 1e308", devs["x"])
+	}
+
+	// Normalized distance u = |1e308 - (-1e308)| / 1e308 = 2 -> 2 + 0.5*exp(-2)*5 - 1.5 ≈ 0.838338208.
+	got := MarginalSurprisalCont(1e308, -1e308, 1e308)
+	want := 2.0 + 0.5*math.Exp(-2.0)*5.0 - 1.5
+	assertClose(t, "MarginalSurprisalCont(1e308, -1e308, 1e308)", got, want)
+
+	// KNNMean of two 1e308 neighbors must remain finite 1e308.
+	km := KNNMean([]float64{1e308, 1e308}, 2)
+	if math.IsNaN(km) || math.IsInf(km, 0) || math.Abs(km-1e308)/1e308 > 1e-12 {
+		t.Fatalf("KNNMean([1e308, 1e308], 2) = %v, want 1e308", km)
+	}
+}

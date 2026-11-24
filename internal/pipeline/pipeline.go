@@ -250,9 +250,14 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	defer p.windowMu.Unlock()
 
 	p.linesRead.Add(1)
+	if evEval.Suppressed {
+		// Pattern- or service-suppressed events must neither trigger Tier 0/Tier 1 alerts
+		// nor enter the Tier 1 rolling baseline.
+		return
+	}
 	tmplID, isOverflow, _ := p.agg.AddWithEntropy(ev, ent)
 
-	if evEval.Suppressed || (len(evEval.Matches) == 0 && !evEval.InjectionSuspected) {
+	if len(evEval.Matches) == 0 && !evEval.InjectionSuspected {
 		return
 	}
 

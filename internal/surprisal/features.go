@@ -95,20 +95,20 @@ func ExtractFeatures(w model.TemplateWindow) LogFeatures {
 	f.Continuous[4] = math.Log1p(float64(cnt))
 
 	// 6. Average inter-arrival delta in milliseconds (log1p scale).
-	// Normalize each endpoint timestamp individually to Unix seconds (supporting
-	// Unix seconds plus contemporary ms/us/ns epochs) BEFORE taking the difference
-	// so two events 1s apart in ms (diff=1000) compute 1000ms rather than 1,000,000ms.
+	// Normalize each endpoint timestamp individually into milliseconds while preserving
+	// subsecond precision for ms/us/ns epochs so identical 100ms bursts produce the same
+	// span regardless of whether they straddle a whole-second boundary.
 	var interArrivalMs float64
 	if cnt <= 1 {
 		interArrivalMs = 1000.0
 	} else {
-		firstSec := normalizeFeatureTimestampSec(w.FirstSeenUnix)
-		lastSec := normalizeFeatureTimestampSec(w.LastSeenUnix)
-		spanSec := lastSec - firstSec
-		if spanSec < 0 {
-			spanSec = 0
+		firstMs := normalizeFeatureTimestampMs(w.FirstSeenUnix)
+		lastMs := normalizeFeatureTimestampMs(w.LastSeenUnix)
+		spanMs := lastMs - firstMs
+		if spanMs < 0 {
+			spanMs = 0
 		}
-		interArrivalMs = (float64(spanSec) * 1000.0) / float64(cnt-1)
+		interArrivalMs = spanMs / float64(cnt-1)
 	}
 	f.Continuous[5] = math.Log1p(interArrivalMs)
 
@@ -131,8 +131,8 @@ func ExtractFeatures(w model.TemplateWindow) LogFeatures {
 	return f
 }
 
-// ComputeLogDeviations computes per-feature MAD substitutability deviations across
-// a slice of LogFeatures with zero heap allocations.
+// ComputeLogDeviations computes overflow-safe per-feature MAD substitutability
+// deviations across a slice of LogFeatures with zero heap allocations.
 func ComputeLogDeviations(cases []LogFeatures) [ContinuousFeatureCount]float64 {
 	var devs [ContinuousFeatureCount]float64
 	n := len(cases)
@@ -143,7 +143,7 @@ func ComputeLogDeviations(cases []LogFeatures) [ContinuousFeatureCount]float64 {
 		return devs
 	}
 
-	var means [ContinuousFeatureCount]float64
+	var scales [ContinuousFeatureCount]float64
 	var counts [ContinuousFeatureCount]int
 	for i := range cases {
 		for k := 0; k < ContinuousFeatureCount; k++ {
@@ -151,32 +151,51 @@ func ComputeLogDeviations(cases []LogFeatures) [ContinuousFeatureCount]float64 {
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				continue
 			}
-			means[k] += v
+			if av := math.Abs(v); av > scales[k] {
+				scales[k] = av
+			}
 			counts[k]++
 		}
 	}
-	for k := 0; k < ContinuousFeatureCount; k++ {
-		if counts[k] > 0 {
-			means[k] /= float64(counts[k])
-		}
-	}
 
-	var absSums [ContinuousFeatureCount]float64
+	var meansScaled [ContinuousFeatureCount]float64
 	for i := range cases {
 		for k := 0; k < ContinuousFeatureCount; k++ {
+			if scales[k] == 0 {
+				continue
+			}
 			v := cases[i].Continuous[k]
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				continue
 			}
-			absSums[k] += math.Abs(v - means[k])
+			meansScaled[k] += v / scales[k]
 		}
 	}
 	for k := 0; k < ContinuousFeatureCount; k++ {
-		if counts[k] == 0 {
+		if counts[k] > 0 && scales[k] > 0 {
+			meansScaled[k] /= float64(counts[k])
+		}
+	}
+
+	var absSumsScaled [ContinuousFeatureCount]float64
+	for i := range cases {
+		for k := 0; k < ContinuousFeatureCount; k++ {
+			if scales[k] == 0 {
+				continue
+			}
+			v := cases[i].Continuous[k]
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			absSumsScaled[k] += math.Abs((v / scales[k]) - meansScaled[k])
+		}
+	}
+	for k := 0; k < ContinuousFeatureCount; k++ {
+		if counts[k] == 0 || scales[k] == 0 {
 			devs[k] = MinDeviationFloor
 			continue
 		}
-		mad := absSums[k] / float64(counts[k])
+		mad := (absSumsScaled[k] / float64(counts[k])) * scales[k]
 		if mad < MinDeviationFloor || math.IsNaN(mad) || math.IsInf(mad, 0) {
 			mad = MinDeviationFloor
 		}
@@ -286,7 +305,9 @@ func extractProtoClass(sample string) string {
 			if key[0] != '"' && !isStatusKeyBoundary(lower, idx) {
 				continue
 			}
-			after := strings.TrimLeft(trimmed[idx+len(key):], " \"")
+			// Slice from `lower` (same string as `idx`) so Unicode case folding that
+			// expands UTF-8 byte lengths (e.g. U+023A Ⱥ) can never exceed slice bounds.
+			after := strings.TrimLeft(lower[idx+len(key):], " \"")
 			if fam := parseHTTPStatusFamily(after); fam != "" {
 				return fam
 			}
@@ -342,20 +363,20 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-func normalizeFeatureTimestampSec(ts int64) int64 {
+func normalizeFeatureTimestampMs(ts int64) float64 {
 	if ts <= 0 {
 		return 0
 	}
 	if ts >= 1_000_000_000_000_000_000 { // contemporary nanoseconds (>= 1e18)
-		return ts / 1_000_000_000
+		return float64(ts) / 1_000_000.0
 	}
 	if ts >= 1_000_000_000_000_000 { // contemporary microseconds (>= 1e15)
-		return ts / 1_000_000
+		return float64(ts) / 1_000.0
 	}
 	if ts >= 1_000_000_000_000 { // contemporary milliseconds (>= 1e12)
-		return ts / 1_000
+		return float64(ts)
 	}
-	return ts
+	return float64(ts) * 1000.0
 }
 
 func isStatusKeyBoundary(s string, idx int) bool {

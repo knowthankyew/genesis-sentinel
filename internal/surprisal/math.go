@@ -39,37 +39,48 @@ type CaseVector struct {
 
 // ComputeDeviations computes empirical Substitutability Deviations (delta) via Mean
 // Absolute Deviation (MAD) around the sample mean for each key in keys, floored at
-// MinDeviationFloor (0.25). Non-finite values are ignored safely.
+// MinDeviationFloor (0.25). Uses max-magnitude scaling to prevent float64 overflow on
+// extreme finite ranges (e.g. [-1e308, 1e308]) and ignores non-finite values safely.
 func ComputeDeviations(cases []map[string]float64, keys []string) map[string]float64 {
 	deviations := make(map[string]float64, len(keys))
 	if len(cases) == 0 {
 		return deviations
 	}
 	for _, k := range keys {
-		var sum float64
+		var scale float64
 		var count int
 		for _, c := range cases {
 			v := c[k]
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				continue
 			}
-			sum += v
+			if av := math.Abs(v); av > scale {
+				scale = av
+			}
 			count++
 		}
-		if count == 0 {
+		if count == 0 || scale == 0 {
 			deviations[k] = MinDeviationFloor
 			continue
 		}
-		mean := sum / float64(count)
-		var absSum float64
+		var sumScaled float64
 		for _, c := range cases {
 			v := c[k]
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				continue
 			}
-			absSum += math.Abs(v - mean)
+			sumScaled += v / scale
 		}
-		mad := absSum / float64(count)
+		meanScaled := sumScaled / float64(count)
+		var absSumScaled float64
+		for _, c := range cases {
+			v := c[k]
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			absSumScaled += math.Abs((v / scale) - meanScaled)
+		}
+		mad := (absSumScaled / float64(count)) * scale
 		if mad < MinDeviationFloor || math.IsNaN(mad) || math.IsInf(mad, 0) {
 			mad = MinDeviationFloor
 		}
@@ -96,9 +107,11 @@ func LukaszykKarmowskiDiff(d, delta float64) float64 {
 }
 
 // MarginalSurprisalCont implements Equation 6: continuous marginal surprisal in nats
-// with the Lukaszyk-Karmowski self-distance (1.5 * delta) subtracted and clamped >= 0:
+// with the Lukaszyk-Karmowski self-distance (1.5 * delta) subtracted and clamped >= 0.
+// Evaluated in dimensionless normalized units u = |x1 - x2| / delta via max-magnitude
+// scaling so extreme finite ranges (e.g. x1=1e308, x2=-1e308, delta=1e308) do not overflow:
 //
-//	S_cont(x1, x2, delta) = max(0, E_LK(|x1 - x2|, delta)/delta - 1.5)
+//	S_cont(u) = max(0, u + 0.5 * exp(-u) * (3 + u) - 1.5)
 func MarginalSurprisalCont(x1, x2, delta float64) float64 {
 	if math.IsNaN(x1) || math.IsInf(x1, 0) || math.IsNaN(x2) || math.IsInf(x2, 0) {
 		return 0
@@ -106,11 +119,31 @@ func MarginalSurprisalCont(x1, x2, delta float64) float64 {
 	if math.IsNaN(delta) || math.IsInf(delta, 0) || delta < MinDeviationFloor {
 		delta = MinDeviationFloor
 	}
-	d := math.Abs(x1 - x2)
-	elk := LukaszykKarmowskiDiff(d, delta)
-	s := (elk / delta) - 1.5
-	if s < 0 || math.IsNaN(s) || math.IsInf(s, 0) {
+	if x1 == x2 {
 		return 0
+	}
+	scale := math.Max(math.Abs(x1), math.Abs(x2))
+	if delta > scale {
+		scale = delta
+	}
+	if scale == 0 {
+		return 0
+	}
+	scaledDiff := math.Abs((x1 / scale) - (x2 / scale))
+	scaledDelta := delta / scale
+	if scaledDelta == 0 {
+		return math.MaxFloat64
+	}
+	u := scaledDiff / scaledDelta
+	if math.IsNaN(u) || math.IsInf(u, 0) {
+		return math.MaxFloat64
+	}
+	s := u + 0.5*math.Exp(-u)*(3.0+u) - 1.5
+	if s < 0 || math.IsNaN(s) {
+		return 0
+	}
+	if math.IsInf(s, 0) {
+		return math.MaxFloat64
 	}
 	return s
 }
@@ -147,8 +180,8 @@ func CaseSurprisal(c1, c2 CaseVector, deviations map[string]float64, contKeys, n
 	return total, contribs
 }
 
-// KNNMean returns the mean of the k smallest finite values in scores (matching
-// statistics.mean(sorted(surprisals)[:min(k, len(surprisals))]) in service.py).
+// KNNMean returns the overflow-safe mean of the k smallest finite values in scores
+// (matching statistics.mean(sorted(surprisals)[:min(k, len(surprisals))]) in service.py).
 func KNNMean(scores []float64, k int) float64 {
 	if len(scores) == 0 || k <= 0 {
 		return 0
@@ -166,11 +199,12 @@ func KNNMean(scores []float64, k int) float64 {
 	if k > len(cp) {
 		k = len(cp)
 	}
-	var sum float64
-	for i := 0; i < k; i++ {
-		sum += cp[i]
+	// Divide each value before accumulation so large finite values (e.g. 1e308) do not overflow.
+	mean := cp[0]
+	for i := 1; i < k; i++ {
+		mean += (cp[i] - mean) / float64(i+1)
 	}
-	return sum / float64(k)
+	return mean
 }
 
 func sanitizeFinite(v float64) float64 {

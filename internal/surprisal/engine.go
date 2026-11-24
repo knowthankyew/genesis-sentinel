@@ -2,6 +2,7 @@ package surprisal
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sort"
 	"strings"
@@ -128,24 +129,31 @@ func NewEngine(opts Options) *Engine {
 }
 
 // LoadFromFile hydrates the rolling baseline from path if present.
-// Does not mark dirtyDisk since state was just read from disk.
+// When path does not exist, existing state is preserved and (0, nil) is returned.
+// When an explicit empty snapshot exists on disk, the in-memory baseline is replaced
+// cleanly with an empty baseline. Does not mark dirtyDisk since state came from disk.
 func (e *Engine) LoadFromFile(path string) (int, error) {
-	snap, err := LoadBaselineSnapshot(path, e.maxSize)
+	snap, exists, err := LoadBaselineSnapshot(path, e.maxSize)
 	if err != nil {
 		return 0, err
 	}
-	if len(snap.Cases) == 0 {
+	if !exists {
 		return 0, nil
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	clear(e.ring)
 	e.head = 0
 	e.count = 0
+	for i := range e.devs {
+		e.devs[i] = MinDeviationFloor
+	}
 	for _, c := range snap.Cases {
 		e.appendLocked(c)
 	}
+	e.revision++
 	e.devsDirty = true
 	e.dirtyDisk = false
 	return e.count, nil
@@ -298,8 +306,10 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		}
 	}
 
-	// Copy chronological baseline references ONLY when an HTTP parity call will execute.
+	// Copy chronological baseline references ONLY when an HTTP parity call will execute,
+	// capturing baseline revision so we can detect concurrent learning during I/O.
 	refsCopy = e.orderedCasesLocked()
+	rev := e.revision
 	// Release lock before loopback HTTP parity request (never hold mutex across I/O).
 	e.mu.Unlock()
 
@@ -310,22 +320,39 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 
 	e.mu.Lock()
 	if e.resetGen != gen {
-		// Burn/Reset occurred mid-request: discard all pre-reset counters and baseline updates.
+		// Burn/Reset occurred mid-request: discard all pre-reset counters, baseline updates,
+		// AND suppress the stale pre-burn anomalous score so callers cannot emit post-Burn alerts.
 		e.mu.Unlock()
 		return model.SurprisalScore{
 			TemplateID:        w.TemplateID,
-			TotalNats:         round4(totalNats),
+			TotalNats:         0,
 			ThresholdNats:     threshold,
-			Anomalous:         anomalous,
-			FeatureContribs:   contribs,
-			BaselineCaseCount: baseCount,
+			Anomalous:         false,
+			BaselineCaseCount: 0,
 		}
 	}
 
 	e.httpChecks++
 	if err != nil {
 		e.httpFallbacks++
-		e.httpOpenUntil = time.Now().Add(e.httpCooldown)
+		callerCanceled := ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+		if !callerCanceled {
+			e.httpOpenUntil = time.Now().Add(e.httpCooldown)
+		}
+	} else if e.revision != rev {
+		// The rolling baseline changed while the HTTP request was in flight: do not reuse
+		// a verdict computed against an older reference snapshot. Re-score locally against
+		// the current baseline before deciding whether to alert or learn.
+		if e.count > 0 {
+			if e.devsDirty {
+				e.devs = ComputeLogDeviations(e.activeSliceLocked())
+				e.devsDirty = false
+			}
+			totalNats, contribs = e.scoreAgainstBaselineLocked(feat)
+		}
+		baseCount = e.count
+		localAnomalous = (e.count >= e.warmupMinCases) && totalNats >= threshold
+		anomalous = localAnomalous
 	} else if mode == "http" {
 		sidecarAnomalous := !vResp.IsConforming || vResp.MeasuredSurprisalNats >= threshold
 		if sidecarAnomalous || !localAnomalous {
@@ -535,23 +562,23 @@ func (e *Engine) scoreAgainstBaselineLocked(cand LogFeatures) (float64, map[stri
 		return 0, nil
 	}
 
-	invK := 1.0 / float64(len(best))
-	var meanScore float64
-	var meanContribs [ContinuousFeatureCount + NominalFeatureCount]float64
-	for _, b := range best {
-		meanScore += b.score
+	// Overflow-safe incremental mean across the k nearest neighbors.
+	meanScore := best[0].score
+	meanContribs := best[0].contribs
+	for i := 1; i < len(best); i++ {
+		denom := float64(i + 1)
+		meanScore += (best[i].score - meanScore) / denom
 		for j := range meanContribs {
-			meanContribs[j] += b.contribs[j]
+			meanContribs[j] += (best[i].contribs[j] - meanContribs[j]) / denom
 		}
 	}
-	meanScore *= invK
 
 	contribMap := make(map[string]float64, ContinuousFeatureCount+NominalFeatureCount)
 	for j := 0; j < ContinuousFeatureCount; j++ {
-		contribMap[ContinuousFeatureNames[j]] = round4(meanContribs[j] * invK)
+		contribMap[ContinuousFeatureNames[j]] = round4(meanContribs[j])
 	}
 	for j := 0; j < NominalFeatureCount; j++ {
-		contribMap[NominalFeatureNames[j]] = round4(meanContribs[ContinuousFeatureCount+j] * invK)
+		contribMap[NominalFeatureNames[j]] = round4(meanContribs[ContinuousFeatureCount+j])
 	}
 
 	return meanScore, contribMap

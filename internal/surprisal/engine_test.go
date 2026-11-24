@@ -102,6 +102,42 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 		t.Fatalf("timestamp unit normalization mismatch: sec=%v vs ms=%v", secFeat.Continuous[5], msFeat.Continuous[5])
 	}
 
+	// Unicode case-folding safety: U+023A (Ⱥ) expands UTF-8 byte length when lowercased.
+	// Slicing must stay within the folded string and never panic.
+	uniWin := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-uni",
+		Service:    "api",
+		Level:      "INFO",
+		SampleLine: "ȺȺȺȺ status=200",
+	})
+	if uniWin.Nominal[3] != "http_2xx" {
+		t.Fatalf("expected Unicode-prefixed status=200 -> http_2xx, got %q", uniWin.Nominal[3])
+	}
+
+	// Subsecond 100ms span must match identically within a second and across a second boundary.
+	withinSec := ExtractFeatures(model.TemplateWindow{
+		TemplateID:    "tmpl-sub",
+		Service:       "api",
+		Level:         "INFO",
+		Count:         2,
+		FirstSeenUnix: 1763996400100,
+		LastSeenUnix:  1763996400200,
+		SampleLine:    "ok",
+	})
+	acrossSec := ExtractFeatures(model.TemplateWindow{
+		TemplateID:    "tmpl-sub",
+		Service:       "api",
+		Level:         "INFO",
+		Count:         2,
+		FirstSeenUnix: 1763996400950,
+		LastSeenUnix:  1763996401050,
+		SampleLine:    "ok",
+	})
+	if !(math.Abs(withinSec.Continuous[5]-acrossSec.Continuous[5]) <= 1e-9) {
+		t.Fatalf("subsecond 100ms span mismatch across second boundary: within=%v across=%v",
+			withinSec.Continuous[5], acrossSec.Continuous[5])
+	}
+
 	// UTF-8 boundary clamping: 127 ASCII bytes + 2-byte 'é' must truncate cleanly without invalid UTF-8.
 	utf8Svc := strings.Repeat("a", 127) + "é"
 	utf8Feat := ExtractFeatures(model.TemplateWindow{
@@ -353,18 +389,52 @@ func TestBaselinePersistenceAndCorruptSnapshotHandling(t *testing.T) {
 	if _, err := eng2.LoadFromFile(badPath); err == nil {
 		t.Fatal("expected error loading corrupt baseline JSON")
 	}
+
+	// Incomplete {} case objects must be rejected instead of counting toward warmup.
+	emptyCasesPath := filepath.Join(dir, "incomplete.json")
+	if err := os.WriteFile(emptyCasesPath, []byte(`{"version":1,"cases":[{},{},{}]}`), 0600); err != nil {
+		t.Fatalf("write incomplete.json: %v", err)
+	}
+	if _, err := eng2.LoadFromFile(emptyCasesPath); err == nil {
+		t.Fatal("expected error loading baseline with incomplete {} case objects")
+	}
+
+	// An explicit empty snapshot file (cases:[]) must replace a populated engine with 0 cases.
+	explicitEmptyPath := filepath.Join(dir, "empty.json")
+	if err := SaveBaselineSnapshot(explicitEmptyPath, BaselineSnapshot{Version: 1, MaxSize: 50, Cases: []LogFeatures{}}); err != nil {
+		t.Fatalf("SaveBaselineSnapshot empty: %v", err)
+	}
+	if _, err := eng.LoadFromFile(explicitEmptyPath); err != nil {
+		t.Fatalf("LoadFromFile explicit empty: %v", err)
+	}
+	if eng.Stats().BaselineCases != 0 {
+		t.Fatalf("expected explicit empty snapshot to replace populated baseline with 0 cases, got %d", eng.Stats().BaselineCases)
+	}
 }
 
 func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
-	// Reject non-loopback endpoint and base URLs with query strings or fragments.
+	// Reject non-loopback endpoint, embedded credentials, and base URLs with query strings or fragments.
 	if _, err := NewHTTPClient("https://example.com:5200", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject non-loopback URL when allowRemote=false")
+	}
+	if _, err := NewHTTPClient("http://user:supersecretpass@127.0.0.1:5200", time.Second, false); err == nil {
+		t.Fatal("expected NewHTTPClient to reject URL with embedded userinfo")
+	} else if strings.Contains(err.Error(), "supersecretpass") {
+		t.Fatalf("NewHTTPClient error leaked embedded password: %v", err)
 	}
 	if _, err := NewHTTPClient("http://127.0.0.1:5200?tenant=local", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject base URL with query parameters")
 	}
 	if _, err := NewHTTPClient("http://127.0.0.1:5200#frag", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject base URL with fragment")
+	}
+	// Preserve escaped path segments when appending endpoint suffixes.
+	escClient, err := NewHTTPClient("http://127.0.0.1:5200/tenant%2Fblue", time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient escaped prefix failed: %v", err)
+	}
+	if got := escClient.endpointURL("/health"); got != "http://127.0.0.1:5200/tenant%2Fblue/health" {
+		t.Fatalf("escaped path prefix corrupted: got %q", got)
 	}
 
 	var calls atomic.Int32
@@ -485,7 +555,7 @@ func TestHTTPClientRejectsIncompleteVerdictAndOffLoopbackRedirect(t *testing.T) 
 		}
 	}
 
-	// 2. 307 redirect from loopback sidecar to external host must be rejected before forwarding POST body.
+	// 2. 307 redirect from loopback sidecar to external host must be rejected by loopback policy before transmission.
 	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://example.com/steal", http.StatusTemporaryRedirect)
 	}))
@@ -497,6 +567,8 @@ func TestHTTPClientRejectsIncompleteVerdictAndOffLoopbackRedirect(t *testing.T) 
 	if _, err := c.VerifyWindow(context.Background(), model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "secret"},
 		[]LogFeatures{ExtractFeatures(model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "ok"})}, 5.0); err == nil {
 		t.Fatal("expected VerifyWindow to reject 307 redirect to non-loopback host")
+	} else if !strings.Contains(err.Error(), "non-loopback") {
+		t.Fatalf("expected loopback policy error (not transport/DNS error), got: %v", err)
 	}
 
 	// 3. HTTP mode fail-closed poisoning defense: sidecar claiming conforming on a local burst anomaly
@@ -506,7 +578,10 @@ func TestHTTPClientRejectsIncompleteVerdictAndOffLoopbackRedirect(t *testing.T) 
 		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.1}`))
 	}))
 	defer permissiveSrv.Close()
-	pc, _ := NewHTTPClient(permissiveSrv.URL, time.Second, false)
+	pc, err := NewHTTPClient(permissiveSrv.URL, time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient permissiveSrv: %v", err)
+	}
 	eng := NewEngine(Options{Mode: "http", ThresholdNats: 5.0, BaselineWindowSize: 50, WarmupMinCases: 5, HTTPClient: pc})
 	for i := 0; i < 6; i++ {
 		eng.LearnBaseline(model.TemplateWindow{
@@ -522,43 +597,95 @@ func TestHTTPClientRejectsIncompleteVerdictAndOffLoopbackRedirect(t *testing.T) 
 		Count:      50000,
 		SampleLine: "POST /v9/dump?x=!!!@@@###$$$%%%^^^&&&*** 503 " + strings.Repeat("Z9xQ", 30),
 	}, false)
-	if !burstSc.Anomalous || eng.Stats().BaselineCases != before {
+	permStats := eng.Stats()
+	if permStats.HTTPChecks != 1 || permStats.HTTPFallbacks != 0 {
+		t.Fatalf("expected 1 successful sidecar check and 0 fallbacks, got stats=%+v", permStats)
+	}
+	if !burstSc.Anomalous || permStats.BaselineCases != before {
 		t.Fatalf("expected HTTP mode to fail closed on local burst anomaly without poisoning baseline: score=%+v cases=%d->%d",
-			burstSc, before, eng.Stats().BaselineCases)
+			burstSc, before, permStats.BaselineCases)
 	}
 
-	// 4. Mid-request Reset() must discard pre-reset counters and baseline updates.
+	// 4. Mid-request Reset() must discard pre-reset counters, baseline updates, AND suppress pre-reset anomaly score.
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var closeReleaseOnce sync.Once
+	closeRelease := func() { closeReleaseOnce.Do(func() { close(release) }) }
 	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
 		<-release
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.2}`))
+		_, _ = w.Write([]byte(`{"is_conforming":false,"measured_surprisal_nats":12.0}`))
 	}))
-	defer slowSrv.Close()
-	scClient, _ := NewHTTPClient(slowSrv.URL, 5*time.Second, false)
+	t.Cleanup(func() {
+		closeRelease()
+		slowSrv.Close()
+	})
+	scClient, err := NewHTTPClient(slowSrv.URL, 5*time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient slowSrv: %v", err)
+	}
 	engReset := NewEngine(Options{Mode: "http", ThresholdNats: 5.0, BaselineWindowSize: 50, WarmupMinCases: 3, HTTPClient: scClient})
 	for i := 0; i < 4; i++ {
 		engReset.LearnBaseline(model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"})
 	}
-	done := make(chan struct{})
+	done := make(chan model.SurprisalScore, 1)
 	go func() {
-		defer close(done)
-		engReset.Evaluate(context.Background(), model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}, false)
+		done <- engReset.Evaluate(context.Background(), model.TemplateWindow{
+			TemplateID: "t-anom", Service: "unknown", Level: "ERROR", Count: 500, SampleLine: "POST /x 503 !!!@@@",
+		}, false)
 	}()
-	<-started
+	select {
+	case <-started:
+	case scEarly := <-done:
+		t.Fatalf("Evaluate returned before dispatching HTTP request: %+v", scEarly)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP verify request dispatch")
+	}
 	engReset.Reset()
-	close(release)
-	<-done
+	closeRelease()
+	resScore := <-done
+	if resScore.Anomalous {
+		t.Fatalf("expected pre-Reset evaluation to suppress stale anomalous verdict, got %+v", resScore)
+	}
 	if st := engReset.Stats(); st.BaselineCases != 0 || st.ScoredTotal != 0 || st.AnomaliesTotal != 0 || st.HTTPChecks != 0 {
 		t.Fatalf("expected mid-request Reset() to discard pre-reset updates, got stats=%+v", st)
+	}
+
+	// 5. Caller context cancellation must fall back locally WITHOUT tripping the shared circuit breaker.
+	var okCalls atomic.Int32
+	healthySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		okCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.3}`))
+	}))
+	defer healthySrv.Close()
+	hc, err := NewHTTPClient(healthySrv.URL, 2*time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient healthySrv: %v", err)
+	}
+	engCancel := NewEngine(Options{Mode: "http", ThresholdNats: 5.0, BaselineWindowSize: 50, WarmupMinCases: 3, HTTPCooldown: time.Minute, HTTPClient: hc})
+	for i := 0; i < 4; i++ {
+		engCancel.LearnBaseline(model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"})
+	}
+	canceledCtx, cancelFn := context.WithCancel(context.Background())
+	cancelFn()
+	engCancel.Evaluate(canceledCtx, model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}, false)
+	// Next call with live context must still reach healthySrv (circuit NOT opened).
+	engCancel.Evaluate(context.Background(), model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}, false)
+	if okCalls.Load() != 1 {
+		t.Fatalf("expected caller cancellation NOT to trip shared HTTP circuit breaker (okCalls=%d)", okCalls.Load())
 	}
 }
 
 func TestWrappedRingChronologicalParityAcrossSaveAndRestore(t *testing.T) {
 	// Capacity 4, candidate cap 2: appending A..E wraps ring in-place to [E, B, C, D],
-	// whereas chronological order is [B, C, D, E]. Scoring must match identically before & after restore.
+	// whereas chronological order is [B, C, D, E]. Querying with an absent service forces
+	// global strided sampling (positions 0 and 2 -> B and D, rather than physical E and C).
 	eng := NewEngine(Options{
 		Mode:               "inprocess",
 		ThresholdNats:      5.0,
@@ -594,7 +721,8 @@ func TestWrappedRingChronologicalParityAcrossSaveAndRestore(t *testing.T) {
 		t.Fatalf("LoadFromFile: %v", err)
 	}
 
-	query := windows[4]
+	// Query with evicted windows[0] (absent service "svcA"): forces global chronological striding over B and D.
+	query := windows[0]
 	before := eng.Evaluate(context.Background(), query, true)
 	after := engRestored.Evaluate(context.Background(), query, true)
 	if before.TotalNats != after.TotalNats {
