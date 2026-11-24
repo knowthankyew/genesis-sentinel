@@ -204,6 +204,18 @@ func TestExecuteStatsAndBurn(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmp, "cursor.json")); !os.IsNotExist(err) {
 		t.Fatal("cursor.json survived burn -y")
 	}
+
+	// Plain-text HTTP 200 response from --http burn endpoint must return an error, not false success.
+	badBurnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK plain text not a burn report"))
+	}))
+	defer badBurnSrv.Close()
+
+	out.Reset()
+	if err := ExecuteWithOutput([]string{"burn", "-y", "--http", badBurnSrv.URL}, &out, &errBuf); err == nil {
+		t.Fatal("expected burn --http to fail on non-JSON BurnReport response")
+	}
 }
 
 func TestExecuteDataSubcommands(t *testing.T) {

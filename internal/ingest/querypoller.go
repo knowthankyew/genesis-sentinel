@@ -1,7 +1,6 @@
 package ingest
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -159,8 +158,11 @@ func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
 		return nil, fmt.Errorf("%w (%d bytes limit)", ErrQueryResponseTooLarge, maxBytes)
 	}
 
-	var parsed genesisQueryResponse
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&parsed); err != nil {
+	var parsed *genesisQueryResponse
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed == nil {
+		if err == nil {
+			err = fmt.Errorf("unexpected null JSON payload")
+		}
 		return nil, fmt.Errorf("decode genesis /query response: %w", err)
 	}
 

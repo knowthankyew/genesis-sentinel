@@ -7,26 +7,38 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
 
 const (
-	// DefaultMaxClusters bounds unique template clusters in RAM to prevent memory exhaustion
-	// under adversarial random-token log floods.
+	// DefaultMaxClusters bounds unique template clusters in RAM under adversarial token floods.
 	DefaultMaxClusters = 4096
-	// DefaultMaxWindows bounds distinct TemplateWindow entries retained between Flush calls.
+	// DefaultMaxClusterBytes bounds total string bytes retained inside learned Drain clusters and tree keys.
+	DefaultMaxClusterBytes = 8 * 1024 * 1024 // 8 MiB
+	// DefaultMaxWindows bounds distinct dedicated TemplateWindow entries retained between Flush calls.
 	DefaultMaxWindows = 4096
+	// DefaultMaxRetainedSampleBytes bounds total preview sample bytes retained across all windows between Flush calls.
+	DefaultMaxRetainedSampleBytes = 16 * 1024 * 1024 // 16 MiB
+	// DefaultMaxWindowSampleBytes bounds preview sample bytes retained by a single TemplateWindow.
+	DefaultMaxWindowSampleBytes = 16 * 1024 // 16 KiB
+	// DefaultMaxSingleSampleBytes bounds any single retained preview sample string.
+	DefaultMaxSingleSampleBytes = 4096 // 4 KiB
 	// DefaultSimilarityThreshold is the Drain token match ratio required to merge into an existing cluster.
 	DefaultSimilarityThreshold = 0.50
 	// DefaultMaxDepth is the fixed prefix-tree token depth before cluster leaf lookup.
 	DefaultMaxDepth = 2
 	// minEntropyTokenLen is the minimum token length checked for whitespace/dot-delimited entropy peaks.
 	minEntropyTokenLen = 24
-	// maxAdditionalSamples bounds extra signature-evidence samples retained per TemplateWindow.
+	// maxAdditionalSamples bounds extra preview samples retained per TemplateWindow.
 	maxAdditionalSamples = 16
-	// maxOverflowBuckets bounds distinct (service, level) overflow windows when at maxWindows.
+	// maxOverflowBuckets bounds distinct (service, level) overflow windows when at capacity.
 	maxOverflowBuckets = 256
+	// maxClusterTokenBytes masks overly long individual tokens in templates so random blobs do not bloat clusters.
+	maxClusterTokenBytes = 256
+	// maxClusterTokens caps normalized tokens retained per cluster template.
+	maxClusterTokens = 128
 )
 
 type drainRootKey struct {
@@ -48,16 +60,18 @@ type drainNode struct {
 // DrainMiner implements a fast, bounded, pure-Go Drain-style log template miner.
 // Dynamic parameters (IPs, UUIDs, timestamps, hex values, numbers) are pre-masked
 // before fixed-depth prefix lookup so repetitive log lines collapse into stable
-// structural templates with bounded RAM even under adversarial token floods.
+// structural templates with bounded cluster count and retained string bytes.
 type DrainMiner struct {
 	mu                  sync.Mutex
 	roots               map[drainRootKey]*drainNode
 	maxClusters         int
+	maxClusterBytes     int
 	clusterCount        int
+	clusterBytes        int
 	similarityThreshold float64
 }
 
-// NewDrainMiner creates a Drain-style template miner with safe memory bounds.
+// NewDrainMiner creates a Drain-style template miner with safe cluster-count and byte bounds.
 func NewDrainMiner(maxClusters int, similarityThreshold float64) *DrainMiner {
 	if maxClusters <= 0 {
 		maxClusters = DefaultMaxClusters
@@ -68,19 +82,44 @@ func NewDrainMiner(maxClusters int, similarityThreshold float64) *DrainMiner {
 	return &DrainMiner{
 		roots:               make(map[drainRootKey]*drainNode, 64),
 		maxClusters:         maxClusters,
+		maxClusterBytes:     DefaultMaxClusterBytes,
 		similarityThreshold: similarityThreshold,
 	}
 }
 
+// SetMaxClusterBytes overrides the cluster string-byte cap (primarily for testing).
+func (m *DrainMiner) SetMaxClusterBytes(n int) {
+	m.mu.Lock()
+	if n > 0 {
+		m.maxClusterBytes = n
+	}
+	m.mu.Unlock()
+}
+
+// ClusterBytes reports total retained string bytes inside learned Drain clusters and tree keys.
+func (m *DrainMiner) ClusterBytes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clusterBytes
+}
+
 // ExtractTemplate normalizes msg into masked tokens, merges it into the Drain prefix
 // tree for (service, level), and returns (stableTemplateID, templateString, overflowed).
-// Once maxClusters is reached, lookup continues across existing clusters without allocating
-// any new tree nodes; unmatched events return a bounded overflow ID.
+// Retained cluster tokens and tree keys are detached via strings.Clone and capped by
+// maxClusters and maxClusterBytes so giant log lines cannot pin backing arrays after Flush.
 func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string, bool) {
 	tokens := NormalizeTokens(msg)
 	if len(tokens) == 0 {
 		tmpl := "<EMPTY>"
 		return TemplateHash(service, level, tmpl), tmpl, false
+	}
+	if len(tokens) > maxClusterTokens {
+		tokens = append(tokens[:maxClusterTokens], "<*>")
+	}
+	for i, tok := range tokens {
+		if len(tok) > maxClusterTokenBytes {
+			tokens[i] = "<*>"
+		}
 	}
 
 	rootKey := drainRootKey{
@@ -92,16 +131,22 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	atCap := m.clusterCount >= m.maxClusters
+	atCap := m.clusterCount >= m.maxClusters || m.clusterBytes >= m.maxClusterBytes
 
 	root, ok := m.roots[rootKey]
 	if !ok {
-		if atCap {
-			tmpl := strings.Join(tokens, " ")
-			return OverflowTemplateID(service, level), tmpl, true
+		rootCost := len(service) + len(level)
+		if atCap || m.clusterBytes+rootCost > m.maxClusterBytes {
+			return OverflowTemplateID(service, level), "<OVERFLOW>", true
+		}
+		clonedKey := drainRootKey{
+			service:    strings.Clone(service),
+			level:      strings.Clone(level),
+			tokenCount: len(tokens),
 		}
 		root = &drainNode{}
-		m.roots[rootKey] = root
+		m.roots[clonedKey] = root
+		m.clusterBytes += rootCost
 	}
 
 	node := root
@@ -112,9 +157,8 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 			tok = "<*>"
 		}
 		if node.children == nil {
-			if atCap {
-				tmpl := strings.Join(tokens, " ")
-				return OverflowTemplateID(service, level), tmpl, true
+			if atCap || m.clusterBytes+len(tok) > m.maxClusterBytes {
+				return OverflowTemplateID(service, level), "<OVERFLOW>", true
 			}
 			node.children = make(map[string]*drainNode, 8)
 		}
@@ -124,19 +168,32 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 				// Fallback read-only check into wildcard branch if one already exists.
 				wild, hasWild := node.children["<*>"]
 				if !hasWild {
-					tmpl := strings.Join(tokens, " ")
-					return OverflowTemplateID(service, level), tmpl, true
+					return OverflowTemplateID(service, level), "<OVERFLOW>", true
 				}
 				child = wild
 			} else if len(node.children) >= 64 {
 				child, exists = node.children["<*>"]
 				if !exists {
+					if m.clusterBytes+len("<*>") > m.maxClusterBytes {
+						return OverflowTemplateID(service, level), "<OVERFLOW>", true
+					}
 					child = &drainNode{}
 					node.children["<*>"] = child
+					m.clusterBytes += len("<*>")
 				}
 			} else {
-				child = &drainNode{}
-				node.children[tok] = child
+				if m.clusterBytes+len(tok) > m.maxClusterBytes {
+					wild, hasWild := node.children["<*>"]
+					if !hasWild {
+						return OverflowTemplateID(service, level), "<OVERFLOW>", true
+					}
+					child = wild
+				} else {
+					clonedTok := strings.Clone(tok)
+					child = &drainNode{}
+					node.children[clonedTok] = child
+					m.clusterBytes += len(clonedTok)
+				}
 			}
 		}
 		node = child
@@ -156,22 +213,32 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 	if best != nil {
 		for i := range best.tokens {
 			if best.tokens[i] != tokens[i] {
+				m.clusterBytes += len("<*>") - len(best.tokens[i])
 				best.tokens[i] = "<*>"
 			}
+		}
+		if m.clusterBytes < 0 {
+			m.clusterBytes = 0
 		}
 		// Keep stable best.id even after token generalization so counts stay aggregated in one window.
 		return best.id, strings.Join(best.tokens, " "), false
 	}
 
-	if atCap {
-		tmpl := strings.Join(tokens, " ")
-		return OverflowTemplateID(service, level), tmpl, true
+	clusterCost := 0
+	for _, tok := range tokens {
+		clusterCost += len(tok)
+	}
+	if atCap || m.clusterBytes+clusterCost > m.maxClusterBytes {
+		return OverflowTemplateID(service, level), "<OVERFLOW>", true
 	}
 
 	copied := make([]string, len(tokens))
-	copy(copied, tokens)
+	for i, tok := range tokens {
+		copied[i] = strings.Clone(tok)
+	}
 	tmpl := strings.Join(copied, " ")
 	m.clusterCount++
+	m.clusterBytes += clusterCost
 	c := &drainCluster{
 		id:     TemplateHash(service, level, fmt.Sprintf("cluster:%d:%s", m.clusterCount, tmpl)),
 		tokens: copied,
@@ -186,6 +253,7 @@ func (m *DrainMiner) Reset() {
 	m.mu.Lock()
 	m.roots = make(map[drainRootKey]*drainNode, 64)
 	m.clusterCount = 0
+	m.clusterBytes = 0
 	m.mu.Unlock()
 }
 
@@ -198,13 +266,20 @@ func (m *DrainMiner) ClusterCount() int {
 
 // Aggregator collects incoming model.LogEvents over a window and collapses identical
 // templates into bounded model.TemplateWindow records for Tier 0/1/2 evaluation.
-// A single mutex coordinates Add, Flush, and Reset across both miner and window map.
+// Dedicated window slots are tracked separately from overflow buckets, and retained
+// preview sample bytes are bounded per sample, per window, and globally across windows.
 type Aggregator struct {
-	mu              sync.Mutex
-	miner           *DrainMiner
-	windows         map[string]*model.TemplateWindow
-	maxWindows      int
-	overflowBuckets int
+	mu                  sync.Mutex
+	miner               *DrainMiner
+	windows             map[string]*model.TemplateWindow
+	windowBytes         map[string]int
+	maxWindows          int
+	dedicatedWindows    int
+	overflowBuckets     int
+	totalSampleBytes    int
+	maxTotalSampleBytes int
+	maxWindowBytes      int
+	maxSingleSample     int
 }
 
 // NewAggregator creates a window aggregator backed by a bounded DrainMiner.
@@ -214,63 +289,118 @@ func NewAggregator(maxClusters int) *Aggregator {
 		maxWin = DefaultMaxWindows
 	}
 	return &Aggregator{
-		miner:      NewDrainMiner(maxClusters, DefaultSimilarityThreshold),
-		windows:    make(map[string]*model.TemplateWindow, 128),
-		maxWindows: maxWin,
+		miner:               NewDrainMiner(maxClusters, DefaultSimilarityThreshold),
+		windows:             make(map[string]*model.TemplateWindow, 128),
+		windowBytes:         make(map[string]int, 128),
+		maxWindows:          maxWin,
+		maxTotalSampleBytes: DefaultMaxRetainedSampleBytes,
+		maxWindowBytes:      DefaultMaxWindowSampleBytes,
+		maxSingleSample:     DefaultMaxSingleSampleBytes,
 	}
 }
 
-// Add folds a single LogEvent into the current window's collapsed templates and
-// returns (windowID, isGlobalOverflow, peakEntropy). Both miner extraction and
-// window insertion run under a.mu so Reset is atomic.
-func (a *Aggregator) Add(ev model.LogEvent) (string, bool, float64) {
-	ent := PeakShannonEntropy(ev.Message)
+// SetSampleByteLimits overrides retained preview sample byte budgets (primarily for testing).
+func (a *Aggregator) SetSampleByteLimits(maxTotal, maxPerWindow, maxSingle int) {
+	a.mu.Lock()
+	if maxTotal > 0 {
+		a.maxTotalSampleBytes = maxTotal
+	}
+	if maxPerWindow > 0 {
+		a.maxWindowBytes = maxPerWindow
+	}
+	if maxSingle > 0 {
+		a.maxSingleSample = maxSingle
+	}
+	a.mu.Unlock()
+}
 
+// SetMaxClusterBytes overrides the underlying DrainMiner's cluster string-byte cap.
+func (a *Aggregator) SetMaxClusterBytes(n int) {
+	a.miner.SetMaxClusterBytes(n)
+}
+
+// RetainedSampleBytes returns the total preview sample bytes currently retained in active windows.
+func (a *Aggregator) RetainedSampleBytes() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.totalSampleBytes
+}
+
+// ClusterBytes returns the total string bytes retained inside the underlying DrainMiner.
+func (a *Aggregator) ClusterBytes() int {
+	return a.miner.ClusterBytes()
+}
+
+// Add folds a single LogEvent into the current window's collapsed templates and
+// returns (windowID, isOverflow, peakEntropy).
+func (a *Aggregator) Add(ev model.LogEvent) (string, bool, float64) {
+	return a.AddWithEntropy(ev, PeakShannonEntropy(ev.Message))
+}
+
+// AddWithEntropy folds a single LogEvent using a precomputed peak entropy value so
+// callers coordinating event-level rule evaluation avoid redundant entropy scans.
+// Returns (windowID, isOverflow, peakEntropy).
+func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, bool, float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	tmplID, tmpl, overflowed := a.miner.ExtractTemplate(ev.Service, ev.Level, ev.Message)
 	isGlobalOverflow := false
-	if overflowed {
-		tmpl = "<OVERFLOW>"
+
+	var (
+		w      *model.TemplateWindow
+		exists bool
+	)
+	if !overflowed {
+		w, exists = a.windows[tmplID]
+		if !exists && a.dedicatedWindows >= a.maxWindows {
+			overflowed = true
+		}
 	}
 
-	w, exists := a.windows[tmplID]
-	if !exists {
-		// Enforce window count cap between flushes under adversarial random floods.
-		if len(a.windows) >= a.maxWindows {
-			overflowed = true
-			ovID := OverflowTemplateID(ev.Service, ev.Level)
-			if existingOv, ok := a.windows[ovID]; ok {
-				w = existingOv
-				tmplID = ovID
+	if overflowed {
+		tmpl = "<OVERFLOW>"
+		ovID := OverflowTemplateID(ev.Service, ev.Level)
+		if existingOv, ok := a.windows[ovID]; ok {
+			w = existingOv
+			tmplID = ovID
+			exists = true
+		} else if a.overflowBuckets < maxOverflowBuckets {
+			a.overflowBuckets++
+			tmplID = ovID
+			exists = false
+		} else {
+			const globalOvID = "overflow:global"
+			isGlobalOverflow = true
+			tmplID = globalOvID
+			if globalOv, ok := a.windows[globalOvID]; ok {
+				w = globalOv
 				exists = true
-			} else if a.overflowBuckets < maxOverflowBuckets {
-				a.overflowBuckets++
-				tmplID = ovID
-				tmpl = "<OVERFLOW>"
 			} else {
-				const globalOvID = "overflow:global"
-				isGlobalOverflow = true
-				tmplID = globalOvID
-				if globalOv, ok := a.windows[globalOvID]; ok {
-					w = globalOv
-					exists = true
-				} else {
-					tmpl = "<OVERFLOW>"
-				}
+				exists = false
 			}
 		}
 	}
 
+	sample := truncateUTF8Clone(ev.Message, a.maxSingleSample)
+
 	if !exists {
-		svc := ev.Service
-		lvl := ev.Level
+		svc := strings.Clone(ev.Service)
+		lvl := strings.Clone(ev.Level)
 		if isGlobalOverflow {
 			// Keep global overflow bucket strictly unattributed so service/level rules
 			// evaluate each event with its real identity rather than the first overflow event's.
 			svc = "<MIXED>"
 			lvl = "<MIXED>"
+		}
+		allowed := min(a.maxWindowBytes, a.maxTotalSampleBytes-a.totalSampleBytes)
+		retainedSample := ""
+		if allowed > 0 && sample != "" {
+			if len(sample) > allowed {
+				retainedSample = truncateUTF8Clone(sample, allowed)
+			} else {
+				retainedSample = sample
+			}
 		}
 		a.windows[tmplID] = &model.TemplateWindow{
 			TemplateID:    tmplID,
@@ -280,10 +410,15 @@ func (a *Aggregator) Add(ev model.LogEvent) (string, bool, float64) {
 			Count:         1,
 			FirstSeenUnix: ev.Timestamp,
 			LastSeenUnix:  ev.Timestamp,
-			SampleLine:    ev.Message,
+			SampleLine:    retainedSample,
 			SampleEntropy: ent,
 		}
-		return tmplID, isGlobalOverflow, ent
+		a.windowBytes[tmplID] = len(retainedSample)
+		a.totalSampleBytes += len(retainedSample)
+		if !overflowed {
+			a.dedicatedWindows++
+		}
+		return tmplID, overflowed, ent
 	}
 
 	w.Count++
@@ -297,23 +432,37 @@ func (a *Aggregator) Add(ev model.LogEvent) (string, bool, float64) {
 		w.LastSeenUnix = ev.Timestamp
 	}
 
-	// Retain the highest-entropy sample in SampleLine and keep a bounded best-effort
+	// Retain the highest-entropy sample in SampleLine and keep a byte-bounded best-effort
 	// preview cache (up to maxAdditionalSamples) in AdditionalSamples. Deterministic
-	// Tier 0 rule coverage evaluates each event at ingest time rather than relying on this cache.
+	// Tier 0 rule coverage evaluates each full event at ingest time rather than relying on this cache.
 	prevSample := w.SampleLine
 	if ent > w.SampleEntropy {
 		w.SampleEntropy = ent
-		w.SampleLine = ev.Message
-		if prevSample != "" && prevSample != ev.Message {
-			addEvidenceSample(w, prevSample)
+		winAvail := a.maxWindowBytes - (a.windowBytes[tmplID] - len(prevSample))
+		totAvail := a.maxTotalSampleBytes - (a.totalSampleBytes - len(prevSample))
+		allowed := min(winAvail, totAvail)
+		newPrimary := ""
+		if allowed > 0 && sample != "" {
+			if len(sample) > allowed {
+				newPrimary = truncateUTF8Clone(sample, allowed)
+			} else {
+				newPrimary = sample
+			}
 		}
-	} else if ev.Message != w.SampleLine {
-		addEvidenceSample(w, ev.Message)
+		delta := len(newPrimary) - len(prevSample)
+		a.windowBytes[tmplID] += delta
+		a.totalSampleBytes += delta
+		w.SampleLine = newPrimary
+		if prevSample != "" && prevSample != newPrimary {
+			a.addEvidenceSampleLocked(tmplID, w, prevSample)
+		}
+	} else if sample != "" && sample != w.SampleLine {
+		a.addEvidenceSampleLocked(tmplID, w, sample)
 	}
-	return tmplID, isGlobalOverflow, ent
+	return tmplID, overflowed, ent
 }
 
-func addEvidenceSample(w *model.TemplateWindow, sample string) {
+func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, sample string) {
 	if sample == "" || sample == w.SampleLine {
 		return
 	}
@@ -322,19 +471,45 @@ func addEvidenceSample(w *model.TemplateWindow, sample string) {
 			return
 		}
 	}
-	if len(w.AdditionalSamples) < maxAdditionalSamples {
+	winRoom := a.maxWindowBytes - a.windowBytes[tmplID]
+	totRoom := a.maxTotalSampleBytes - a.totalSampleBytes
+	if len(w.AdditionalSamples) < maxAdditionalSamples && len(sample) <= winRoom && len(sample) <= totRoom {
 		w.AdditionalSamples = append(w.AdditionalSamples, sample)
+		a.windowBytes[tmplID] += len(sample)
+		a.totalSampleBytes += len(sample)
 		return
 	}
-	// When full, prioritize retaining samples carrying security-relevant cues over plain lines.
+	// When full on count or byte budget, prioritize retaining samples carrying security-relevant cues.
 	if hasSecurityCue(sample) {
 		for i, existing := range w.AdditionalSamples {
 			if !hasSecurityCue(existing) {
-				w.AdditionalSamples[i] = sample
-				return
+				delta := len(sample) - len(existing)
+				if delta <= winRoom && delta <= totRoom {
+					w.AdditionalSamples[i] = sample
+					a.windowBytes[tmplID] += delta
+					a.totalSampleBytes += delta
+					return
+				}
 			}
 		}
 	}
+}
+
+func truncateUTF8Clone(s string, maxBytes int) string {
+	if maxBytes <= 0 || s == "" {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return strings.Clone(s)
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	if end == 0 {
+		return ""
+	}
+	return strings.Clone(s[:end])
 }
 
 func hasSecurityCue(s string) bool {
@@ -363,7 +538,10 @@ func (a *Aggregator) Flush() []model.TemplateWindow {
 	}
 	drained := a.windows
 	a.windows = make(map[string]*model.TemplateWindow, 128)
+	a.windowBytes = make(map[string]int, 128)
+	a.dedicatedWindows = 0
 	a.overflowBuckets = 0
+	a.totalSampleBytes = 0
 	a.mu.Unlock()
 
 	out := make([]model.TemplateWindow, 0, len(drained))
@@ -387,7 +565,10 @@ func (a *Aggregator) Flush() []model.TemplateWindow {
 func (a *Aggregator) Reset() {
 	a.mu.Lock()
 	a.windows = make(map[string]*model.TemplateWindow, 128)
+	a.windowBytes = make(map[string]int, 128)
+	a.dedicatedWindows = 0
 	a.overflowBuckets = 0
+	a.totalSampleBytes = 0
 	a.miner.Reset()
 	a.mu.Unlock()
 }

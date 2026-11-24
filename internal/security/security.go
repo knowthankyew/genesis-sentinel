@@ -1,6 +1,7 @@
 package security
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net"
@@ -13,15 +14,20 @@ import (
 )
 
 var (
-	// noProxyTransport is a reusable transport with Proxy disabled so loopback-only
-	// clients cannot be diverted to an environment HTTP_PROXY via mixed-case LOCALHOST URLs.
-	noProxyTransport = func() *http.Transport {
+	// loopbackTransport is a reusable transport with Proxy disabled and dial-time
+	// loopback IP enforcement so loopback-only clients cannot be diverted off-host via
+	// environment HTTP_PROXY or hosts/DNS overrides for localhost.
+	loopbackTransport = func() *http.Transport {
 		if dt, ok := http.DefaultTransport.(*http.Transport); ok && dt != nil {
 			cloned := dt.Clone()
 			cloned.Proxy = nil
+			cloned.DialContext = DialLoopbackContext
 			return cloned
 		}
-		return &http.Transport{Proxy: nil}
+		return &http.Transport{
+			Proxy:       nil,
+			DialContext: DialLoopbackContext,
+		}
 	}()
 
 	// specialTokenPattern matches common LLM chat-template and control token delimiters
@@ -116,10 +122,47 @@ func IsLoopbackEndpoint(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// DialLoopbackContext dials only validated loopback IP literals without trusting
+// DNS or hosts-file resolution. For "localhost", it dials 127.0.0.1 and ::1 directly
+// so a modified hosts/DNS entry cannot route a loopback-only client off-host.
+func DialLoopbackContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("security: invalid dial address %q: %w", addr, err)
+	}
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	if strings.EqualFold(host, "localhost") {
+		switch network {
+		case "tcp4", "udp4":
+			return dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+		case "tcp6", "udp6":
+			return dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
+		default:
+			conn, err4 := dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+			if err4 == nil || ctx.Err() != nil {
+				return conn, err4
+			}
+			conn6, err6 := dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
+			if err6 == nil {
+				return conn6, nil
+			}
+			return nil, fmt.Errorf("security: loopback dial localhost:%s failed (ipv4: %v; ipv6: %v)", port, err4, err6)
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("security: refusing non-loopback dial target %q", addr)
+	}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+}
+
 // NewLoopbackHTTPClient returns an *http.Client whose CheckRedirect policy enforces
 // the loopback-only invariant on every redirect hop unless allowRemote is true.
-// When allowRemote is false, environment proxies are also disabled on the transport
-// so mixed-case localhost URLs cannot trigger Go's case-sensitive localhost proxy bypass.
+// When allowRemote is false, environment proxies are disabled and dialing is restricted
+// to loopback IP literals (with direct IPv4/IPv6 loopback dialing for localhost).
 // When blockRedirects is true, all HTTP redirects are rejected outright (e.g., for DELETE /burn).
 func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bool) *http.Client {
 	if timeout <= 0 {
@@ -141,7 +184,7 @@ func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bo
 		},
 	}
 	if !allowRemote {
-		client.Transport = noProxyTransport
+		client.Transport = loopbackTransport
 	}
 	return client
 }

@@ -157,3 +157,71 @@ func TestAggregatorPreservesOverflowMarkerOnRepeatedEmptyMessages(t *testing.T) 
 		t.Fatalf("expected overflow window in %+v", windows)
 	}
 }
+
+func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
+	// 1. Dedicated slot reservation: learn api/INFO: ready, flush, then send unknown overflow FIRST.
+	agg := NewAggregator(1)
+	agg.Add(model.LogEvent{ID: 1, Timestamp: 100, Service: "api", Level: "INFO", Message: "ready"})
+	_ = agg.Flush()
+
+	agg.Add(model.LogEvent{ID: 2, Timestamp: 101, Service: "unknown", Level: "INFO", Message: "unrecognized flood"})
+	agg.Add(model.LogEvent{ID: 3, Timestamp: 102, Service: "api", Level: "INFO", Message: "ready"})
+
+	windows := agg.Flush()
+	if len(windows) != 2 {
+		t.Fatalf("expected 2 windows (1 overflow + 1 dedicated api/INFO), got %d: %+v", len(windows), windows)
+	}
+	foundDedicated := false
+	for _, w := range windows {
+		if w.Service == "api" && w.Template == "ready" && !strings.HasPrefix(w.TemplateID, "overflow:") {
+			foundDedicated = true
+		}
+	}
+	if !foundDedicated {
+		t.Fatalf("known template api/INFO: ready lost its dedicated window to earlier overflow: %+v", windows)
+	}
+
+	// 2. Overflow bucket count stays bounded across hundreds of distinct unknown services.
+	for i := 0; i < 300; i++ {
+		agg.Add(model.LogEvent{ID: uint64(10 + i), Timestamp: 200, Service: fmt.Sprintf("u-%d", i), Level: "INFO", Message: "flood"})
+	}
+	ovWins := agg.Flush()
+	if len(ovWins) > maxOverflowBuckets+1 {
+		t.Fatalf("expected overflow windows <= %d, got %d", maxOverflowBuckets+1, len(ovWins))
+	}
+
+	// 3. Retained sample byte budget and cluster byte budget stay strictly bounded under 64 KiB floods.
+	aggBytes := NewAggregator(64)
+	aggBytes.SetMaxClusterBytes(4096)
+	aggBytes.SetSampleByteLimits(8192, 2048, 512)
+	bigLine := strings.Repeat("A", 65536)
+	for i := 0; i < 100; i++ {
+		aggBytes.Add(model.LogEvent{
+			ID:        uint64(i + 1),
+			Timestamp: 300,
+			Service:   fmt.Sprintf("svc-%d", i%20),
+			Level:     "WARN",
+			Message:   fmt.Sprintf("prefix_%d %s", i, bigLine),
+		})
+	}
+	if got := aggBytes.RetainedSampleBytes(); got > 8192 {
+		t.Fatalf("RetainedSampleBytes() = %d, exceeds budget 8192", got)
+	}
+	if got := aggBytes.ClusterBytes(); got > 4096 {
+		t.Fatalf("ClusterBytes() = %d, exceeds budget 4096", got)
+	}
+	flushed := aggBytes.Flush()
+	totalFlushedBytes := 0
+	for _, w := range flushed {
+		if len(w.SampleLine) > 512 {
+			t.Fatalf("SampleLine length %d exceeds single-sample cap 512", len(w.SampleLine))
+		}
+		totalFlushedBytes += len(w.SampleLine)
+		for _, s := range w.AdditionalSamples {
+			totalFlushedBytes += len(s)
+		}
+	}
+	if totalFlushedBytes > 8192 {
+		t.Fatalf("flushed retained sample bytes %d exceeds budget 8192", totalFlushedBytes)
+	}
+}

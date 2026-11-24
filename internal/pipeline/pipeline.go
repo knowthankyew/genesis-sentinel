@@ -24,32 +24,34 @@ import (
 )
 
 const (
-	// maxPendingRuleBuckets bounds exact per-(window, service, level) rule accumulators between flushes.
-	maxPendingRuleBuckets = 4096
+	// defaultMaxPendingRuleBuckets bounds exact per-(window, service, level) rule accumulators between flushes.
+	defaultMaxPendingRuleBuckets = 4096
 )
 
 // Stats exposes live Sentinel Tier 0 pipeline telemetry over HTTP /stats and CLI output.
 type Stats struct {
-	LinesRead        uint64  `json:"lines_read"`
-	LinesIgnoredSelf uint64  `json:"lines_ignored_self"`
-	TemplatesEmitted uint64  `json:"templates_emitted"`
-	CollapseRatio    float64 `json:"collapse_ratio"`
-	ClustersActive   int     `json:"clusters_active"`
-	RuleHitsTotal    uint64  `json:"rule_hits_total"`
-	AlertsEmitted    uint64  `json:"alerts_emitted"`
-	InjectionSignals uint64  `json:"injection_signals"`
-	SinkErrors       uint64  `json:"sink_errors"`
-	CorruptedFrames  uint64  `json:"corrupted_frames"`
-	RecoveryStalls   uint64  `json:"recovery_stalls"`
-	BurnResets       uint64  `json:"burn_resets"`
-	EvictionGaps     uint64  `json:"eviction_gaps"`
-	EstimatedLost    uint64  `json:"estimated_lost"`
-	SaturatedPages   uint64  `json:"saturated_pages"`
-	ActiveSource     string  `json:"active_source"`
-	DataDir          string  `json:"data_dir"`
-	GenesisDataDir   string  `json:"genesis_data_dir,omitempty"`
-	HeapBytes        uint64  `json:"heap_bytes"`
-	UptimeSeconds    int64   `json:"uptime_seconds"`
+	LinesRead                uint64  `json:"lines_read"`
+	LinesIgnoredSelf         uint64  `json:"lines_ignored_self"`
+	TemplatesEmitted         uint64  `json:"templates_emitted"`
+	CollapseRatio            float64 `json:"collapse_ratio"`
+	ClustersActive           int     `json:"clusters_active"`
+	RuleHitsTotal            uint64  `json:"rule_hits_total"`
+	AlertsEmitted            uint64  `json:"alerts_emitted"`
+	InjectionSignals         uint64  `json:"injection_signals"`
+	RuleBucketsDropped       uint64  `json:"rule_buckets_dropped"`
+	OverflowThresholdSkipped uint64  `json:"overflow_threshold_skipped"`
+	SinkErrors               uint64  `json:"sink_errors"`
+	CorruptedFrames          uint64  `json:"corrupted_frames"`
+	RecoveryStalls           uint64  `json:"recovery_stalls"`
+	BurnResets               uint64  `json:"burn_resets"`
+	EvictionGaps             uint64  `json:"eviction_gaps"`
+	EstimatedLost            uint64  `json:"estimated_lost"`
+	SaturatedPages           uint64  `json:"saturated_pages"`
+	ActiveSource             string  `json:"active_source"`
+	DataDir                  string  `json:"data_dir"`
+	GenesisDataDir           string  `json:"genesis_data_dir,omitempty"`
+	HeapBytes                uint64  `json:"heap_bytes"`
+	UptimeSeconds            int64   `json:"uptime_seconds"`
 }
 
 // FailedAlert pairs an alert with the sink delivery error that prevented emission.
@@ -104,21 +106,26 @@ type Pipeline struct {
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
-	burnMu      sync.RWMutex
-	hitsMu      sync.Mutex
-	pendingHits map[ruleBucketKey]*bucketAccumulator
+	// windowMu coordinates p.agg and p.pendingHits at the exact same window boundary
+	// so FlushWindow drains templates and corresponding rule hits atomically.
+	burnMu                sync.RWMutex
+	windowMu              sync.Mutex
+	maxPendingRuleBuckets int
+	pendingHits           map[ruleBucketKey]*bucketAccumulator
 
 	segReader   *ingest.SegReader
 	queryPoller *ingest.QueryPoller
 
-	linesRead        atomic.Uint64
-	linesIgnoredSelf atomic.Uint64
-	templatesEmitted atomic.Uint64
-	ruleHitsTotal    atomic.Uint64
-	alertsEmitted    atomic.Uint64
-	injectionSignals atomic.Uint64
-	sinkErrors       atomic.Uint64
-	alertSeq         atomic.Uint64
+	linesRead                atomic.Uint64
+	linesIgnoredSelf         atomic.Uint64
+	templatesEmitted         atomic.Uint64
+	ruleHitsTotal            atomic.Uint64
+	alertsEmitted            atomic.Uint64
+	injectionSignals         atomic.Uint64
+	ruleBucketsDropped       atomic.Uint64
+	overflowThresholdSkipped atomic.Uint64
+	sinkErrors               atomic.Uint64
+	alertSeq                 atomic.Uint64
 }
 
 // New builds a Pipeline wired with Tier 0 template collapsing and deterministic rules.
@@ -130,13 +137,14 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		sink = emit.NopSink{}
 	}
 	return &Pipeline{
-		cfg:          cfg,
-		agg:          template.NewAggregator(template.DefaultMaxClusters),
-		ruleEng:      ruleEng,
-		sink:         sink,
-		activeSource: activeSource,
-		startTime:    time.Now(),
-		pendingHits:  make(map[ruleBucketKey]*bucketAccumulator, 64),
+		cfg:                   cfg,
+		agg:                   template.NewAggregator(template.DefaultMaxClusters),
+		ruleEng:               ruleEng,
+		sink:                  sink,
+		activeSource:          activeSource,
+		startTime:             time.Now(),
+		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
+		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
 }
 
@@ -156,7 +164,8 @@ func (p *Pipeline) AttachQueryPoller(q *ingest.QueryPoller) {
 
 // IngestEvent folds a single incoming LogEvent into Tier 0 while enforcing strict
 // loop prevention and evaluating per-event deterministic signatures & suppressions
-// before template collapsing.
+// before template collapsing. Template insertion and rule-hit recording execute under
+// the same windowMu lock so FlushWindow always drains both at one consistent boundary.
 func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	if emit.ShouldIgnoreEvent(ev, p.cfg.AlertServiceName) {
 		p.linesIgnoredSelf.Add(1)
@@ -165,12 +174,36 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	p.burnMu.RLock()
 	defer p.burnMu.RUnlock()
 
-	p.linesRead.Add(1)
-	tmplID, _, ent := p.agg.Add(ev)
-
+	ent := template.PeakShannonEntropy(ev.Message)
 	evEval := p.ruleEng.MatchEvent(ev, ent, p.cfg.MaxPromptByte)
+
+	p.windowMu.Lock()
+	defer p.windowMu.Unlock()
+
+	p.linesRead.Add(1)
+	tmplID, isOverflow, _ := p.agg.AddWithEntropy(ev, ent)
+
 	if evEval.Suppressed || (len(evEval.Matches) == 0 && !evEval.InjectionSuspected) {
 		return
+	}
+
+	// Never combine multi-event burst thresholds (MinCount > 1) across unrelated templates
+	// that fell into a shared overflow bucket. Single-event signatures (MinCount <= 1) and
+	// prompt-injection detections remain eligible on their own merits.
+	matches := evEval.Matches
+	if isOverflow && len(matches) > 0 {
+		filtered := matches[:0]
+		for _, m := range matches {
+			if m.MinCount > 1 {
+				p.overflowThresholdSkipped.Add(1)
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		matches = filtered
+		if len(matches) == 0 && !evEval.InjectionSuspected {
+			return
+		}
 	}
 
 	key := ruleBucketKey{
@@ -179,23 +212,19 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 		level:      ev.Level,
 	}
 
-	p.hitsMu.Lock()
-	defer p.hitsMu.Unlock()
-
 	bucket, exists := p.pendingHits[key]
 	if !exists {
-		if len(p.pendingHits) >= maxPendingRuleBuckets {
-			// Still keep global-bucket attribution bounded under extreme adversarial floods.
-			key.templateID = "overflow:rules"
-			bucket, exists = p.pendingHits[key]
+		if len(p.pendingHits) >= p.maxPendingRuleBuckets {
+			p.ruleBucketsDropped.Add(1)
+			return
 		}
-		if !exists {
-			bucket = &bucketAccumulator{
-				key:   key,
-				rules: make(map[string]*ruleAccumulator, 4),
-			}
-			p.pendingHits[key] = bucket
+		key.service = strings.Clone(ev.Service)
+		key.level = strings.Clone(ev.Level)
+		bucket = &bucketAccumulator{
+			key:   key,
+			rules: make(map[string]*ruleAccumulator, 4),
 		}
+		p.pendingHits[key] = bucket
 	}
 
 	if ev.Timestamp > bucket.lastSeenUnix {
@@ -216,7 +245,7 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 			}
 		}
 	}
-	for _, m := range evEval.Matches {
+	for _, m := range matches {
 		acc, ok := bucket.rules[m.RuleHit.RuleID]
 		if !ok {
 			acc = &ruleAccumulator{
@@ -237,19 +266,18 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	}
 }
 
-// FlushWindow drains collapsed TemplateWindows and exact per-event rule accumulators,
-// applies MinCount thresholds per rule, emits structured alerts to the sink, and returns
-// successfully emitted alerts separately from any failed sink deliveries.
+// FlushWindow atomically drains collapsed TemplateWindows and exact per-event rule
+// accumulators under windowMu, releases windowMu before emitting alerts, applies
+// MinCount thresholds per rule, and returns emitted alerts separately from sink failures.
 func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	p.burnMu.RLock()
 	defer p.burnMu.RUnlock()
 
+	p.windowMu.Lock()
 	windows := p.agg.Flush()
-
-	p.hitsMu.Lock()
 	drainedHits := p.pendingHits
 	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
-	p.hitsMu.Unlock()
+	p.windowMu.Unlock()
 
 	if len(windows) == 0 && len(drainedHits) == 0 {
 		return nil, nil
@@ -423,20 +451,22 @@ func (p *Pipeline) Stats() Stats {
 	p.burnMu.RUnlock()
 
 	st := Stats{
-		LinesRead:        lines,
-		LinesIgnoredSelf: p.linesIgnoredSelf.Load(),
-		TemplatesEmitted: tmpls,
-		CollapseRatio:    ratio,
-		ClustersActive:   p.agg.ClusterCount(),
-		RuleHitsTotal:    p.ruleHitsTotal.Load(),
-		AlertsEmitted:    p.alertsEmitted.Load(),
-		InjectionSignals: p.injectionSignals.Load(),
-		SinkErrors:       p.sinkErrors.Load(),
-		ActiveSource:     p.activeSource,
-		DataDir:          p.cfg.DataDir,
-		GenesisDataDir:   p.cfg.GenesisDataDir,
-		HeapBytes:        m.HeapAlloc,
-		UptimeSeconds:    int64(time.Since(p.startTime).Seconds()),
+		LinesRead:                lines,
+		LinesIgnoredSelf:         p.linesIgnoredSelf.Load(),
+		TemplatesEmitted:         tmpls,
+		CollapseRatio:            ratio,
+		ClustersActive:           p.agg.ClusterCount(),
+		RuleHitsTotal:            p.ruleHitsTotal.Load(),
+		AlertsEmitted:            p.alertsEmitted.Load(),
+		InjectionSignals:         p.injectionSignals.Load(),
+		RuleBucketsDropped:       p.ruleBucketsDropped.Load(),
+		OverflowThresholdSkipped: p.overflowThresholdSkipped.Load(),
+		SinkErrors:               p.sinkErrors.Load(),
+		ActiveSource:             p.activeSource,
+		DataDir:                  p.cfg.DataDir,
+		GenesisDataDir:           p.cfg.GenesisDataDir,
+		HeapBytes:                m.HeapAlloc,
+		UptimeSeconds:            int64(time.Since(p.startTime).Seconds()),
 	}
 
 	if segReader != nil {
@@ -461,10 +491,10 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	p.burnMu.Lock()
 	defer p.burnMu.Unlock()
 
+	p.windowMu.Lock()
 	p.agg.Reset()
-	p.hitsMu.Lock()
 	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
-	p.hitsMu.Unlock()
+	p.windowMu.Unlock()
 
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
@@ -603,34 +633,43 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 			if openRootErr != nil {
 				errs = append(errs, fmt.Errorf("open feedback root: %w", openRootErr))
 			} else {
-				fbDir, openErr := fbRoot.Open(".")
-				if openErr != nil {
-					errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+				fbStat, fbStatErr := fbRoot.Stat(".")
+				if fbStatErr != nil {
+					errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
+					_ = fbRoot.Close()
+				} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
+					errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
+					_ = fbRoot.Close()
 				} else {
-					fbEntries, readErr := fbDir.ReadDir(-1)
-					_ = fbDir.Close()
-					if readErr != nil {
-						errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+					fbDir, openErr := fbRoot.Open(".")
+					if openErr != nil {
+						errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
 					} else {
-						for _, e := range fbEntries {
-							if e.IsDir() {
-								continue
-							}
-							if isOwnedFeedbackFile(e.Name()) {
-								removeOwnedInRoot(fbRoot, e.Name())
+						fbEntries, readErr := fbDir.ReadDir(-1)
+						_ = fbDir.Close()
+						if readErr != nil {
+							errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+						} else {
+							for _, e := range fbEntries {
+								if e.IsDir() {
+									continue
+								}
+								if isOwnedFeedbackFile(e.Name()) {
+									removeOwnedInRoot(fbRoot, e.Name())
+								}
 							}
 						}
 					}
-				}
-				_ = fbRoot.Close()
+					_ = fbRoot.Close()
 
-				// Remove feedback/ only if empty (preserves any unrelated user files inside feedback/).
-				if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
-					if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
-						remaining, _ := checkDir.ReadDir(1)
-						_ = checkDir.Close()
-						if len(remaining) == 0 {
-							errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
+					// Remove feedback/ only if empty (preserves any unrelated user files inside feedback/).
+					if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
+						if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
+							remaining, _ := checkDir.ReadDir(1)
+							_ = checkDir.Close()
+							if len(remaining) == 0 {
+								errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
+							}
 						}
 					}
 				}

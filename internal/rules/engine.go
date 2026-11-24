@@ -232,11 +232,14 @@ func LoadEngine(path string) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read rules file %q: %w", path, err)
 	}
-	var pack RulePack
+	var pack *RulePack
 	if err := json.Unmarshal(data, &pack); err != nil {
 		return nil, fmt.Errorf("parse rules file %q: %w", path, err)
 	}
-	return NewEngine(pack)
+	if pack == nil {
+		return nil, fmt.Errorf("parse rules file %q: rule pack must be a JSON object, not null", path)
+	}
+	return NewEngine(*pack)
 }
 
 // MatchEvent evaluates a single incoming LogEvent BEFORE window collapsing so:
@@ -351,8 +354,18 @@ func (e *Engine) IsTemplateSuppressed(service, tmpl string) bool {
 // Evaluate inspects a standalone TemplateWindow against suppressions, adversarial
 // prompt-injection heuristics, and compiled deterministic rules.
 // Enforces message-pattern suppressions per candidate sample, tests MinLength and
-// MinEntropy on the same candidate sample, and preserves prompt-injection evidence.
+// MinEntropy on the same candidate sample, evaluates message-pattern rules strictly
+// against unsuppressed sample messages (never falling back to w.Template), and avoids
+// applying total window Count to burst rules when mixed or suppressed samples are present.
+// Callers with exact per-rule event match counts should prefer EvaluateWithMatchCounts.
 func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) EvaluationResult {
+	return e.EvaluateWithMatchCounts(w, nil, maxPromptBytes)
+}
+
+// EvaluateWithMatchCounts inspects a TemplateWindow using optional per-rule matching-event
+// counts (keyed by rule ID). When matchCounts is non-nil, burst thresholds (MinCount) are
+// evaluated strictly against matchCounts[ruleID].
+func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map[string]uint64, maxPromptBytes int) EvaluationResult {
 	// Service-only or template-only suppressions suppress the entire window.
 	if e.isWindowSuppressed(w) {
 		sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
@@ -422,6 +435,7 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 
 	svcLower := strings.ToLower(w.Service)
 	lvlUpper := strings.ToUpper(w.Level)
+	noSuppressedSamples := len(activeSamples) == len(rawCandidates)
 
 	for _, cr := range e.rules {
 		if len(cr.services) > 0 {
@@ -434,12 +448,39 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 				continue
 			}
 		}
-		if cr.rule.MinCount > 0 && w.Count < cr.rule.MinCount {
+
+		minReq := cr.rule.MinCount
+		if minReq == 0 {
+			minReq = 1
+		}
+		hasMsgPredicate := cr.re != nil || cr.rule.MinLength > 0 || cr.rule.MinEntropy > 0
+		matchedSample, matchedCount := matchRuleCandidates(cr, w, activeSamples, primarySample)
+		if hasMsgPredicate && matchedCount == 0 {
 			continue
 		}
 
-		matchedSample, ok := matchRuleCandidates(cr, w, activeSamples)
-		if !ok {
+		var effectiveCount uint64
+		if matchCounts != nil {
+			effectiveCount = matchCounts[cr.rule.ID]
+		} else if !hasMsgPredicate {
+			if w.Template != "<OVERFLOW>" && noSuppressedSamples {
+				effectiveCount = w.Count
+			} else {
+				effectiveCount = uint64(len(activeSamples))
+			}
+		} else if minReq <= 1 {
+			effectiveCount = uint64(matchedCount)
+		} else {
+			// Burst rule with a message predicate (e.g. SENT-001) and no explicit matchCounts:
+			// only treat w.Count as matching count when the window is non-overflow and every
+			// observed sample is unsuppressed and matched; otherwise count only matched samples.
+			if w.Template != "<OVERFLOW>" && noSuppressedSamples && len(rawCandidates) > 0 && matchedCount == len(rawCandidates) {
+				effectiveCount = w.Count
+			} else {
+				effectiveCount = uint64(matchedCount)
+			}
+		}
+		if effectiveCount < minReq {
 			continue
 		}
 
@@ -458,13 +499,18 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 	return res
 }
 
-// matchRuleCandidates checks MinLength, MinEntropy, and Pattern on the SAME candidate
-// sample so a short high-entropy sample and a long low-entropy sample cannot combine to fire.
-func matchRuleCandidates(cr compiledRule, w model.TemplateWindow, activeSamples []string) (string, bool) {
+// matchRuleCandidates checks MinLength, MinEntropy, and Pattern on the SAME unsuppressed
+// candidate sample, returning the first matching sample and the total number of matching
+// unsuppressed samples. Message-pattern rules never fall back to matching w.Template.
+func matchRuleCandidates(cr compiledRule, w model.TemplateWindow, activeSamples []string, primarySample string) (string, int) {
 	if cr.re == nil && cr.rule.MinLength <= 0 && cr.rule.MinEntropy <= 0 {
-		return w.SampleLine, true
+		return primarySample, len(activeSamples)
 	}
 
+	var (
+		firstMatch string
+		matches    int
+	)
 	for _, cand := range activeSamples {
 		if cr.rule.MinLength > 0 && len(cand) < cr.rule.MinLength {
 			continue
@@ -481,17 +527,12 @@ func matchRuleCandidates(cr compiledRule, w model.TemplateWindow, activeSamples 
 		if cr.re != nil && !cr.re.MatchString(cand) {
 			continue
 		}
-		return cand, true
-	}
-
-	// Fallback regex match on Template itself only when no entropy threshold applies
-	// and Template satisfies MinLength.
-	if cr.re != nil && cr.rule.MinEntropy <= 0 && (cr.rule.MinLength <= 0 || len(w.Template) >= cr.rule.MinLength) {
-		if cr.re.MatchString(w.Template) {
-			return w.SampleLine, true
+		if matches == 0 {
+			firstMatch = cand
 		}
+		matches++
 	}
-	return "", false
+	return firstMatch, matches
 }
 
 func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {

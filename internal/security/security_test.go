@@ -1,6 +1,8 @@
 package security
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,18 +130,67 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Verify restricted client disables environment proxying (noProxyTransport)
+	// Verify restricted client disables environment proxying and enforces loopback at dial time
 	defaultClient := NewLoopbackHTTPClient(2*time.Second, false, false)
 	tr, ok := defaultClient.Transport.(*http.Transport)
-	if !ok || tr == nil || tr.Proxy != nil {
-		t.Fatalf("expected restricted client to use a Transport with Proxy == nil, got %#v", defaultClient.Transport)
+	if !ok || tr == nil || tr.Proxy != nil || tr.DialContext == nil {
+		t.Fatalf("expected restricted client to use a Transport with Proxy == nil and loopback DialContext, got %#v", defaultClient.Transport)
+	}
+
+	// Verify DialLoopbackContext rejects non-loopback IPs and hostnames directly at dial time
+	if conn, err := DialLoopbackContext(context.Background(), "tcp", "192.0.2.1:80"); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected DialLoopbackContext to reject non-loopback IP literal")
+	}
+	if conn, err := DialLoopbackContext(context.Background(), "tcp", "example.com:80"); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected DialLoopbackContext to reject non-loopback hostname")
+	}
+
+	// Verify restricted client reaches IPv4 localhost server via direct loopback dialing
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split httptest addr: %v", err)
+	}
+	localResp, err := defaultClient.Get("http://localhost:" + port + "/ok")
+	if err != nil {
+		t.Fatalf("expected localhost dial to succeed on IPv4 loopback server: %v", err)
+	}
+	_ = localResp.Body.Close()
+	if localResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from localhost IPv4 server, got %d", localResp.StatusCode)
+	}
+
+	// Verify IPv6 loopback localhost fallback when IPv6 loopback is supported on the host
+	if ln6, err6 := net.Listen("tcp6", "[::1]:0"); err6 == nil {
+		srv6 := &httptest.Server{
+			Listener: ln6,
+			Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})},
+		}
+		srv6.Start()
+		defer srv6.Close()
+
+		_, port6, splitErr := net.SplitHostPort(ln6.Addr().String())
+		if splitErr != nil {
+			t.Fatalf("split ipv6 addr: %v", splitErr)
+		}
+		resp6, reqErr6 := defaultClient.Get("http://localhost:" + port6 + "/ok")
+		if reqErr6 != nil {
+			t.Fatalf("expected localhost dial to reach IPv6 loopback server: %v", reqErr6)
+		}
+		_ = resp6.Body.Close()
+		if resp6.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK from localhost IPv6 server, got %d", resp6.StatusCode)
+		}
 	}
 
 	// Use recording transport so no public network call ever happens and policy rejection is explicitly verified.
 	rec := &recordingTransport{base: srv.Client().Transport}
 	c := NewLoopbackHTTPClient(2*time.Second, false, false)
 	c.Transport = rec
-	_, err := c.Get(srv.URL + "/to-external")
+	_, err = c.Get(srv.URL + "/to-external")
 	if err == nil || !strings.Contains(err.Error(), "blocked by loopback policy") {
 		t.Fatalf("expected explicit loopback policy error on external redirect, got err=%v", err)
 	}

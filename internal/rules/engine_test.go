@@ -207,8 +207,15 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 		t.Fatalf("expected LEN-1 hit on qualifying AdditionalSample, got %+v", resLen.RuleHits)
 	}
 
-	// Entropy and MinLength must pass on the SAME sample (short high-entropy + long low-entropy must NOT fire SENT-005)
-	shortHighEnt := "Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN" // 40 bytes (<48), high entropy
+	// Entropy and MinLength must pass on the SAME sample (short high-entropy + long low-entropy must NOT fire SENT-005).
+	// 40 distinct ASCII bytes yields log2(40) ~= 5.322 bits/byte (>= 5.2) while failing MinLength=48.
+	shortHighEnt := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"
+	if len(shortHighEnt) >= 48 {
+		t.Fatalf("test fixture shortHighEnt must be < 48 bytes, got %d", len(shortHighEnt))
+	}
+	if ent := template.PeakShannonEntropy(shortHighEnt); ent < 5.2 {
+		t.Fatalf("test fixture shortHighEnt must score >= 5.2 bits/byte, got %.3f", ent)
+	}
 	longLowEnt := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	resSplit := defEng.Evaluate(model.TemplateWindow{
 		Service:           "coredns",
@@ -251,5 +258,105 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	}
 	if !foundTraversal {
 		t.Fatalf("expected SENT-003 to survive heartbeat pattern suppression, got %+v", resPartialSup.RuleHits)
+	}
+
+	// Reject JSON `null` as a rules file
+	nullPath := filepath.Join(t.TempDir(), "null-rules.json")
+	if err := os.WriteFile(nullPath, []byte("null\n"), 0600); err != nil {
+		t.Fatalf("write null-rules.json: %v", err)
+	}
+	if _, err := LoadEngine(nullPath); err == nil {
+		t.Fatal("expected LoadEngine to reject JSON null rules file")
+	}
+
+	// Burst rule in standalone Evaluate must NOT fire for 1 login failed + 4 login succeeded,
+	// while 5 matching failures MUST trigger SENT-001.
+	mixedBurst := defEng.Evaluate(model.TemplateWindow{
+		Service:           "sshd",
+		Level:             "INFO",
+		Count:             5,
+		Template:          "login <*>",
+		SampleLine:        "login failed",
+		AdditionalSamples: []string{"login succeeded", "login succeeded", "login succeeded", "login succeeded"},
+	}, 1024)
+	for _, h := range mixedBurst.RuleHits {
+		if h.RuleID == "SENT-001" {
+			t.Fatalf("SENT-001 falsely fired on 1 failure + 4 successes: %+v", mixedBurst.RuleHits)
+		}
+	}
+	realBurst := defEng.Evaluate(model.TemplateWindow{
+		Service:    "sshd",
+		Level:      "INFO",
+		Count:      5,
+		Template:   "login failed for <*>",
+		SampleLine: "login failed for user1",
+		AdditionalSamples: []string{
+			"login failed for user2",
+			"login failed for user3",
+			"login failed for user4",
+			"login failed for user5",
+		},
+	}, 1024)
+	foundBurst := false
+	for _, h := range realBurst.RuleHits {
+		if h.RuleID == "SENT-001" {
+			foundBurst = true
+		}
+	}
+	if !foundBurst {
+		t.Fatalf("expected SENT-001 on 5 matching login failures, got %+v", realBurst.RuleHits)
+	}
+
+	// Explicit match counts override window.Count in EvaluateWithMatchCounts
+	withCounts := defEng.EvaluateWithMatchCounts(model.TemplateWindow{
+		Service:    "sshd",
+		Level:      "INFO",
+		Count:      10,
+		SampleLine: "login failed",
+	}, map[string]uint64{"SENT-001": 1}, 1024)
+	for _, h := range withCounts.RuleHits {
+		if h.RuleID == "SENT-001" {
+			t.Fatalf("SENT-001 fired despite explicit matchCount=1: %+v", withCounts.RuleHits)
+		}
+	}
+
+	// Message-pattern rule must NOT fall back to matching w.Template after suppressing a sample.
+	jobEng, err := NewEngine(RulePack{
+		Version: "1.0",
+		Rules: []Rule{{
+			ID:          "JOB-1",
+			Category:    "job_check",
+			Severity:    "MEDIUM",
+			Description: "match leading job done",
+			Pattern:     `^job done`,
+			MinCount:    1,
+			Enabled:     true,
+		}},
+		Suppressions: []Suppression{{ID: "SUP-NOISY", Pattern: "noisy", Reason: "benign noisy"}},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine jobEng: %v", err)
+	}
+	resNoFallback := jobEng.Evaluate(model.TemplateWindow{
+		Service:           "worker",
+		Level:             "INFO",
+		Count:             2,
+		Template:          "job done <*>",
+		SampleLine:        "job done noisy",
+		AdditionalSamples: []string{"job  done healthy"},
+	}, 1024)
+	if len(resNoFallback.RuleHits) != 0 {
+		t.Fatalf("message-pattern rule falsely fell back to w.Template after suppression: %+v", resNoFallback.RuleHits)
+	}
+	resUnsupMatch := jobEng.Evaluate(model.TemplateWindow{
+		Service:           "worker",
+		Level:             "INFO",
+		Count:             2,
+		Template:          "job done <*>",
+		SampleLine:        "job done noisy",
+		AdditionalSamples: []string{"job done healthy"},
+	}, 1024)
+	if len(resUnsupMatch.RuleHits) != 1 || resUnsupMatch.RuleHits[0].RuleID != "JOB-1" {
+		t.Fatalf("expected JOB-1 hit on unsuppressed matching sample, got %+v", resUnsupMatch.RuleHits)
 	}
 }

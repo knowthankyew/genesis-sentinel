@@ -118,8 +118,8 @@ func GenerateSyntheticCorpus(totalLines int, seed uint64, emitFn func(raw []byte
 	return sum, nil
 }
 
-// MaxSyntheticInMemoryLines bounds ParseLogEventsFromRaw slice preallocation so huge
-// counts cannot panic or exhaust memory; use GenerateSyntheticCorpus to stream larger runs.
+// MaxSyntheticInMemoryLines caps the number of events preallocated and retained in memory
+// by ParseLogEventsFromRaw; use GenerateSyntheticCorpus to stream larger runs.
 const MaxSyntheticInMemoryLines = 1_000_000
 
 // ParseLogEventsFromRaw is a convenience helper converting raw synthetic lines directly to LogEvents.

@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
@@ -16,6 +18,7 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/ingest"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
+	"github.com/knowthankyew/genesis-sentinel/internal/template"
 )
 
 type failingSink struct{}
@@ -248,7 +251,8 @@ func TestPipelineCountsOnlySuccessfulSinkEmissions(t *testing.T) {
 func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
 	dataDir := t.TempDir()
 	outsideDir := t.TempDir()
-	outsideFile := filepath.Join(outsideDir, "precious.jsonl")
+	// Use an owned feedback filename so survival genuinely establishes non-traversal.
+	outsideFile := filepath.Join(outsideDir, "sentinel-feedback.jsonl")
 	if err := os.WriteFile(outsideFile, []byte(`{"keep":true}`), 0600); err != nil {
 		t.Fatalf("write outside file: %v", err)
 	}
@@ -260,6 +264,120 @@ func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
 		t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
 	}
 	if _, err := os.Stat(outsideFile); err != nil {
-		t.Fatalf("outside file was deleted through feedback symlink: %v", err)
+		t.Fatalf("outside sentinel-feedback.jsonl was deleted through feedback symlink: %v", err)
+	}
+}
+
+func TestPipelineOverflowDoesNotCombineThresholdsAndCapsRuleBuckets(t *testing.T) {
+	cfg := config.DefaultConfig()
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+	pipe.agg = template.NewAggregator(1) // capacity=1 so subsequent templates overflow
+	pipe.maxPendingRuleBuckets = 2
+
+	// Occupy the single dedicated cluster slot with a benign template
+	pipe.IngestEvent(model.LogEvent{ID: 1, Timestamp: 100, Service: "api", Level: "INFO", Message: "ready"})
+
+	// Two unrelated overflowed templates on (auth, INFO): 3 matches on A + 2 matches on B.
+	// Neither template reaches SENT-001 MinCount=5, so NO SENT-001 alert may fire!
+	for i := 0; i < 3; i++ {
+		pipe.IngestEvent(model.LogEvent{ID: uint64(10 + i), Timestamp: 101, Service: "auth", Level: "INFO", Message: "alpha invalid user alice"})
+	}
+	for i := 0; i < 2; i++ {
+		pipe.IngestEvent(model.LogEvent{ID: uint64(20 + i), Timestamp: 102, Service: "auth", Level: "INFO", Message: "beta login failed bob"})
+	}
+
+	alerts, _ := pipe.FlushWindow()
+	for _, a := range alerts {
+		for _, rid := range a.RuleIDs {
+			if rid == "SENT-001" {
+				t.Fatalf("SENT-001 falsely combined thresholds across unrelated overflow templates: %+v", a)
+			}
+		}
+	}
+	if st := pipe.Stats(); st.OverflowThresholdSkipped != 5 {
+		t.Fatalf("expected OverflowThresholdSkipped=5, got %d", st.OverflowThresholdSkipped)
+	}
+
+	// Verify pending rule bucket cap holds strictly across distinct (service, level) pairs.
+	pipe2 := New(cfg, ruleEng, emit.NopSink{}, "file")
+	pipe2.maxPendingRuleBuckets = 3
+	for i := 0; i < 10; i++ {
+		pipe2.IngestEvent(model.LogEvent{
+			ID:        uint64(100 + i),
+			Timestamp: 200,
+			Service:   fmt.Sprintf("svc-%d", i),
+			Level:     "WARN",
+			Message:   "GET /../../etc/passwd 403",
+		})
+	}
+	if len(pipe2.pendingHits) > 3 {
+		t.Fatalf("pendingHits exceeded maxPendingRuleBuckets=3: got %d", len(pipe2.pendingHits))
+	}
+	emitted, _ := pipe2.FlushWindow()
+	if len(emitted) != 3 {
+		t.Fatalf("expected 3 retained bucket alerts, got %d", len(emitted))
+	}
+	if st := pipe2.Stats(); st.RuleBucketsDropped != 7 {
+		t.Fatalf("expected RuleBucketsDropped=7, got %d", st.RuleBucketsDropped)
+	}
+}
+
+func TestPipelineAtomicWindowBoundaryUnderConcurrency(t *testing.T) {
+	cfg := config.DefaultConfig()
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var alertMu sync.Mutex
+	var allAlerts []emit.Alert
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				emitted, _ := pipe.FlushWindow()
+				if len(emitted) > 0 {
+					alertMu.Lock()
+					allAlerts = append(allAlerts, emitted...)
+					alertMu.Unlock()
+				}
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID:        uint64(i + 1),
+			Timestamp: 1763996400,
+			Service:   "nginx",
+			Level:     "WARN",
+			Message:   fmt.Sprintf("GET /static/../../../../etc/passwd?req=%d HTTP/1.1 403", i),
+		})
+	}
+	close(stop)
+	wg.Wait()
+	if final, _ := pipe.FlushWindow(); len(final) > 0 {
+		allAlerts = append(allAlerts, final...)
+	}
+
+	if len(allAlerts) == 0 {
+		t.Fatal("expected at least one alert under concurrent ingest/flush")
+	}
+	for _, a := range allAlerts {
+		if a.Template == "<OVERFLOW>" {
+			t.Fatalf("concurrent FlushWindow split template and rule hit across windows (got <OVERFLOW>): %+v", a)
+		}
 	}
 }

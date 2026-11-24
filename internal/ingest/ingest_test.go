@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -75,6 +76,11 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	ev, err = ParseRawLog(52, []byte(`<36>Nov 24 10:00:00 host1 cronjob completed ok`), 0, "genesis")
 	if err != nil || ev.Service != "cronjob" || ev.Message != "completed ok" {
 		t.Fatalf("RFC 3164 space-delimited tag failed: ev=%+v err=%v", ev, err)
+	}
+	// Hostname-free RFC 3164 TAG with PID must preserve service=sentinel for self-alert filtering
+	ev, err = ParseRawLog(521, []byte(`<36>Nov 24 10:00:00 sentinel[42] alert emitted`), 0, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != "alert emitted" {
+		t.Fatalf("RFC 3164 hostname-free PID tag lost service=sentinel: ev=%+v err=%v", ev, err)
 	}
 
 	// 5a. Extreme float timestamp 1e20 falls back cleanly without int64 overflow UB
@@ -411,11 +417,22 @@ func TestQueryPollerGapWithCursorRowPresentAndConcurrency(t *testing.T) {
 		t.Fatal("timed out waiting for second Poll request to enter handler")
 	}
 
-	// Verify canceled caller exits Poll queue promptly without waiting for gate
-	cancelCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := poller.Poll(cancelCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected queued canceled Poll to return DeadlineExceeded, got %v", err)
+	// Verify canceled caller exits Poll queue promptly without waiting for gate (guarded by watchdog)
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := poller.Poll(cancelCtx)
+		cancelDone <- err
+	}()
+	select {
+	case err := <-cancelDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected queued canceled Poll to return DeadlineExceeded, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseGate()
+		t.Fatal("queued canceled Poll blocked instead of honoring context cancellation")
 	}
 
 	// Exercise concurrent Stats and SetMaxResponseBytes while Poll is blocked in HTTP handler (with timeout guard)
@@ -444,5 +461,103 @@ func TestQueryPollerGapWithCursorRowPresentAndConcurrency(t *testing.T) {
 	st := poller.Stats()
 	if st.EvictionGaps != 1 || st.EstimatedLost != 3 {
 		t.Fatalf("cursor 10 + page [10, 14]: expected EvictionGaps=1 EstimatedLost=3, got %+v", st)
+	}
+}
+
+func TestQueryPollerRejectsTrailingGarbageWithoutAdvancingCursor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"count":1,"logs":[{"id":99,"timestamp":1000,"service":"api","level":"INFO","message":"ok"}]} trailing-garbage`))
+	}))
+	defer srv.Close()
+
+	poller := NewQueryPoller(srv.URL, "", 100, false)
+	if _, err := poller.Poll(context.Background()); err == nil {
+		t.Fatal("expected QueryPoller to reject trailing non-whitespace garbage after JSON object")
+	}
+	if st := poller.Stats(); st.LastID != 0 || st.EventsRead != 0 {
+		t.Fatalf("cursor advanced despite malformed response: %+v", st)
+	}
+}
+
+func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *testing.T) {
+	// 1. Quiet active segment with a fake incomplete candidate header in the first 256 KiB
+	// and a real valid frame beyond 256 KiB must still advance and recover the later frame.
+	segDir := t.TempDir()
+	seg1 := filepath.Join(segDir, "00000001.seg")
+	buf := bytes.Repeat([]byte{0xff}, maxRecoveryScanBytes+4096)
+	// Place a fake incomplete candidate header at offset 100 claiming payloadLen = 900000 (> fileSize)
+	binary.BigEndian.PutUint32(buf[100:104], 900000)
+	binary.BigEndian.PutUint32(buf[104:108], 0xdeadbeef)
+	var validFrame bytes.Buffer
+	_ = WriteSegmentFrame(&validFrame, []byte(`{"timestamp":500,"service":"api","level":"INFO","message":"beyond-scan-window"}`))
+	buf = append(buf, validFrame.Bytes()...)
+	if err := os.WriteFile(seg1, buf, 0600); err != nil {
+		t.Fatalf("write quiet damaged seg: %v", err)
+	}
+
+	r, err := NewSegReader(segDir, filepath.Join(t.TempDir(), "c1.json"), 0)
+	if err != nil {
+		t.Fatalf("NewSegReader: %v", err)
+	}
+	b1, err := r.ReadBatch(10)
+	if err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	if len(b1) != 0 {
+		t.Fatalf("expected 0 events on first bounded scan poll, got %d", len(b1))
+	}
+	b2, err := r.ReadBatch(10)
+	if err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	if len(b2) != 1 || b2[0].Message != "beyond-scan-window" {
+		t.Fatalf("expected quiet active segment to advance past fake incomplete candidate and recover frame, got %+v", b2)
+	}
+
+	// 2. Active segment with a genuine in-flight frame after corruption recovers once file grows.
+	segDir2 := t.TempDir()
+	seg2 := filepath.Join(segDir2, "00000001.seg")
+	var partialFull bytes.Buffer
+	partialFull.Write(bytes.Repeat([]byte{0xff}, 32)) // corrupt prefix
+	var targetFrame bytes.Buffer
+	_ = WriteSegmentFrame(&targetFrame, []byte(`{"timestamp":600,"service":"sshd","level":"ERROR","message":"inflight-frame-completed"}`))
+	fullBytes := append(partialFull.Bytes(), targetFrame.Bytes()...)
+	halfCut := 32 + MagicHeaderLen + 10
+	if err := os.WriteFile(seg2, fullBytes[:halfCut], 0600); err != nil {
+		t.Fatalf("write partial seg2: %v", err)
+	}
+	r2, _ := NewSegReader(segDir2, filepath.Join(t.TempDir(), "c2.json"), 0)
+	if evs, err := r2.ReadBatch(10); err != nil || len(evs) != 0 {
+		t.Fatalf("expected 0 events before growth, got len=%d err=%v", len(evs), err)
+	}
+	// Complete the in-flight frame write
+	if err := os.WriteFile(seg2, fullBytes, 0600); err != nil {
+		t.Fatalf("complete seg2: %v", err)
+	}
+	evs, err := r2.ReadBatch(10)
+	if err != nil || len(evs) != 1 || evs[0].Message != "inflight-frame-completed" {
+		t.Fatalf("expected pending incomplete candidate to recover after file growth, got %+v err=%v", evs, err)
+	}
+
+	// 3. Budget must stop after one processed frame even when CRC-valid frames fail ParseRawLog.
+	segDir3 := t.TempDir()
+	seg3 := filepath.Join(segDir3, "00000001.seg")
+	f3, err := os.Create(seg3)
+	if err != nil {
+		t.Fatalf("create seg3: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		// Whitespace-only payloads pass CRC32 but fail ParseRawLog with ErrEmptyInput
+		_ = WriteSegmentFrame(f3, bytes.Repeat([]byte{' '}, 64))
+	}
+	_ = f3.Close()
+
+	r3, _ := NewSegReader(segDir3, filepath.Join(t.TempDir(), "c3.json"), 0)
+	r3.SetMaxBatchBytes(10) // smaller than one 72-byte frame; only 1 over-budget frame allowed per call
+	if _, err := r3.ReadBatch(100); err != nil {
+		t.Fatalf("ReadBatch seg3: %v", err)
+	}
+	if st := r3.Stats(); st.FramesRead != 1 {
+		t.Fatalf("expected over-budget exception limited to 1 parse-failing frame per ReadBatch, got FramesRead=%d", st.FramesRead)
 	}
 }

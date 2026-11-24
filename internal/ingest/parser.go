@@ -502,13 +502,14 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	msg := remainder
 
 	// RFC 3164 layout after timestamp: HOSTNAME MSG (where MSG begins with TAG[: ]CONTENT).
-	// Recognize IPv6 literals (including ones ending in "::" like 2001:db8::) before testing
-	// whether firstWord is a colon-terminated TAG without a hostname.
+	// Recognize IPv6 literals (including ones ending in "::" like 2001:db8::) and hostname-free
+	// TAGs (colon-terminated or PID-bracketed like "sentinel[42]") before stripping an optional hostname.
 	if spIdx := strings.IndexByte(remainder, ' '); spIdx != -1 {
 		firstWord := remainder[:spIdx]
 		afterHost := strings.TrimSpace(remainder[spIdx+1:])
 		isIPv6Host := net.ParseIP(strings.Trim(firstWord, "[]")) != nil
-		if (isIPv6Host || !strings.HasSuffix(firstWord, ":")) && afterHost != "" {
+		isTagWord := strings.HasSuffix(firstWord, ":") || isPIDTaggedSyslogWord(firstWord)
+		if (isIPv6Host || !isTagWord) && afterHost != "" {
 			remainder = afterHost
 		}
 	}
@@ -560,6 +561,27 @@ func stripPIDBracket(rawTag string) string {
 		return rawTag[:idx]
 	}
 	return rawTag
+}
+
+// isPIDTaggedSyslogWord reports whether word is a hostname-free RFC 3164 TAG with a
+// bracketed numeric PID (e.g. "sentinel[42]" or "sshd[1234]:").
+func isPIDTaggedSyslogWord(word string) bool {
+	trimmed := strings.TrimSuffix(word, ":")
+	openIdx := strings.IndexByte(trimmed, '[')
+	if openIdx <= 0 || !strings.HasSuffix(trimmed, "]") {
+		return false
+	}
+	tag := trimmed[:openIdx]
+	pid := trimmed[openIdx+1 : len(trimmed)-1]
+	if !isValidSyslogTag(tag) || len(pid) == 0 {
+		return false
+	}
+	for i := 0; i < len(pid); i++ {
+		if pid[i] < '0' || pid[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidSyslogTag(tag string) bool {
