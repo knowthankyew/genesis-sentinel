@@ -114,9 +114,10 @@ func (m *DrainMiner) ClusterBytes() int {
 }
 
 // extractBoundedTokens iterates msg lazily via Go 1.24 strings.FieldsSeq, masking only
-// up to maxTokens fields and inspecting at most one additional field to append "<*>"
-// when more tokens exist, avoiding large temporary slices on multi-thousand-token lines.
+// up to maxTokens fields and skipping normalization work on raw tokens exceeding
+// maxTokenBytes*2 so giant slash-heavy payloads cannot trigger large temporary allocations.
 func extractBoundedTokens(msg string, maxTokens, maxTokenBytes int) []string {
+	maxRawNormBytes := maxTokenBytes * 2
 	var tokens []string
 	for rawTok := range strings.FieldsSeq(msg) {
 		if len(tokens) >= maxTokens {
@@ -125,6 +126,10 @@ func extractBoundedTokens(msg string, maxTokens, maxTokenBytes int) []string {
 		}
 		if tokens == nil {
 			tokens = make([]string, 0, 16)
+		}
+		if len(rawTok) > maxRawNormBytes {
+			tokens = append(tokens, "<*>")
+			continue
 		}
 		tok := maskToken(rawTok)
 		if len(tok) > maxTokenBytes {
@@ -554,6 +559,9 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 		}
 	} else if sample != "" && sample == w.SampleLine {
 		if w.SampleTruncated && !sampleTruncated {
+			// A complete message replaced a clipped preview of identical bytes: update
+			// SampleEntropy to the complete event's true score before clearing SampleTruncated.
+			w.SampleEntropy = ent
 			w.SampleTruncated = false
 		}
 	} else if sample != "" && sample != w.SampleLine {
@@ -760,27 +768,41 @@ func maskScalar(tok string) string {
 }
 
 func maskPathSegments(p string) string {
-	parts := strings.Split(p, "/")
-	changed := false
-	for i, seg := range parts {
-		if seg == "" {
-			continue
-		}
-		if isUUID(seg) {
-			parts[i] = "<UUID>"
-			changed = true
-		} else if isHexBlob(seg) {
-			parts[i] = "<HEX>"
-			changed = true
-		} else if isAllDigitsStr(seg) {
-			parts[i] = "<NUM>"
-			changed = true
+	needsMask := false
+	for seg := range strings.SplitSeq(p, "/") {
+		if seg != "" && (isUUID(seg) || isHexBlob(seg) || isAllDigitsStr(seg)) {
+			needsMask = true
+			break
 		}
 	}
-	if !changed {
+	if !needsMask {
 		return p
 	}
-	return strings.Join(parts, "/")
+	var b strings.Builder
+	b.Grow(len(p))
+	first := true
+	for seg := range strings.SplitSeq(p, "/") {
+		if !first {
+			b.WriteByte('/')
+		}
+		first = false
+		if seg != "" {
+			if isUUID(seg) {
+				b.WriteString("<UUID>")
+				continue
+			}
+			if isHexBlob(seg) {
+				b.WriteString("<HEX>")
+				continue
+			}
+			if isAllDigitsStr(seg) {
+				b.WriteString("<NUM>")
+				continue
+			}
+		}
+		b.WriteString(seg)
+	}
+	return b.String()
 }
 
 func isSimpleKey(s string) bool {

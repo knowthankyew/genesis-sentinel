@@ -212,6 +212,10 @@ func TestPipelineEndToEnd100kSyntheticSegmentReplay(t *testing.T) {
 	if err := json.Unmarshal(applyGenesisRedact(bytes.TrimSpace(usBuf.Bytes())), &usDecoded); err != nil {
 		t.Fatalf("alert with microsecond timestamp + quoted card failed JSON parse after Genesis --redact: %v", err)
 	}
+	// Ambiguous 12-digit pre-2001 value (999999999999) falls back cleanly instead of emitting year 33658
+	if got := normalizeAlertTimestamp(999_999_999_999, 1763996400); got != 1763996400 {
+		t.Fatalf("expected ambiguous 999999999999 to fall back to 1763996400, got %d", got)
+	}
 
 	// Verify Burn wipes Sentinel-owned cursor.json & sentinel-feedback.jsonl while preserving unrelated user files!
 	rep, err := pipe.Burn()
@@ -246,16 +250,37 @@ func TestPipelineCountsSignatureMatchesNotTotalWindowEvents(t *testing.T) {
 	}
 	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
 
-	// 4 benign "valid user" lines + 1 "invalid user" line collapse into the same Drain template (total=5),
-	// but only 1 event actually matches SENT-001 (MinCount=5) — must NOT false-alert!
+	// 4 benign "valid user" lines + 1 "invalid user" line collapse into ONE Drain template (total=5),
+	// with exactly 1 event matching SENT-001 (MinCount=5) — must NOT false-alert!
 	for i := 0; i < 4; i++ {
 		pipe.IngestEvent(model.LogEvent{ID: uint64(i + 1), Timestamp: 100, Service: "auth", Level: "INFO", Message: "request completed for valid user alice"})
 	}
 	pipe.IngestEvent(model.LogEvent{ID: 5, Timestamp: 101, Service: "auth", Level: "INFO", Message: "request completed for invalid user mallory"})
 
+	if len(pipe.pendingHits) != 1 {
+		t.Fatalf("expected 1 pending rule bucket for the single SENT-001 match, got %d", len(pipe.pendingHits))
+	}
+	for _, b := range pipe.pendingHits {
+		if acc := b.rules["SENT-001"]; acc == nil || acc.matchCount != 1 {
+			t.Fatalf("expected SENT-001 matchCount=1 before flush, got %+v", acc)
+		}
+	}
+
 	alerts, _ := pipe.FlushWindow()
 	if len(alerts) != 0 {
 		t.Fatalf("expected 0 SENT-001 alerts for 4 valid + 1 invalid user, got %+v", alerts)
+	}
+	if st := pipe.Stats(); st.TemplatesEmitted != 1 {
+		t.Fatalf("expected all 5 inputs to share 1 template window, got TemplatesEmitted=%d", st.TemplatesEmitted)
+	}
+
+	// Positive control: 5 matching "invalid user" events in the same bucket MUST trigger SENT-001.
+	for i := 0; i < 5; i++ {
+		pipe.IngestEvent(model.LogEvent{ID: uint64(10 + i), Timestamp: 102, Service: "auth", Level: "INFO", Message: "request completed for invalid user mallory"})
+	}
+	posAlerts, _ := pipe.FlushWindow()
+	if len(posAlerts) != 1 || len(posAlerts[0].RuleIDs) != 1 || posAlerts[0].RuleIDs[0] != "SENT-001" || posAlerts[0].Count != 5 {
+		t.Fatalf("expected positive control to emit 1 SENT-001 alert with Count=5, got %+v", posAlerts)
 	}
 }
 

@@ -713,22 +713,29 @@ func isOwnedFeedbackFile(name string) bool {
 	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
 }
 
-// normalizeAlertTimestamp converts sub-second Unix epochs (ms/us/ns) to Unix seconds
-// matching Genesis's LogEntry.Timestamp contract and guarantees the serialized bare
-// JSON integer is never a 16-digit run that Genesis --redact would replace with an
-// unquoted [REDACTED_CARD] token.
+// normalizeAlertTimestamp enforces the Unix-seconds alert timestamp contract expected by
+// Genesis (`parser.LogEntry.Timestamp`). Supported input ranges without explicit unit metadata:
+//   - Unix seconds:       1 .. 99_999_999_999 (through year 5138; <= 11 digits)
+//   - Contemporary ms:    1_000_000_000_000 .. 999_999_999_999_999 (2001-09-09+) -> / 1e3
+//   - Contemporary us:    1_000_000_000_000_000 .. 999_999_999_999_999_999 (16-18 digits) -> / 1e6
+//   - Contemporary ns:    >= 1_000_000_000_000_000_000 -> / 1e9
+//
+// Values outside the supported Unix-second range after normalization (e.g. ambiguous 12-digit
+// pre-2001 milliseconds such as 999_999_999_999) fall back to fallbackUnix so Sentinel never
+// emits a mis-scaled year or a bare 16-digit integer that breaks Genesis --redact JSON parsing.
 func normalizeAlertTimestamp(ts, fallbackUnix int64) int64 {
+	const maxSupportedUnixSec = 99_999_999_999 // 11 digits (year 5138)
 	if ts <= 0 {
 		return fallbackUnix
 	}
-	if ts >= 1_000_000_000_000_000_000 { // nanoseconds (>= 1e18)
+	if ts >= 1_000_000_000_000_000_000 { // contemporary nanoseconds (>= 1e18)
 		ts /= 1_000_000_000
-	} else if ts >= 1_000_000_000_000_000 { // microseconds (>= 1e15, 16-digit range!)
+	} else if ts >= 1_000_000_000_000_000 { // contemporary microseconds (>= 1e15)
 		ts /= 1_000_000
-	} else if ts >= 1_000_000_000_000 { // milliseconds (>= 1e12)
+	} else if ts >= 1_000_000_000_000 { // contemporary milliseconds (>= 1e12)
 		ts /= 1_000
 	}
-	if ts >= 1_000_000_000_000_000 && ts <= 9_999_999_999_999_999 {
+	if ts <= 0 || ts > maxSupportedUnixSec {
 		return fallbackUnix
 	}
 	return ts

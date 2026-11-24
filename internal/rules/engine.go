@@ -392,12 +392,24 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 
 // EvaluateWithMatchCounts inspects a TemplateWindow using optional per-rule matching-event
 // counts (keyed by rule ID). When matchCounts is non-nil, firing decisions use matchCounts[ruleID]
-// directly and treat retained preview samples as optional evidence.
+// directly (relying on MatchEvent for event-level service/pattern suppressions and applying
+// only service-independent template suppressions at window level) and treat retained preview
+// samples as optional evidence.
 func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map[string]uint64, maxPromptBytes int) EvaluationResult {
-	// Service-only or template-only suppressions suppress the entire window.
-	if e.isWindowSuppressed(w) {
-		sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
-		return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
+	if matchCounts == nil {
+		// Preview mode: service-only or template-only suppressions suppress the entire window.
+		if e.isWindowSuppressed(w) {
+			sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
+			return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
+		}
+	} else {
+		// Exact mode: event-level service suppressions already ran in MatchEvent against
+		// the untruncated service identity; only apply service-independent template suppressions
+		// here so clipped 128-byte display names never falsely discard exact matches.
+		if e.isGlobalTemplateSuppressed(w.Template) {
+			sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
+			return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
+		}
 	}
 
 	type previewSample struct {
@@ -405,7 +417,9 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 		truncated bool
 	}
 
-	// Build candidate list excluding any individual sample matched by a message-pattern suppression.
+	// Build candidate list excluding complete samples matched by a message-pattern suppression.
+	// Never apply a message-pattern suppression regex to a clipped preview whose omitted tail
+	// could falsify an anchored match (e.g. "^status ok$" on truncated "status ok").
 	rawCandidates := make([]previewSample, 0, 1+len(w.AdditionalSamples))
 	if w.SampleLine != "" {
 		rawCandidates = append(rawCandidates, previewSample{text: w.SampleLine, truncated: w.SampleTruncated})
@@ -417,9 +431,10 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 
 	var activeSamples []previewSample
 	for _, cand := range rawCandidates {
-		if !e.isSamplePatternSuppressed(w.Service, w.Template, cand.text) {
-			activeSamples = append(activeSamples, cand)
+		if !cand.truncated && e.isSamplePatternSuppressed(w.Service, w.Template, cand.text) {
+			continue
 		}
+		activeSamples = append(activeSamples, cand)
 	}
 	// In preview-only mode (matchCounts == nil), suppress the window if every retained preview
 	// matched a message-pattern suppression. When exact event-level matchCounts are provided,
@@ -456,17 +471,32 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	}
 
 	res := EvaluationResult{
-		InjectionSuspected: len(injSignals) > 0,
-		InjectionSignals:   injSignals,
-		SanitizedSample:    sanitized,
-		InjectionSample:    injSample,
+		SanitizedSample: sanitized,
 	}
-	if res.InjectionSuspected && injSample != "" {
-		res.SanitizedSample = injSample
-	}
-
-	if res.InjectionSuspected || (matchCounts != nil && matchCounts["SENT-006"] > 0) {
+	if matchCounts != nil {
+		// Exact mode: SENT-006 fires strictly from matchCounts["SENT-006"] > 0;
+		// retain preview evidence only when exact count confirms an injection hit.
+		if matchCounts["SENT-006"] > 0 {
+			res.InjectionSuspected = true
+			res.InjectionSignals = injSignals
+			res.InjectionSample = injSample
+			if injSample != "" {
+				res.SanitizedSample = injSample
+			}
+			res.RuleHits = append(res.RuleHits, model.RuleHit{
+				RuleID:      "SENT-006",
+				Category:    "prompt_injection_probe",
+				Severity:    "HIGH",
+				Description: "Adversarial LLM control delimiter or prompt-injection phrase detected in untrusted log",
+			})
+		}
+	} else if len(injSignals) > 0 {
 		res.InjectionSuspected = true
+		res.InjectionSignals = injSignals
+		res.InjectionSample = injSample
+		if injSample != "" {
+			res.SanitizedSample = injSample
+		}
 		res.RuleHits = append(res.RuleHits, model.RuleHit{
 			RuleID:      "SENT-006",
 			Category:    "prompt_injection_probe",
@@ -511,9 +541,10 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 			matchedCount = len(activeSamples)
 		} else {
 			for _, cand := range activeSamples {
-				// Exclude clipped previews from confirmed regex matches (e.g. anchored "^status ok$"
-				// must not fire on truncated "status ok" from "status ok later").
-				if cr.re != nil && cand.truncated {
+				// Exclude clipped previews from confirmed regex or entropy matches:
+				// a clipped prefix can satisfy anchored regexes ("^status ok$") or score
+				// artificially higher entropy than the complete event payload.
+				if cand.truncated && (cr.re != nil || cr.rule.MinEntropy > 0) {
 					continue
 				}
 				if cr.rule.MinLength > 0 && len(cand.text) < cr.rule.MinLength {
@@ -573,6 +604,21 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	}
 
 	return res
+}
+
+func (e *Engine) isGlobalTemplateSuppressed(tmpl string) bool {
+	if tmpl == "" {
+		return false
+	}
+	for _, cs := range e.suppressions {
+		if cs.re != nil || cs.supp.Service != "" {
+			continue
+		}
+		if cs.supp.Template != "" && cs.supp.Template == tmpl {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) hasApplicablePatternSuppression(service, tmpl string) bool {

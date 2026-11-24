@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,38 @@ import (
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
+
+func writeSegmentFixture(t *testing.T, path string, frames ...[]byte) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create segment %q: %v", path, err)
+	}
+	for i, frame := range frames {
+		if err := WriteSegmentFrame(f, frame); err != nil {
+			_ = f.Close()
+			t.Fatalf("write frame %d to %q: %v", i, path, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close segment %q: %v", path, err)
+	}
+}
+
+func appendBytesFixture(t *testing.T, path string, extra []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open %q for append: %v", path, err)
+	}
+	if _, err := f.Write(extra); err != nil {
+		_ = f.Close()
+		t.Fatalf("append %d bytes to %q: %v", len(extra), path, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close appended %q: %v", path, err)
+	}
+}
 
 func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	// 1. JSON Lines (including surrounding whitespace preserving service=sentinel)
@@ -106,6 +139,20 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	ev, err = ParseRawLog(524, []byte(`<36>Nov 24 10:00:00 host1 sshd[notice: failed]`), 0, "genesis")
 	if err != nil || ev.Service != "sshd" || ev.Message != "[notice: failed]" {
 		t.Fatalf("RFC 3164 bracketed CONTENT mangled as PID: ev=%+v err=%v", ev, err)
+	}
+	// RFC 3164 '.' is a CONTENT delimiter per RFC 3164 §4.1.3 while DNS hostname '.' is preserved
+	ev, err = ParseRawLog(525, []byte(`<36>Nov 24 10:00:00 host sentinel.alert`), 0, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != ".alert" {
+		t.Fatalf("RFC 3164 '.' content delimiter lost service=sentinel: ev=%+v err=%v", ev, err)
+	}
+	ev, err = ParseRawLog(526, []byte(`<36>Nov 24 10:00:00 web-01.prod sshd: failed`), 0, "genesis")
+	if err != nil || ev.Service != "sshd" || ev.Message != "failed" {
+		t.Fatalf("RFC 3164 dotted DNS hostname failed: ev=%+v err=%v", ev, err)
+	}
+	// RFC 3164 with small maxLineLen=32 must preserve service=sentinel before truncating MSG
+	ev, err = ParseRawLog(527, []byte(`<36>Nov 24 10:00:00 localhost sentinel: alert payload`), 32, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != "alert payload" {
+		t.Fatalf("RFC 3164 small maxLineLen=32 lost service=sentinel: ev=%+v err=%v", ev, err)
 	}
 	// Whitespace-only input must return ErrEmptyInput instead of plain-text INFO event
 	if _, err := ParseRawLog(523, []byte("    \t   "), 0, "genesis"); !errors.Is(err, ErrEmptyInput) {
@@ -293,7 +340,11 @@ func TestQueryPollerDeduplicationGapsSaturationBoundsAndConcurrency(t *testing.T
 		t.Fatalf("expected EvictionGaps=1 EstimatedLost=7 SaturatedPages=2, got %+v", st)
 	}
 
-	// Test response byte limit
+	// Test response byte limit (and math.MaxInt64 clamping so maxBytes+1 never wraps)
+	poller.SetMaxResponseBytes(math.MaxInt64)
+	if _, err := poller.Poll(ctx); err != nil {
+		t.Fatalf("SetMaxResponseBytes(math.MaxInt64) caused Poll error: %v", err)
+	}
 	poller.SetMaxResponseBytes(10)
 	if _, err := poller.Poll(ctx); !errors.Is(err, ErrQueryResponseTooLarge) {
 		t.Fatalf("expected ErrQueryResponseTooLarge, got %v", err)
@@ -318,10 +369,7 @@ func TestSegReaderSegmentRotationAndIdenticalPrefixReplacement(t *testing.T) {
 	seg2 := filepath.Join(segDir, "00000002.seg")
 	prefixLine := []byte(`{"timestamp":100,"service":"api","level":"INFO","message":"identical-prefix-padding-line-repeated-across-burn-boundary-0123456789012345678901234567890123456789"}`)
 
-	f1, _ := os.Create(seg1)
-	_ = WriteSegmentFrame(f1, prefixLine)
-	_ = WriteSegmentFrame(f1, []byte(`{"timestamp":101,"service":"api","level":"INFO","message":"seg1-second"}`))
-	_ = f1.Close()
+	writeSegmentFixture(t, seg1, prefixLine, []byte(`{"timestamp":101,"service":"api","level":"INFO","message":"seg1-second"}`))
 
 	r1, err := NewSegReader(segDir, cursorPath, 0)
 	if err != nil {
@@ -336,10 +384,10 @@ func TestSegReaderSegmentRotationAndIdenticalPrefixReplacement(t *testing.T) {
 	}
 
 	// Rotate to 00000002.seg and resume from saved cursor
-	f2, _ := os.Create(seg2)
-	_ = WriteSegmentFrame(f2, []byte(`{"timestamp":102,"service":"sshd","level":"ERROR","message":"seg2-first"}`))
-	_ = WriteSegmentFrame(f2, []byte(`{"timestamp":103,"service":"sshd","level":"ERROR","message":"seg2-second"}`))
-	_ = f2.Close()
+	writeSegmentFixture(t, seg2,
+		[]byte(`{"timestamp":102,"service":"sshd","level":"ERROR","message":"seg2-first"}`),
+		[]byte(`{"timestamp":103,"service":"sshd","level":"ERROR","message":"seg2-second"}`),
+	)
 
 	r2, err := NewSegReader(segDir, cursorPath, 0)
 	if err != nil {
@@ -355,29 +403,32 @@ func TestSegReaderSegmentRotationAndIdenticalPrefixReplacement(t *testing.T) {
 		segDirB := t.TempDir()
 		cursorPathB := filepath.Join(t.TempDir(), "cursorB.json")
 		segB := filepath.Join(segDirB, "00000001.seg")
-		fb1, _ := os.Create(segB)
-		_ = WriteSegmentFrame(fb1, prefixLine)
-		_ = WriteSegmentFrame(fb1, prefixLine)
-		_ = fb1.Close()
+		writeSegmentFixture(t, segB, prefixLine, prefixLine)
 
-		rb1, _ := NewSegReader(segDirB, cursorPathB, 0)
+		rb1, err := NewSegReader(segDirB, cursorPathB, 0)
+		if err != nil {
+			t.Fatalf("NewSegReader rb1: %v", err)
+		}
 		if batch, err := rb1.ReadBatch(10); err != nil || len(batch) != 2 {
 			t.Fatalf("rb1 read: len=%d err=%v", len(batch), err)
 		}
-		_ = rb1.SaveCursor()
+		if err := rb1.SaveCursor(); err != nil {
+			t.Fatalf("rb1 SaveCursor: %v", err)
+		}
 
 		// Create replacement at a distinct temp path WHILE original segB still exists, then rename into place
 		segBNew := filepath.Join(segDirB, "00000001.seg.new")
-		fb2, _ := os.Create(segBNew)
-		_ = WriteSegmentFrame(fb2, prefixLine)
-		_ = WriteSegmentFrame(fb2, prefixLine)
-		_ = WriteSegmentFrame(fb2, []byte(`{"timestamp":200,"service":"api","level":"WARN","message":"after-identical-prefix-replacement"}`))
-		_ = fb2.Close()
+		writeSegmentFixture(t, segBNew, prefixLine, prefixLine,
+			[]byte(`{"timestamp":200,"service":"api","level":"WARN","message":"after-identical-prefix-replacement"}`),
+		)
 		if err := os.Rename(segBNew, segB); err != nil {
 			t.Fatalf("rename replacement segB: %v", err)
 		}
 
-		rb2, _ := NewSegReader(segDirB, cursorPathB, 0)
+		rb2, err := NewSegReader(segDirB, cursorPathB, 0)
+		if err != nil {
+			t.Fatalf("NewSegReader rb2: %v", err)
+		}
 		batchRepl, err := rb2.ReadBatch(10)
 		if err != nil || len(batchRepl) != 3 {
 			t.Fatalf("expected identical-prefix replacement to rewind and deliver all 3 frames, got len=%d err=%v", len(batchRepl), err)
@@ -559,21 +610,17 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	if evs, err := r2.ReadBatch(10); err != nil || len(evs) != 0 {
 		t.Fatalf("expected 0 events before growth, got len=%d err=%v", len(evs), err)
 	}
-	// Complete the in-flight frame write AND rotate to segment 2 (sealing segment 1!) before next poll
-	if err := os.WriteFile(seg2, fullBytes, 0600); err != nil {
-		t.Fatalf("complete seg2: %v", err)
-	}
+	// Append the missing tail bytes in place (no truncation!) AND rotate to segment 2 (sealing segment 1!) before next poll
+	appendBytesFixture(t, seg2, fullBytes[halfCut:])
 	seg2Next := filepath.Join(segDir2, "00000002.seg")
-	fNext, err := os.Create(seg2Next)
-	if err != nil {
-		t.Fatalf("create rotated seg2Next: %v", err)
-	}
-	_ = WriteSegmentFrame(fNext, []byte(`{"timestamp":601,"service":"sshd","level":"INFO","message":"rotated-seg2-msg"}`))
-	_ = fNext.Close()
+	writeSegmentFixture(t, seg2Next, []byte(`{"timestamp":601,"service":"sshd","level":"INFO","message":"rotated-seg2-msg"}`))
 
 	evs, err := r2.ReadBatch(10)
 	if err != nil || len(evs) != 2 || evs[0].Message != "inflight-frame-completed" || evs[1].Message != "rotated-seg2-msg" {
 		t.Fatalf("expected completed pending candidate on newly sealed seg1 + seg2 event, got %+v err=%v", evs, err)
+	}
+	if r2.Stats().BurnResets != 0 {
+		t.Fatalf("expected BurnResets=0 on genuine in-place append, got %d", r2.Stats().BurnResets)
 	}
 
 	// 3. Budget must stop after one processed frame even when CRC-valid frames fail ParseRawLog,
@@ -725,10 +772,8 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	if evs, err := r7.ReadBatch(10); err != nil || len(evs) != 0 {
 		t.Fatalf("seg7 poll 1: len=%d err=%v", len(evs), err)
 	}
-	// Now complete the append so fileSize reaches len(full7) >= 776
-	if err := os.WriteFile(seg7, full7, 0600); err != nil {
-		t.Fatalf("write full seg7: %v", err)
-	}
+	// Append missing bytes in place (no truncation!) so fileSize reaches len(full7) >= 776
+	appendBytesFixture(t, seg7, full7[initialCut:])
 	var recovered7 []model.LogEvent
 	for attempt := 0; attempt < 5 && len(recovered7) == 0; attempt++ {
 		b, readErr := r7.ReadBatch(10)
@@ -739,5 +784,16 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	}
 	if len(recovered7) != 1 || recovered7[0].Service != "sshd" {
 		t.Fatalf("discarded genuine in-flight frame was missed after growth: got %+v", recovered7)
+	}
+	if r7.Stats().BurnResets != 0 {
+		t.Fatalf("expected BurnResets=0 on genuine in-place append in seg7, got %d", r7.Stats().BurnResets)
+	}
+
+	// 8. Reserved segment ID 0 (00000000.seg) is ignored during segment discovery.
+	segDir8 := t.TempDir()
+	writeSegmentFixture(t, filepath.Join(segDir8, "00000000.seg"), []byte(`{"timestamp":1,"service":"api","level":"INFO","message":"seg0-ignored"}`))
+	ids8, err := listSegmentIDs(segDir8)
+	if err != nil || len(ids8) != 0 {
+		t.Fatalf("expected 00000000.seg to be excluded from discovery, got ids=%v err=%v", ids8, err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -84,9 +85,13 @@ func NewQueryPoller(baseURL, authToken string, limit int, allowRemote bool) *Que
 }
 
 // SetMaxResponseBytes overrides the response byte limit (primarily for testing).
+// Clamps to math.MaxInt64-1 so the +1 overflow-probe read can never wrap int64.
 func (p *QueryPoller) SetMaxResponseBytes(n int64) {
 	p.mu.Lock()
 	if n > 0 {
+		if n >= math.MaxInt64 {
+			n = math.MaxInt64 - 1
+		}
 		p.maxResponseBytes = n
 	}
 	p.mu.Unlock()
@@ -150,7 +155,11 @@ func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
 	}
 
 	// Enforce response byte ceiling before JSON decoding so an oversized payload cannot OOM the poller.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	readLimit := int64(math.MaxInt64)
+	if maxBytes < math.MaxInt64 {
+		readLimit = maxBytes + 1
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, readLimit))
 	if err != nil {
 		return nil, fmt.Errorf("read genesis /query response: %w", err)
 	}

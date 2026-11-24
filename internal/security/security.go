@@ -184,6 +184,14 @@ func dialLocalhostDualStack(ctx context.Context, dialer *net.Dialer, network, po
 		if !v6Started {
 			select {
 			case <-ctx.Done():
+				cancel()
+				// Drain the lone in-flight IPv4 dial result so an established socket is never leaked.
+				go func() {
+					res := <-results
+					if res.conn != nil {
+						_ = res.conn.Close()
+					}
+				}()
 				return nil, ctx.Err()
 			case res := <-results:
 				received++
@@ -203,12 +211,16 @@ func dialLocalhostDualStack(ctx context.Context, dialer *net.Dialer, network, po
 		select {
 		case <-ctx.Done():
 			cancel()
-			for received < 2 {
-				res := <-results
-				received++
-				if res.conn != nil {
-					_ = res.conn.Close()
-				}
+			rem := 2 - received
+			if rem > 0 {
+				go func(pending int) {
+					for i := 0; i < pending; i++ {
+						res := <-results
+						if res.conn != nil {
+							_ = res.conn.Close()
+						}
+					}
+				}(rem)
 			}
 			return nil, ctx.Err()
 		case res := <-results:
