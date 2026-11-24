@@ -1,0 +1,46 @@
+# CodeRabbit Configuration for Genesis Sentinel (knowthankyew/genesis-sentinel)
+# Targeted Scope: Phase 1+ Deep Audit (Pure Go Stdlib, Lossless .seg Ingest, Tier 0 Drain & Rules, Hostile-Log Security, Loop Prevention)
+
+language: "en-US"
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  sequence_diagrams: true
+  auto_review:
+    enabled: true
+    drafts: true
+
+  path_filters:
+    - "!**/*.gif"
+    - "!**/*.mp4"
+    - "!**/*.png"
+    - "!**/*.zip"
+    - "!**/*.seg"
+    - "!bin/**"
+    - "!data/**"
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        You are performing an exhaustive systems engineering, concurrency safety, security, and correctness audit for "genesis-sentinel" (knowthankyew/genesis-sentinel), a local-first tiered log triage and anomaly detection sidecar for Project Genesis written in pure Go 1.24+ standard library.
+
+        Evaluate all code and documentation against these non-negotiable invariants:
+        1. ZERO EXTERNAL GO DEPENDENCIES:
+           - `go.mod` must remain pure Go standard library (zero `require` directives).
+        2. CONCURRENCY, PARSING & FILE-IO SAFETY:
+           - Audit `internal/ingest/` (`segreader.go`, `cursor.go`, `parser.go`, `querypoller.go`) for torn writes, segment rotation edge cases, integer overflow/OOM on untrusted frame lengths, `genesis burn` rewind safety, and race conditions.
+           - Audit `internal/template/` (`drain.go`) for bounded memory under adversarial random-token floods, race freedom, and entropy accuracy.
+           - Audit `internal/rules/`, `internal/emit/`, `internal/pipeline/`, and `internal/cli/` for lock ordering, goroutine leaks, context cancellation, graceful shutdown, and socket timeouts.
+        3. HOSTILE-LOG SECURITY & LOOP PREVENTION:
+           - Every log line is attacker-controlled untrusted input. Verify `internal/security/security.go` neutralizes LLM chat-template delimiters and unsafe control bytes everywhere untrusted data enters alerts or prompts (including `Template` and `SanitizedSample`).
+           - Verify strict self-alert loop prevention (`service=sentinel` ignored on ingest).
+           - Verify alert-only non-destructive posture and loopback-only defaults (`127.0.0.1` / `localhost` / `::1`) unless explicitly overridden.
+           - Verify emitted alert JSON cannot break Genesis `--redact` parsing (e.g., 16-digit float mantissas).
+        4. MODEL GOVERNANCE & TRANSPARENT PILLAR 1 VARIANCE:
+           - SmolLM2-Instruct is the Phase 0-4 active tier, Gemma 2 2B IT is Phase 5, and BitNet models must remain explicitly excluded (`ErrExperimentalModelExcluded`).
+           - Lossless disk-backed `.seg` tailing and `~/.genesis-sentinel/` state are an intentional, documented variance from Portfolio Pillar 1 (ADR-4).
+        5. CLAIMS ARE MEASURED, NOT ASSERTED:
+           - Reject unmeasured marketing superlatives ('bulletproof', 'rock solid', 'conclusive', 'definitive', 'infinitely scalable') and unanchored absolute claims.
