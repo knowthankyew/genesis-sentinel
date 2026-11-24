@@ -62,7 +62,7 @@ def generate_sbom(
         ("pipeline", "Tier 0 orchestrator, self-alert loop-prevention guard, HTTP status/burn server, and safe local disk state purge"),
         ("rules", "Precompiled Go RE2 deterministic rule engine (rules.json and built-in SENT-001..SENT-008 starter pack) with burst, entropy, and suppression support"),
         ("security", "Constant-time Bearer auth middleware, dial-time loopback IP enforcement, and hostile-log prompt-injection sanitizer"),
-        ("surprisal", "Clean-room pure-Go Laplace-LK log surprisal engine (arXiv:2510.22809 Equations 4, 6, 7, 8), rolling baseline persistence, and optional loopback HTTP parity client"),
+        ("surprisal", "Clean-room pure-Go Laplace-LK log surprisal engine (arXiv:2510.22809 Equations 4, 6, 7, 8), rolling baseline persistence, and loopback-by-default HTTP parity client"),
         ("template", "Bounded pure-Go Drain-style prefix-tree template collapser with linear ASCII masking and peak Shannon entropy tracking"),
     ]
 

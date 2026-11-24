@@ -342,4 +342,12 @@ func TestExecuteScanWithPreloadedBaselineSurfacesTier1Anomaly(t *testing.T) {
 	if !foundTier1 {
 		t.Fatalf("expected a tier1 alert with surprisal_nats >= 5.0, got alerts=%+v", rep.Alerts)
 	}
+
+	// Explicitly requesting a nonexistent --baseline file must fail closed.
+	out.Reset()
+	errBuf.Reset()
+	missingPath := filepath.Join(dir, "does-not-exist.json")
+	if err := ExecuteWithOutput([]string{"scan", "--file", logPath, "--baseline", missingPath}, &out, &errBuf); err == nil {
+		t.Fatal("expected scan --baseline <missing> to return an error")
+	}
 }

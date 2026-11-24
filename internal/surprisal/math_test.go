@@ -10,6 +10,14 @@ import (
 // numerical parity within 1e-6 nats without requiring Python at test runtime.
 const parityTolerance = 1e-6
 
+func assertClose(t *testing.T, label string, got, want float64) {
+	t.Helper()
+	// Negated <= rejects NaN (whereas math.Abs(NaN) > tol evaluates to false).
+	if !(math.Abs(got-want) <= parityTolerance) {
+		t.Errorf("%s = %.15f, want %.15f (diff=%g)", label, got, want, math.Abs(got-want))
+	}
+}
+
 func TestLukaszykKarmowskiParityWithPythonService(t *testing.T) {
 	cases := []struct {
 		d, delta, want float64
@@ -25,10 +33,7 @@ func TestLukaszykKarmowskiParityWithPythonService(t *testing.T) {
 
 	for _, tc := range cases {
 		got := LukaszykKarmowskiDiff(tc.d, tc.delta)
-		if math.Abs(got-tc.want) > parityTolerance {
-			t.Errorf("LukaszykKarmowskiDiff(%v, %v) = %.15f, want %.15f (diff=%g)",
-				tc.d, tc.delta, got, tc.want, math.Abs(got-tc.want))
-		}
+		assertClose(t, "LukaszykKarmowskiDiff", got, tc.want)
 	}
 }
 
@@ -45,10 +50,7 @@ func TestMarginalSurprisalContParityWithPythonService(t *testing.T) {
 
 	for _, tc := range cases {
 		got := MarginalSurprisalCont(tc.x1, tc.x2, tc.delta)
-		if math.Abs(got-tc.want) > parityTolerance {
-			t.Errorf("MarginalSurprisalCont(%v, %v, %v) = %.15f, want %.15f (diff=%g)",
-				tc.x1, tc.x2, tc.delta, got, tc.want, math.Abs(got-tc.want))
-		}
+		assertClose(t, "MarginalSurprisalCont", got, tc.want)
 	}
 }
 
@@ -71,9 +73,7 @@ func TestJointCaseSurprisalAndKNNParityWithPythonService(t *testing.T) {
 		"completion_cnt": 0.25,
 	}
 	for k, want := range wantDevs {
-		if math.Abs(devs[k]-want) > parityTolerance {
-			t.Fatalf("deviation[%s] = %.12f, want %.12f", k, devs[k], want)
-		}
+		assertClose(t, "deviation["+k+"]", devs[k], want)
 	}
 
 	baseline := make([]CaseVector, len(rawCases))
@@ -110,27 +110,15 @@ func TestJointCaseSurprisalAndKNNParityWithPythonService(t *testing.T) {
 	for i, b := range baseline {
 		sNorm, _ := CaseSurprisal(queryNormal, b, devs, contKeys, nomKeys)
 		normalScores[i] = sNorm
-		if math.Abs(sNorm-wantNormalPairwise[i]) > parityTolerance {
-			t.Errorf("normal pairwise[%d] = %.12f, want %.12f", i, sNorm, wantNormalPairwise[i])
-		}
+		assertClose(t, "normal pairwise", sNorm, wantNormalPairwise[i])
+
 		sAnom, _ := CaseSurprisal(queryAnomalous, b, devs, contKeys, nomKeys)
 		anomScores[i] = sAnom
-		if math.Abs(sAnom-wantAnomalousPairwise[i]) > parityTolerance {
-			t.Errorf("anomalous pairwise[%d] = %.12f, want %.12f", i, sAnom, wantAnomalousPairwise[i])
-		}
+		assertClose(t, "anomalous pairwise", sAnom, wantAnomalousPairwise[i])
 	}
 
-	gotNormalKNN := KNNMean(normalScores, 3)
-	wantNormalKNN := 0.10728796379241201
-	if math.Abs(gotNormalKNN-wantNormalKNN) > parityTolerance {
-		t.Fatalf("normal kNN-3 = %.12f, want %.12f", gotNormalKNN, wantNormalKNN)
-	}
-
-	gotAnomKNN := KNNMean(anomScores, 3)
-	wantAnomKNN := 93.84706820673313
-	if math.Abs(gotAnomKNN-wantAnomKNN) > parityTolerance {
-		t.Fatalf("anomalous kNN-3 = %.12f, want %.12f", gotAnomKNN, wantAnomKNN)
-	}
+	assertClose(t, "normal kNN-3", KNNMean(normalScores, 3), 0.10728796379241201)
+	assertClose(t, "anomalous kNN-3", KNNMean(anomScores, 3), 93.84706820673313)
 }
 
 func TestMathSanitizesNonFiniteAndZeroDelta(t *testing.T) {

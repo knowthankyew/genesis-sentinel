@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
@@ -63,6 +65,53 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 	})
 	if http403.Nominal[3] != "http_4xx" {
 		t.Fatalf("expected http_4xx, got %q", http403.Nominal[3])
+	}
+
+	// Field boundary check: previous_status=500 must NOT shadow standalone status=200.
+	boundaryWin := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-boundary",
+		Service:    "api",
+		Level:      "INFO",
+		SampleLine: "backup previous_status=500 status=200 ok",
+	})
+	if boundaryWin.Nominal[3] != "http_2xx" {
+		t.Fatalf("expected boundary-aware http_2xx, got %q", boundaryWin.Nominal[3])
+	}
+
+	// Millisecond timestamps 1 second apart must produce the exact same inter-arrival
+	// feature as Unix-second timestamps 1 second apart.
+	secFeat := ExtractFeatures(model.TemplateWindow{
+		TemplateID:    "tmpl-ts",
+		Service:       "api",
+		Level:         "INFO",
+		Count:         2,
+		FirstSeenUnix: 1763996400,
+		LastSeenUnix:  1763996401,
+		SampleLine:    "ok",
+	})
+	msFeat := ExtractFeatures(model.TemplateWindow{
+		TemplateID:    "tmpl-ts",
+		Service:       "api",
+		Level:         "INFO",
+		Count:         2,
+		FirstSeenUnix: 1763996400000,
+		LastSeenUnix:  1763996401000,
+		SampleLine:    "ok",
+	})
+	if !(math.Abs(secFeat.Continuous[5]-msFeat.Continuous[5]) <= 1e-9) {
+		t.Fatalf("timestamp unit normalization mismatch: sec=%v vs ms=%v", secFeat.Continuous[5], msFeat.Continuous[5])
+	}
+
+	// UTF-8 boundary clamping: 127 ASCII bytes + 2-byte 'é' must truncate cleanly without invalid UTF-8.
+	utf8Svc := strings.Repeat("a", 127) + "é"
+	utf8Feat := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-utf8",
+		Service:    utf8Svc,
+		Level:      "INFO",
+		SampleLine: "ok",
+	})
+	if !utf8.ValidString(utf8Feat.Nominal[0]) || len(utf8Feat.Nominal[0]) != 127 {
+		t.Fatalf("expected valid 127-byte UTF-8 clamped service, got len=%d valid=%v", len(utf8Feat.Nominal[0]), utf8.ValidString(utf8Feat.Nominal[0]))
 	}
 }
 
@@ -307,12 +356,18 @@ func TestBaselinePersistenceAndCorruptSnapshotHandling(t *testing.T) {
 }
 
 func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
-	// Reject non-loopback endpoint by default.
+	// Reject non-loopback endpoint and base URLs with query strings or fragments.
 	if _, err := NewHTTPClient("https://example.com:5200", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject non-loopback URL when allowRemote=false")
 	}
+	if _, err := NewHTTPClient("http://127.0.0.1:5200?tenant=local", time.Second, false); err == nil {
+		t.Fatal("expected NewHTTPClient to reject base URL with query parameters")
+	}
+	if _, err := NewHTTPClient("http://127.0.0.1:5200#frag", time.Second, false); err == nil {
+		t.Fatal("expected NewHTTPClient to reject base URL with fragment")
+	}
 
-	var calls int
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.WriteHeader(http.StatusOK)
@@ -320,7 +375,7 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/v1/verify/completion" {
-			calls++
+			calls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(VerifyResponse{
 				IsConforming:          false,
@@ -348,6 +403,7 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 		ThresholdNats:      5.0,
 		BaselineWindowSize: 50,
 		WarmupMinCases:     5,
+		HTTPCooldown:       time.Minute,
 		HTTPClient:         client,
 	})
 	for i := 0; i < 6; i++ {
@@ -368,12 +424,17 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 		Count:      10,
 		SampleLine: "ERR unexpected",
 	}, false)
-	if !sc.Anomalous || sc.TotalNats != 9.75 || calls != 1 {
-		t.Fatalf("expected HTTP mode to use sidecar score 9.75 (calls=%d), got %+v", calls, sc)
+	if !sc.Anomalous || sc.TotalNats != 9.75 || calls.Load() != 1 {
+		t.Fatalf("expected HTTP mode to use sidecar score 9.75 (calls=%d), got %+v", calls.Load(), sc)
+	}
+	if sc.FeatureContribs != nil {
+		t.Fatalf("expected local FeatureContribs to be cleared on sidecar override, got %+v", sc.FeatureContribs)
 	}
 
-	// Verify graceful fallback when sidecar goes down.
+	// Verify graceful fallback AND circuit breaker when sidecar goes down:
+	// first failure opens circuit, next 100 windows fall back immediately without hanging.
 	srv.Close()
+	start := time.Now()
 	scFallback := eng.Evaluate(context.Background(), model.TemplateWindow{
 		TemplateID: "t-weird-2",
 		Template:   "ERR unexpected 2",
@@ -382,9 +443,168 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 		Count:      500,
 		SampleLine: "FATAL !!!@@@###$$$%%% " + strings.Repeat("Z9xQ", 40),
 	}, false)
+	for i := 0; i < 100; i++ {
+		eng.Evaluate(context.Background(), model.TemplateWindow{
+			TemplateID: "t-norm",
+			Template:   "GET /ok 200",
+			Service:    "api",
+			Level:      "INFO",
+			Count:      10,
+			SampleLine: "GET /ok 200",
+		}, false)
+	}
+	elapsed := time.Since(start)
 	st := eng.Stats()
-	if st.HTTPFallbacks != 1 || !scFallback.Anomalous {
-		t.Fatalf("expected graceful fallback to in-process anomaly detection, stats=%+v score=%+v", st, scFallback)
+	if st.HTTPFallbacks < 101 || !scFallback.Anomalous || elapsed > 2*time.Second {
+		t.Fatalf("expected circuit-breaker fast fallback (elapsed=%v), stats=%+v score=%+v", elapsed, st, scFallback)
+	}
+}
+
+func TestHTTPClientRejectsIncompleteVerdictAndOffLoopbackRedirect(t *testing.T) {
+	// 1. Missing required JSON fields or negative measurement must fail closed.
+	badPayloads := []string{
+		`{"is_conforming":true}`,
+		`{"measured_surprisal_nats":1.2}`,
+		`{"is_conforming":true,"measured_surprisal_nats":-0.5}`,
+	}
+	for _, payload := range badPayloads {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(payload))
+		}))
+		c, err := NewHTTPClient(srv.URL, time.Second, false)
+		if err != nil {
+			srv.Close()
+			t.Fatalf("NewHTTPClient: %v", err)
+		}
+		_, err = c.VerifyWindow(context.Background(), model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "ok"},
+			[]LogFeatures{ExtractFeatures(model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "ok"})}, 5.0)
+		srv.Close()
+		if err == nil {
+			t.Fatalf("expected VerifyWindow to reject incomplete/invalid payload %s", payload)
+		}
+	}
+
+	// 2. 307 redirect from loopback sidecar to external host must be rejected before forwarding POST body.
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://example.com/steal", http.StatusTemporaryRedirect)
+	}))
+	defer redirSrv.Close()
+	c, err := NewHTTPClient(redirSrv.URL, time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	if _, err := c.VerifyWindow(context.Background(), model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "secret"},
+		[]LogFeatures{ExtractFeatures(model.TemplateWindow{Service: "api", Level: "INFO", SampleLine: "ok"})}, 5.0); err == nil {
+		t.Fatal("expected VerifyWindow to reject 307 redirect to non-loopback host")
+	}
+
+	// 3. HTTP mode fail-closed poisoning defense: sidecar claiming conforming on a local burst anomaly
+	// must NOT let the burst enter the rolling baseline or suppress local detection.
+	permissiveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.1}`))
+	}))
+	defer permissiveSrv.Close()
+	pc, _ := NewHTTPClient(permissiveSrv.URL, time.Second, false)
+	eng := NewEngine(Options{Mode: "http", ThresholdNats: 5.0, BaselineWindowSize: 50, WarmupMinCases: 5, HTTPClient: pc})
+	for i := 0; i < 6; i++ {
+		eng.LearnBaseline(model.TemplateWindow{
+			TemplateID: "t-ok", Template: "GET /ok 200", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200",
+		})
+	}
+	before := eng.Stats().BaselineCases
+	burstSc := eng.Evaluate(context.Background(), model.TemplateWindow{
+		TemplateID: "t-burst-weird",
+		Template:   "POST /v9/dump <HEX>",
+		Service:    "api",
+		Level:      "INFO",
+		Count:      50000,
+		SampleLine: "POST /v9/dump?x=!!!@@@###$$$%%%^^^&&&*** 503 " + strings.Repeat("Z9xQ", 30),
+	}, false)
+	if !burstSc.Anomalous || eng.Stats().BaselineCases != before {
+		t.Fatalf("expected HTTP mode to fail closed on local burst anomaly without poisoning baseline: score=%+v cases=%d->%d",
+			burstSc, before, eng.Stats().BaselineCases)
+	}
+
+	// 4. Mid-request Reset() must discard pre-reset counters and baseline updates.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.2}`))
+	}))
+	defer slowSrv.Close()
+	scClient, _ := NewHTTPClient(slowSrv.URL, 5*time.Second, false)
+	engReset := NewEngine(Options{Mode: "http", ThresholdNats: 5.0, BaselineWindowSize: 50, WarmupMinCases: 3, HTTPClient: scClient})
+	for i := 0; i < 4; i++ {
+		engReset.LearnBaseline(model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"})
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		engReset.Evaluate(context.Background(), model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}, false)
+	}()
+	<-started
+	engReset.Reset()
+	close(release)
+	<-done
+	if st := engReset.Stats(); st.BaselineCases != 0 || st.ScoredTotal != 0 || st.AnomaliesTotal != 0 || st.HTTPChecks != 0 {
+		t.Fatalf("expected mid-request Reset() to discard pre-reset updates, got stats=%+v", st)
+	}
+}
+
+func TestWrappedRingChronologicalParityAcrossSaveAndRestore(t *testing.T) {
+	// Capacity 4, candidate cap 2: appending A..E wraps ring in-place to [E, B, C, D],
+	// whereas chronological order is [B, C, D, E]. Scoring must match identically before & after restore.
+	eng := NewEngine(Options{
+		Mode:               "inprocess",
+		ThresholdNats:      5.0,
+		BaselineWindowSize: 4,
+		WarmupMinCases:     4,
+		KNeighbors:         1,
+		MaxCandidateCases:  2,
+	})
+	windows := []model.TemplateWindow{
+		{TemplateID: "t-A", Service: "svcA", Level: "INFO", Count: 1, SampleLine: "alpha"},
+		{TemplateID: "t-B", Service: "svcB", Level: "WARN", Count: 5, SampleLine: "bravo 404"},
+		{TemplateID: "t-C", Service: "svcC", Level: "ERROR", Count: 20, SampleLine: "charlie 500"},
+		{TemplateID: "t-D", Service: "svcD", Level: "DEBUG", Count: 2, SampleLine: "delta 302"},
+		{TemplateID: "t-E", Service: "svcE", Level: "INFO", Count: 100, SampleLine: "echo 200"},
+	}
+	for _, w := range windows {
+		eng.LearnBaseline(w)
+	}
+
+	path := filepath.Join(t.TempDir(), "wrapped.json")
+	if err := eng.SaveToFile(path, true); err != nil {
+		t.Fatalf("SaveToFile: %v", err)
+	}
+	engRestored := NewEngine(Options{
+		Mode:               "inprocess",
+		ThresholdNats:      5.0,
+		BaselineWindowSize: 4,
+		WarmupMinCases:     4,
+		KNeighbors:         1,
+		MaxCandidateCases:  2,
+	})
+	if _, err := engRestored.LoadFromFile(path); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+
+	query := windows[4]
+	before := eng.Evaluate(context.Background(), query, true)
+	after := engRestored.Evaluate(context.Background(), query, true)
+	if before.TotalNats != after.TotalNats {
+		t.Fatalf("wrapped ring score drifted across save/restore: before=%v after=%v", before.TotalNats, after.TotalNats)
+	}
+
+	// Large finite float must stay finite after round4 (no overflow to +Inf).
+	huge := round4(1e308)
+	if math.IsInf(huge, 0) || math.IsNaN(huge) || huge != 1e308 {
+		t.Fatalf("round4(1e308) overflowed or corrupted value: %v", huge)
 	}
 }
 

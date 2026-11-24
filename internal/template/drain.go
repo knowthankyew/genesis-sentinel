@@ -1,6 +1,7 @@
 package template
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -514,7 +515,7 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 				retainedSample = sample
 			}
 		}
-		a.windows[tmplID] = &model.TemplateWindow{
+		win := &model.TemplateWindow{
 			TemplateID:       tmplID,
 			Template:         tmpl,
 			Service:          svc,
@@ -527,6 +528,12 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 			SampleTruncated:  len(retainedSample) < len(ev.Message),
 			SampleEntropy:    ent,
 		}
+		if !isGlobalOverflow {
+			win.HasIdentityHash = true
+			win.ServiceHash = sha256.Sum256([]byte(ev.Service))
+			win.LevelHash = sha256.Sum256([]byte(ev.Level))
+		}
+		a.windows[tmplID] = win
 		a.windowBytes[tmplID] = len(retainedSample)
 		a.totalSampleBytes += len(retainedSample)
 		if !overflowed {

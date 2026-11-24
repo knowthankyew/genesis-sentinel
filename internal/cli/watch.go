@@ -248,11 +248,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 					finalSaveErr = fmt.Errorf("final cursor save failed: %w", saveErr)
 				}
 			}
-			if surpEng := pipe.SurprisalEngine(); surpEng != nil && surpEng.Dirty() {
-				if saveErr := surpEng.SaveToFile(baselinePath, false); saveErr != nil {
-					logger.Printf("[Shutdown] Final baseline save failed: %v", saveErr)
-					finalSaveErr = errors.Join(finalSaveErr, fmt.Errorf("final baseline save failed: %w", saveErr))
-				}
+			if saveErr := pipe.SaveBaseline(baselinePath, false); saveErr != nil {
+				logger.Printf("[Shutdown] Final baseline save failed: %v", saveErr)
+				finalSaveErr = errors.Join(finalSaveErr, fmt.Errorf("final baseline save failed: %w", saveErr))
 			}
 
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -306,10 +304,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 				logger.Printf("[Tier0+1] Emitted %d alert(s), %d sink failure(s) (total_lines=%d, surprisal_anomalies=%d, baseline=%d)",
 					len(emitted), len(failed), st.LinesRead, st.SurprisalAnomalies, st.SurprisalBaselineCases)
 			}
-			if surpEng := pipe.SurprisalEngine(); surpEng != nil && surpEng.Dirty() {
-				if saveErr := surpEng.SaveToFile(baselinePath, false); saveErr != nil {
-					logger.Printf("[Tier1] baseline save error (will retry on next flush): %v", saveErr)
-				}
+			if saveErr := pipe.SaveBaseline(baselinePath, false); saveErr != nil {
+				logger.Printf("[Tier1] baseline save error (will retry on next flush): %v", saveErr)
 			}
 		}
 	}

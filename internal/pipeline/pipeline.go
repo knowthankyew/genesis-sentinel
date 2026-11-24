@@ -205,6 +205,18 @@ func (p *Pipeline) AttachSurprisalEngine(eng *surprisal.Engine) {
 	p.burnMu.Unlock()
 }
 
+// SaveBaseline persists the Tier 1 rolling baseline snapshot while holding burnMu.RLock
+// so Burn() strictly waits for any in-flight baseline write before removing baseline.json,
+// preventing a pre-burn snapshot from reappearing on disk after Burn completes.
+func (p *Pipeline) SaveBaseline(path string, force bool) error {
+	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+	if p.surprisalEng == nil {
+		return nil
+	}
+	return p.surprisalEng.SaveToFile(path, force)
+}
+
 // AttachSegReader links a SegReader so Stats() reports segment cursor & corruption telemetry.
 func (p *Pipeline) AttachSegReader(r *ingest.SegReader) {
 	p.burnMu.Lock()
@@ -326,10 +338,23 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	}
 }
 
-type windowJoinKey struct {
-	templateID     string
-	displayService string
-	displayLevel   string
+func bucketKeyForWindow(w model.TemplateWindow) (ruleBucketKey, bool) {
+	if w.HasIdentityHash {
+		return ruleBucketKey{
+			templateID:  w.TemplateID,
+			serviceHash: w.ServiceHash,
+			levelHash:   w.LevelHash,
+		}, true
+	}
+	// Global mixed overflow buckets have no single source service/level identity.
+	if w.TemplateID == "overflow:global" {
+		return ruleBucketKey{}, false
+	}
+	return ruleBucketKey{
+		templateID:  w.TemplateID,
+		serviceHash: sha256.Sum256([]byte(w.Service)),
+		levelHash:   sha256.Sum256([]byte(w.Level)),
+	}, true
 }
 
 // FlushWindow atomically drains collapsed TemplateWindows and exact per-event rule
@@ -352,7 +377,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 	p.templatesEmitted.Add(uint64(len(windows)))
 
-	// Sort windows deterministically so baseline learning and alert order are reproducible.
+	// Sort windows deterministically by (TemplateID, Service, Level, identity hashes)
+	// so baseline learning and alert order are reproducible even when long service names share prefixes.
 	sort.Slice(windows, func(i, j int) bool {
 		if windows[i].TemplateID != windows[j].TemplateID {
 			return windows[i].TemplateID < windows[j].TemplateID
@@ -360,7 +386,13 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		if windows[i].Service != windows[j].Service {
 			return windows[i].Service < windows[j].Service
 		}
-		return windows[i].Level < windows[j].Level
+		if windows[i].Level != windows[j].Level {
+			return windows[i].Level < windows[j].Level
+		}
+		if c := bytes.Compare(windows[i].ServiceHash[:], windows[j].ServiceHash[:]); c != 0 {
+			return c < 0
+		}
+		return bytes.Compare(windows[i].LevelHash[:], windows[j].LevelHash[:]) < 0
 	})
 
 	winByID := make(map[string]model.TemplateWindow, len(windows))
@@ -368,48 +400,42 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		winByID[w.TemplateID] = w
 	}
 
-	// Track which (templateID, displayService, displayLevel) windows carry Tier 0 signals
-	// so Tier 1 poisoning defense never absorbs rule-flagged or prompt-injection windows.
-	tier0SignalKeys := make(map[windowJoinKey]bool, len(drainedHits))
-	for k, b := range drainedHits {
-		tier0SignalKeys[windowJoinKey{
-			templateID:     k.templateID,
-			displayService: b.displayService,
-			displayLevel:   b.displayLevel,
-		}] = true
+	// Track exact Tier 0 signal keys (using full SHA-256 service/level hashes) so distinct
+	// long service names (>128 bytes) never share Tier 1 score enrichment or deduplication.
+	tier0SignalKeys := make(map[ruleBucketKey]bool, len(drainedHits))
+	for k := range drainedHits {
+		tier0SignalKeys[k] = true
 	}
 
-	// Evaluate Tier 1 Laplace-LK surprisal on every non-suppressed window before emitting
-	// alerts so Tier 0 alerts can be enriched with surprisal context in a single pass.
+	// Evaluate Tier 1 Laplace-LK surprisal on every non-suppressed window with a bounded
+	// flush-wide HTTP context so an unreachable/slow sidecar can never stall Tier 0 alerts.
 	surpEng := p.surprisalEng
 	type scoredWindow struct {
 		win        model.TemplateWindow
-		joinKey    windowJoinKey
+		bucketKey  ruleBucketKey
+		hasKey     bool
 		score      model.SurprisalScore
 		suppressed bool
 	}
 	scoredWindows := make([]scoredWindow, 0, len(windows))
-	scoresByKey := make(map[windowJoinKey]model.SurprisalScore, len(windows))
+	scoresByKey := make(map[ruleBucketKey]model.SurprisalScore, len(windows))
 	if surpEng != nil {
-		ctx := context.Background()
+		evalCtx, cancelEval := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelEval()
 		for _, w := range windows {
-			cleanSvc, _ := security.SanitizeUntrustedLogText(w.Service, 128)
-			cleanLvl, _ := security.SanitizeUntrustedLogText(w.Level, 64)
-			jk := windowJoinKey{
-				templateID:     w.TemplateID,
-				displayService: cleanSvc,
-				displayLevel:   cleanLvl,
-			}
+			bk, hasKey := bucketKeyForWindow(w)
 			if p.ruleEng != nil && p.ruleEng.IsWindowSuppressed(w) {
-				scoredWindows = append(scoredWindows, scoredWindow{win: w, joinKey: jk, suppressed: true})
+				scoredWindows = append(scoredWindows, scoredWindow{win: w, bucketKey: bk, hasKey: hasKey, suppressed: true})
 				continue
 			}
 			// Never absorb Tier 0 hits or cluster-overflow buckets into the benign baseline.
-			blockLearn := tier0SignalKeys[jk] || w.Template == "<OVERFLOW>"
-			sc := surpEng.Evaluate(ctx, w, blockLearn)
-			scoredWindows = append(scoredWindows, scoredWindow{win: w, joinKey: jk, score: sc})
-			if prev, exists := scoresByKey[jk]; !exists || sc.TotalNats > prev.TotalNats {
-				scoresByKey[jk] = sc
+			blockLearn := (hasKey && tier0SignalKeys[bk]) || w.Template == "<OVERFLOW>"
+			sc := surpEng.Evaluate(evalCtx, w, blockLearn)
+			scoredWindows = append(scoredWindows, scoredWindow{win: w, bucketKey: bk, hasKey: hasKey, score: sc})
+			if hasKey {
+				if prev, exists := scoresByKey[bk]; !exists || sc.TotalNats > prev.TotalNats {
+					scoresByKey[bk] = sc
+				}
 			}
 		}
 	}
@@ -439,7 +465,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	var (
 		emitted        []emit.Alert
 		failed         []FailedAlert
-		emittedWinKeys = make(map[windowJoinKey]bool, len(keys))
+		emittedWinKeys = make(map[ruleBucketKey]bool, len(keys))
 	)
 	nowUnix := time.Now().Unix()
 
@@ -521,18 +547,13 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		roundedEntropy := math.Round(bestEntropy*10000) / 10000
 
-		jk := windowJoinKey{
-			templateID:     k.templateID,
-			displayService: cleanService,
-			displayLevel:   cleanLevel,
-		}
 		tierLabel := "tier0"
 		var (
 			surpNats      float64
 			surpThreshold float64
 			topFeats      map[string]float64
 		)
-		if sc, ok := scoresByKey[jk]; ok && sc.TotalNats > 0 {
+		if sc, ok := scoresByKey[k]; ok && sc.TotalNats > 0 {
 			surpNats = sc.TotalNats
 			surpThreshold = sc.ThresholdNats
 			topFeats = surprisal.TopFeatures(sc.FeatureContribs, 4)
@@ -586,7 +607,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      bestSample,
 		}
 
-		emittedWinKeys[jk] = true
+		emittedWinKeys[k] = true
 		if err := p.sink.Emit(alert); err != nil {
 			p.sinkErrors.Add(1)
 			failed = append(failed, FailedAlert{Alert: alert, Err: err})
@@ -598,7 +619,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 	// Emit Tier 1-only alerts for unseen anomalous windows that did not already emit a Tier 0 alert.
 	for _, sw := range scoredWindows {
-		if sw.suppressed || !sw.score.Anomalous || emittedWinKeys[sw.joinKey] {
+		if sw.suppressed || !sw.score.Anomalous {
+			continue
+		}
+		if sw.hasKey && emittedWinKeys[sw.bucketKey] {
 			continue
 		}
 		w := sw.win
@@ -663,7 +687,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      cleanSample,
 		}
 
-		emittedWinKeys[sw.joinKey] = true
+		if sw.hasKey {
+			emittedWinKeys[sw.bucketKey] = true
+		}
 		if err := p.sink.Emit(alert); err != nil {
 			p.sinkErrors.Add(1)
 			failed = append(failed, FailedAlert{Alert: alert, Err: err})

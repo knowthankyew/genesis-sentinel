@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -23,31 +25,53 @@ const (
 // HTTPClient communicates over loopback with the companion ml/src/surprisal-service
 // (`:5200`) for optional `surprisal_mode=http` or `hybrid` cross-checks (ADR-7).
 type HTTPClient struct {
-	baseURL     string
+	baseURL     *url.URL
 	allowRemote bool
 	client      *http.Client
 }
 
 // NewHTTPClient creates a loopback-enforced client targeting baseURL (e.g. http://127.0.0.1:5200).
+// Base URLs containing query strings or fragments are rejected fail-closed so appended
+// endpoint paths (/health, /v1/verify/completion) always target explicit URL paths.
 func NewHTTPClient(baseURL string, timeout time.Duration, allowRemote bool) (*HTTPClient, error) {
-	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	trimmed := strings.TrimSpace(baseURL)
 	if trimmed == "" {
 		return nil, fmt.Errorf("surprisal HTTP base URL is empty")
 	}
 	if !strings.Contains(trimmed, "://") {
 		trimmed = "http://" + trimmed
 	}
-	if !allowRemote && !security.IsLoopbackEndpoint(trimmed) {
-		return nil, fmt.Errorf("refusing non-loopback surprisal-service URL %q without allow_remote_endpoints=true", trimmed)
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("parse surprisal-service URL %q: %w", trimmed, err)
 	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported surprisal-service URL scheme %q (expected http or https)", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("surprisal-service URL %q is missing host", trimmed)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("surprisal-service base URL %q must not include query parameters or fragments", trimmed)
+	}
+	if !allowRemote && !security.IsLoopbackEndpoint(parsed.String()) {
+		return nil, fmt.Errorf("refusing non-loopback surprisal-service URL %q without allow_remote_endpoints=true", parsed.String())
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeout
 	}
 	return &HTTPClient{
-		baseURL:     trimmed,
+		baseURL:     parsed,
 		allowRemote: allowRemote,
 		client:      security.NewLoopbackHTTPClient(timeout, allowRemote, false),
 	}, nil
+}
+
+func (c *HTTPClient) endpointURL(suffix string) string {
+	u := *c.baseURL
+	u.Path = c.baseURL.Path + suffix
+	return u.String()
 }
 
 type datasetRecordPayload struct {
@@ -72,9 +96,9 @@ type VerifyResponse struct {
 	Explanation           string  `json:"explanation"`
 }
 
-// Health checks GET /health on surprisal-service.
+// Health checks GET /health on surprisal-service and verifies response body readability.
 func (c *HTTPClient) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpointURL("/health"), nil)
 	if err != nil {
 		return err
 	}
@@ -83,7 +107,13 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 		return fmt.Errorf("surprisal-service health request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxHTTPResponseBytes))
+	n, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxHTTPResponseBytes+1))
+	if copyErr != nil {
+		return fmt.Errorf("read surprisal-service health response: %w", copyErr)
+	}
+	if n > maxHTTPResponseBytes {
+		return fmt.Errorf("surprisal-service health response exceeded %d-byte limit", maxHTTPResponseBytes)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("surprisal-service health returned status %d", resp.StatusCode)
 	}
@@ -126,7 +156,8 @@ func (c *HTTPClient) VerifyWindow(
 		return VerifyResponse{}, fmt.Errorf("marshal surprisal verify request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/verify/completion", bytes.NewReader(bodyBytes))
+	verifyURL := c.endpointURL("/v1/verify/completion")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, verifyURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return VerifyResponse{}, err
 	}
@@ -134,7 +165,7 @@ func (c *HTTPClient) VerifyWindow(
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return VerifyResponse{}, fmt.Errorf("post %s/v1/verify/completion: %w", c.baseURL, err)
+		return VerifyResponse{}, fmt.Errorf("post %s: %w", verifyURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -149,11 +180,33 @@ func (c *HTTPClient) VerifyWindow(
 		return VerifyResponse{}, fmt.Errorf("surprisal-service returned status %d", resp.StatusCode)
 	}
 
-	var out VerifyResponse
-	if err := json.Unmarshal(respBytes, &out); err != nil {
+	var raw struct {
+		IsConforming          *bool    `json:"is_conforming"`
+		MeasuredSurprisalNats *float64 `json:"measured_surprisal_nats"`
+		PredictedTag          string   `json:"predicted_tag"`
+		CandidateTag          string   `json:"candidate_tag"`
+		Explanation           string   `json:"explanation"`
+	}
+	if err := json.Unmarshal(respBytes, &raw); err != nil {
 		return VerifyResponse{}, fmt.Errorf("decode surprisal response: %w", err)
 	}
-	return out, nil
+	if raw.IsConforming == nil {
+		return VerifyResponse{}, fmt.Errorf("surprisal response missing required field 'is_conforming'")
+	}
+	if raw.MeasuredSurprisalNats == nil {
+		return VerifyResponse{}, fmt.Errorf("surprisal response missing required field 'measured_surprisal_nats'")
+	}
+	measured := *raw.MeasuredSurprisalNats
+	if math.IsNaN(measured) || math.IsInf(measured, 0) || measured < 0 {
+		return VerifyResponse{}, fmt.Errorf("surprisal response has invalid measured_surprisal_nats %v", measured)
+	}
+	return VerifyResponse{
+		IsConforming:          *raw.IsConforming,
+		MeasuredSurprisalNats: measured,
+		PredictedTag:          raw.PredictedTag,
+		CandidateTag:          raw.CandidateTag,
+		Explanation:           raw.Explanation,
+	}, nil
 }
 
 func formatFeatureSummaryPrompt(f LogFeatures) string {

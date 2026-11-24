@@ -6,9 +6,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
+
+const defaultHTTPCircuitCooldown = 30 * time.Second
 
 // Options configures the Tier 1 Laplace-LK Log Surprisal Engine.
 type Options struct {
@@ -18,6 +21,7 @@ type Options struct {
 	WarmupMinCases     int
 	KNeighbors         int
 	MaxCandidateCases  int
+	HTTPCooldown       time.Duration // circuit-breaker cooldown after HTTP parity failure (default 30s)
 	HTTPClient         *HTTPClient
 }
 
@@ -40,12 +44,15 @@ type Stats struct {
 // baseline in pure Go stdlib, with optional loopback parity calls to surprisal-service.
 type Engine struct {
 	mu             sync.Mutex
+	saveMu         sync.Mutex // serializes SaveToFile from snapshot capture through publication
 	mode           string
 	thresholdNats  float64
 	maxSize        int
 	warmupMinCases int
 	kNeighbors     int
 	maxCandidates  int
+	httpCooldown   time.Duration
+	httpOpenUntil  time.Time
 	httpClient     *HTTPClient
 
 	// Fixed-capacity circular buffer of benign baseline LogFeatures.
@@ -53,6 +60,7 @@ type Engine struct {
 	head      int // next write position
 	count     int // number of populated entries (<= maxSize)
 	revision  uint64
+	resetGen  uint64 // incremented ONLY by Reset() to discard pre-reset in-flight HTTP updates
 	devs      [ContinuousFeatureCount]float64
 	devsDirty bool
 	dirtyDisk bool
@@ -96,6 +104,10 @@ func NewEngine(opts Options) *Engine {
 	if maxCand <= 0 {
 		maxCand = DefaultMaxCandidateCases
 	}
+	cooldown := opts.HTTPCooldown
+	if cooldown <= 0 {
+		cooldown = defaultHTTPCircuitCooldown
+	}
 
 	e := &Engine{
 		mode:           mode,
@@ -104,6 +116,7 @@ func NewEngine(opts Options) *Engine {
 		warmupMinCases: warmup,
 		kNeighbors:     k,
 		maxCandidates:  maxCand,
+		httpCooldown:   cooldown,
 		httpClient:     opts.HTTPClient,
 		ring:           make([]LogFeatures, maxSize),
 		devsDirty:      true,
@@ -138,12 +151,17 @@ func (e *Engine) LoadFromFile(path string) (int, error) {
 	return e.count, nil
 }
 
-// SaveToFile writes the current rolling baseline atomically to path if new cases
-// have been learned since the last save (or if force is true).
+// SaveToFile serializes persistence across callers (via saveMu) and atomically writes
+// the current rolling baseline to path if new cases have been learned since the last
+// save (or if force is true). Callers that coordinate with Burn() should hold the
+// pipeline burn lock across SaveToFile so Burn waits for any in-flight write.
 func (e *Engine) SaveToFile(path string, force bool) error {
 	if path == "" {
 		return nil
 	}
+	e.saveMu.Lock()
+	defer e.saveMu.Unlock()
+
 	e.mu.Lock()
 	if !force && !e.dirtyDisk {
 		e.mu.Unlock()
@@ -177,7 +195,9 @@ func (e *Engine) Dirty() bool {
 	return e.dirtyDisk
 }
 
-// Reset clears the in-memory rolling baseline and cached deviations cleanly (used by Burn).
+// Reset clears the in-memory rolling baseline, circuit-breaker state, and cached
+// deviations cleanly (used by Burn), bumping resetGen so any in-flight HTTP evaluation
+// discards pre-reset metric or baseline updates.
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -186,6 +206,8 @@ func (e *Engine) Reset() {
 	e.head = 0
 	e.count = 0
 	e.revision++
+	e.resetGen++
+	e.httpOpenUntil = time.Time{}
 	for i := range e.devs {
 		e.devs[i] = MinDeviationFloor
 	}
@@ -223,6 +245,7 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 	e.scoredTotal++
 	baseCount := e.count
 	warmupDone := baseCount >= e.warmupMinCases
+	gen := e.resetGen
 
 	var (
 		totalNats float64
@@ -241,12 +264,16 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		totalNats, contribs = e.scoreAgainstBaselineLocked(feat)
 	}
 
-	if (mode == "http" || mode == "hybrid") && client != nil && warmupDone {
-		refsCopy = e.orderedCasesLocked()
-	}
+	localAnomalous := warmupDone && totalNats >= threshold
+	anomalous := localAnomalous
+	now := time.Now()
+	circuitOpen := !e.httpOpenUntil.IsZero() && now.Before(e.httpOpenUntil)
+	needHTTP := client != nil && warmupDone && !circuitOpen && (mode == "http" || (mode == "hybrid" && localAnomalous))
 
-	anomalous := warmupDone && totalNats >= threshold
-	if mode == "inprocess" {
+	if mode == "inprocess" || !needHTTP {
+		if (mode == "http" || mode == "hybrid") && client != nil && warmupDone && circuitOpen && (mode == "http" || localAnomalous) {
+			e.httpFallbacks++
+		}
 		if anomalous {
 			e.anomaliesTotal++
 		}
@@ -271,39 +298,57 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		}
 	}
 
-	// Release lock before optional loopback HTTP parity request (never hold mutex across I/O).
+	// Copy chronological baseline references ONLY when an HTTP parity call will execute.
+	refsCopy = e.orderedCasesLocked()
+	// Release lock before loopback HTTP parity request (never hold mutex across I/O).
 	e.mu.Unlock()
 
-	if client != nil && warmupDone && len(refsCopy) > 0 {
-		// In "http" mode, query every post-warmup window; in "hybrid" mode, cross-check anomalous windows.
-		if mode == "http" || (mode == "hybrid" && anomalous) {
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			vResp, err := client.VerifyWindow(ctx, w, refsCopy, threshold)
-			e.mu.Lock()
-			e.httpChecks++
-			if err != nil {
-				e.httpFallbacks++
-			} else if mode == "http" {
-				// Use sidecar measurement when healthy in http mode.
-				if !math.IsNaN(vResp.MeasuredSurprisalNats) && !math.IsInf(vResp.MeasuredSurprisalNats, 0) && vResp.MeasuredSurprisalNats >= 0 {
-					totalNats = vResp.MeasuredSurprisalNats
-					anomalous = !vResp.IsConforming || totalNats >= threshold
-				}
-			}
-			e.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	vResp, err := client.VerifyWindow(ctx, w, refsCopy, threshold)
+
+	e.mu.Lock()
+	if e.resetGen != gen {
+		// Burn/Reset occurred mid-request: discard all pre-reset counters and baseline updates.
+		e.mu.Unlock()
+		return model.SurprisalScore{
+			TemplateID:        w.TemplateID,
+			TotalNats:         round4(totalNats),
+			ThresholdNats:     threshold,
+			Anomalous:         anomalous,
+			FeatureContribs:   contribs,
+			BaselineCaseCount: baseCount,
 		}
 	}
 
-	e.mu.Lock()
+	e.httpChecks++
+	if err != nil {
+		e.httpFallbacks++
+		e.httpOpenUntil = time.Now().Add(e.httpCooldown)
+	} else if mode == "http" {
+		sidecarAnomalous := !vResp.IsConforming || vResp.MeasuredSurprisalNats >= threshold
+		if sidecarAnomalous || !localAnomalous {
+			// Adopt sidecar measurement and clear local contributions so attributions never
+			// describe a different calculation than the score that produced the verdict.
+			totalNats = vResp.MeasuredSurprisalNats
+			anomalous = sidecarAnomalous
+			contribs = nil
+		} else {
+			// Defense-in-depth: if local pure-Go Laplace-LK detected a log-domain burst/anomaly
+			// that a general-purpose sidecar missed, fail closed on local detection and keep
+			// local attributions so anomalies never poison the rolling baseline.
+			anomalous = true
+		}
+	}
+
 	if anomalous {
 		e.anomaliesTotal++
 	}
 	if totalNats > e.maxNatsObserved {
 		e.maxNatsObserved = totalNats
 	}
-	if !hasTier0Signal && !anomalous {
+	if !hasTier0Signal && !anomalous && !localAnomalous {
 		e.appendLocked(feat)
 		e.devsDirty = true
 		e.dirtyDisk = true
@@ -409,15 +454,19 @@ type neighborResult struct {
 	contribs [ContinuousFeatureCount + NominalFeatureCount]float64
 }
 
+func (e *Engine) chronologicalAtLocked(pos int) LogFeatures {
+	if e.count < e.maxSize {
+		return e.ring[pos]
+	}
+	return e.ring[(e.head+pos)%e.maxSize]
+}
+
 // scoreAgainstBaselineLocked computes the k-NN mean Laplace-LK surprisal (and
 // averaged per-feature marginal breakdown) across up to maxCandidates evenly-strided
-// baseline records. Mirroring ml/src/surprisal-service/service.py, when at least k
-// same-service baseline peers exist, candidates are strided from those peers so rare
-// benign services are never lost behind high-volume services; otherwise global
-// baseline peers are used so brand-new services surface their +2.5 nats novelty.
+// baseline records traversed in chronological oldest-first order so wrapped rings
+// produce identical results before and after SaveToFile/LoadFromFile round-trips.
 func (e *Engine) scoreAgainstBaselineLocked(cand LogFeatures) (float64, map[string]float64) {
-	active := e.activeSliceLocked()
-	n := len(active)
+	n := e.count
 	if n == 0 {
 		return 0, nil
 	}
@@ -427,19 +476,19 @@ func (e *Engine) scoreAgainstBaselineLocked(cand LogFeatures) (float64, map[stri
 		k = n
 	}
 
-	// Collect indices of same-service peers first when baseline exceeds maxCandidates
-	// (or always when >= k same-service peers exist) to match service.py neighborhood semantics.
-	var peerIdx []int
-	for i := 0; i < n; i++ {
-		if active[i].Nominal[0] == cand.Nominal[0] {
-			peerIdx = append(peerIdx, i)
+	// Collect chronological positions of same-service peers so rare benign services
+	// are never lost behind high-volume services and wraparound order stays deterministic.
+	var peerPos []int
+	for pos := 0; pos < n; pos++ {
+		if e.chronologicalAtLocked(pos).Nominal[0] == cand.Nominal[0] {
+			peerPos = append(peerPos, pos)
 		}
 	}
 
-	usePeers := len(peerIdx) >= k
+	usePeers := len(peerPos) >= k
 	poolLen := n
 	if usePeers {
-		poolLen = len(peerIdx)
+		poolLen = len(peerPos)
 	}
 
 	numCand := poolLen
@@ -463,11 +512,11 @@ func (e *Engine) scoreAgainstBaselineLocked(cand LogFeatures) (float64, map[stri
 				posInPool = poolLen - 1
 			}
 		}
-		idx := posInPool
+		chronPos := posInPool
 		if usePeers {
-			idx = peerIdx[posInPool]
+			chronPos = peerPos[posInPool]
 		}
-		s, c := pairSurprisal(cand, active[idx], e.devs)
+		s, c := pairSurprisal(cand, e.chronologicalAtLocked(chronPos), e.devs)
 
 		if len(best) < k || s < best[len(best)-1].score {
 			pos := len(best)
@@ -527,6 +576,9 @@ func selectStrided(cases []LogFeatures, maxN int) []LogFeatures {
 func round4(v float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0
+	}
+	if math.Abs(v) >= math.MaxFloat64/10000 {
+		return v
 	}
 	return math.Round(v*10000) / 10000
 }

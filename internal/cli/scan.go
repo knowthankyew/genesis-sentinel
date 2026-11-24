@@ -85,6 +85,12 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("scan requires one of --seg-dir, --file, or --synthetic <N>")
 	}
 
+	if *baselinePath != "" {
+		if _, statErr := os.Stat(*baselinePath); statErr != nil {
+			return fmt.Errorf("baseline file %q: %w", *baselinePath, statErr)
+		}
+	}
+
 	ruleEng, err := rules.LoadEngine(cfg.RulesPath)
 	if err != nil {
 		return err

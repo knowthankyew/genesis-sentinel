@@ -606,3 +606,90 @@ func TestPipelineTier1SurprisalCatchesUnseenAnomalyAndBurnWipesBaseline(t *testi
 		t.Fatalf("expected empty clean baseline after Burn(), got stats=%+v", pipe.Stats())
 	}
 }
+
+func TestPipelineLongServiceNamesDoNotCollideOnTier1JoinKey(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.SurprisalThreshold = 5.0
+
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	// Warm up baseline with ordinary short-service logs.
+	for w := 0; w < 22; w++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID:        uint64(w + 1),
+			Timestamp: 1763996000 + int64(w*10),
+			Service:   "nginx",
+			Level:     "INFO",
+			Message:   "GET /healthz HTTP/1.1 200 3ms",
+		})
+		_, _ = pipe.FlushWindow()
+	}
+
+	// Two distinct 129-byte services sharing identical 128-byte prefix:
+	// svcA matches a Tier 0 rule; svcB has zero Tier 0 rule matches and must STILL fire its own Tier 1 alert!
+	prefix := strings.Repeat("a", 128)
+	svcA := prefix + "A"
+	svcB := prefix + "B"
+
+	pipe.IngestEvent(model.LogEvent{
+		ID:        5001,
+		Timestamp: 1763997000,
+		Service:   svcA,
+		Level:     "ERROR",
+		Message:   "GET /../../../../etc/passwd HTTP/1.1 403",
+	})
+	pipe.IngestEvent(model.LogEvent{
+		ID:        5002,
+		Timestamp: 1763997000,
+		Service:   svcB,
+		Level:     "ERROR",
+		Message:   "unexpected outbound relay connection reset by peer during background archive sync retry",
+	})
+
+	alerts, failed := pipe.FlushWindow()
+	if len(failed) != 0 || len(alerts) != 2 {
+		t.Fatalf("expected 2 distinct alerts (one tier0/tier0+tier1 for svcA, one tier1 for svcB), got %d alerts=%+v", len(alerts), alerts)
+	}
+	hasTier1Only := false
+	hasTier0 := false
+	for _, a := range alerts {
+		if a.Tier == "tier1" {
+			hasTier1Only = true
+		}
+		if a.Tier == "tier0" || a.Tier == "tier0+tier1" {
+			hasTier0 = true
+		}
+	}
+	if !hasTier0 || !hasTier1Only {
+		t.Fatalf("expected both Tier 0 (svcA) and Tier 1-only (svcB) alerts without key collision, got %+v", alerts)
+	}
+
+	// Verify SaveBaseline serializes cleanly under burnMu with concurrent Burn().
+	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
+	if err := pipe.SaveBaseline(baselinePath, true); err != nil {
+		t.Fatalf("SaveBaseline: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = pipe.SaveBaseline(baselinePath, false)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = pipe.Burn()
+	}()
+	wg.Wait()
+	// Final Burn after all concurrent writers guarantees baseline.json is gone and stays gone.
+	if _, err := pipe.Burn(); err != nil {
+		t.Fatalf("final Burn: %v", err)
+	}
+	if _, err := os.Stat(baselinePath); !os.IsNotExist(err) {
+		t.Fatal("baseline.json survived serialized Burn")
+	}
+}

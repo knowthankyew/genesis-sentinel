@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
@@ -93,24 +94,19 @@ func ExtractFeatures(w model.TemplateWindow) LogFeatures {
 	}
 	f.Continuous[4] = math.Log1p(float64(cnt))
 
-	// 6. Average inter-arrival delta in milliseconds (log1p scale)
-	// Single-event windows default to 1000ms (baseline neutral) when span == 0;
-	// multi-event windows compute (spanSec * 1000) / (count - 1).
+	// 6. Average inter-arrival delta in milliseconds (log1p scale).
+	// Normalize each endpoint timestamp individually to Unix seconds (supporting
+	// Unix seconds plus contemporary ms/us/ns epochs) BEFORE taking the difference
+	// so two events 1s apart in ms (diff=1000) compute 1000ms rather than 1,000,000ms.
 	var interArrivalMs float64
 	if cnt <= 1 {
 		interArrivalMs = 1000.0
 	} else {
-		spanSec := w.LastSeenUnix - w.FirstSeenUnix
+		firstSec := normalizeFeatureTimestampSec(w.FirstSeenUnix)
+		lastSec := normalizeFeatureTimestampSec(w.LastSeenUnix)
+		spanSec := lastSec - firstSec
 		if spanSec < 0 {
 			spanSec = 0
-		}
-		// Normalize ms/us/ns timestamps if a caller supplied sub-second raw epochs.
-		if spanSec > 1_000_000_000 {
-			spanSec /= 1_000_000_000
-		} else if spanSec > 1_000_000 {
-			spanSec /= 1_000_000
-		} else if spanSec > 86400*365 {
-			spanSec /= 1_000
 		}
 		interArrivalMs = (float64(spanSec) * 1000.0) / float64(cnt-1)
 	}
@@ -277,8 +273,19 @@ func extractProtoClass(sample string) string {
 			}
 		}
 	}
+	lower := strings.ToLower(trimmed)
 	for _, key := range []string{"status=", "status:", `"status":`, "code="} {
-		if idx := strings.Index(strings.ToLower(trimmed), key); idx >= 0 {
+		searchFrom := 0
+		for searchFrom < len(lower) {
+			rel := strings.Index(lower[searchFrom:], key)
+			if rel < 0 {
+				break
+			}
+			idx := searchFrom + rel
+			searchFrom = idx + len(key)
+			if key[0] != '"' && !isStatusKeyBoundary(lower, idx) {
+				continue
+			}
 			after := strings.TrimLeft(trimmed[idx+len(key):], " \"")
 			if fam := parseHTTPStatusFamily(after); fam != "" {
 				return fam
@@ -335,9 +342,39 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+func normalizeFeatureTimestampSec(ts int64) int64 {
+	if ts <= 0 {
+		return 0
+	}
+	if ts >= 1_000_000_000_000_000_000 { // contemporary nanoseconds (>= 1e18)
+		return ts / 1_000_000_000
+	}
+	if ts >= 1_000_000_000_000_000 { // contemporary microseconds (>= 1e15)
+		return ts / 1_000_000
+	}
+	if ts >= 1_000_000_000_000 { // contemporary milliseconds (>= 1e12)
+		return ts / 1_000
+	}
+	return ts
+}
+
+func isStatusKeyBoundary(s string, idx int) bool {
+	if idx <= 0 {
+		return true
+	}
+	prev := s[idx-1]
+	return !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-')
+}
+
+// clampStr truncates s to at most maxBytes at a valid UTF-8 character boundary so
+// multi-byte runes are never split into invalid UTF-8 sequences.
 func clampStr(s string, maxBytes int) string {
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
-	return s[:maxBytes]
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
