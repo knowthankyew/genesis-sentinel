@@ -13,6 +13,17 @@ import (
 )
 
 var (
+	// noProxyTransport is a reusable transport with Proxy disabled so loopback-only
+	// clients cannot be diverted to an environment HTTP_PROXY via mixed-case LOCALHOST URLs.
+	noProxyTransport = func() *http.Transport {
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok && dt != nil {
+			cloned := dt.Clone()
+			cloned.Proxy = nil
+			return cloned
+		}
+		return &http.Transport{Proxy: nil}
+	}()
+
 	// specialTokenPattern matches common LLM chat-template and control token delimiters
 	// such as <|im_start|>, <|im_end|>, <|eot_id|>, and <|endoftext|>.
 	specialTokenPattern = regexp.MustCompile(`<\|[^|>]{1,64}\|>`)
@@ -107,12 +118,14 @@ func IsLoopbackEndpoint(raw string) bool {
 
 // NewLoopbackHTTPClient returns an *http.Client whose CheckRedirect policy enforces
 // the loopback-only invariant on every redirect hop unless allowRemote is true.
+// When allowRemote is false, environment proxies are also disabled on the transport
+// so mixed-case localhost URLs cannot trigger Go's case-sensitive localhost proxy bypass.
 // When blockRedirects is true, all HTTP redirects are rejected outright (e.g., for DELETE /burn).
 func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bool) *http.Client {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return &http.Client{
+	client := &http.Client{
 		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if blockRedirects {
@@ -127,6 +140,10 @@ func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bo
 			return nil
 		},
 	}
+	if !allowRemote {
+		client.Transport = noProxyTransport
+	}
+	return client
 }
 
 // SanitizeUntrustedLogText neutralizes chat-template delimiters and unsafe control bytes

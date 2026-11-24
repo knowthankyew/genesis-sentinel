@@ -9,6 +9,7 @@ import (
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
+	"github.com/knowthankyew/genesis-sentinel/internal/template"
 )
 
 // Rule defines a single deterministic Tier 0 detection signature, rate threshold,
@@ -27,7 +28,7 @@ type Rule struct {
 	Enabled     bool     `json:"enabled"`
 }
 
-// Suppression silences known benign services or message patterns before rule evaluation.
+// Suppression silences known benign services, templates, or message patterns.
 // At least one selector (Service, Template, or Pattern) is required so an empty
 // suppression cannot accidentally disable all alerting.
 type Suppression struct {
@@ -57,22 +58,41 @@ type compiledSuppression struct {
 	re   *regexp.Regexp
 }
 
-// Engine evaluates collapsed Tier 0 TemplateWindows against precompiled RE2 rules
-// and prompt-injection heuristics. For a fixed rule pack of size |R|, each regex
-// scan runs in linear O(L) time in input length L (total O(|R| * L) across active rules).
+// Engine evaluates incoming LogEvents and collapsed Tier 0 TemplateWindows against
+// precompiled RE2 rules and prompt-injection heuristics. For a fixed rule pack of
+// size |R|, each regex scan runs in linear O(L) time in input length L (total O(|R| * L)).
 type Engine struct {
 	rules        []compiledRule
 	suppressions []compiledSuppression
 }
 
+// EventRuleMatch records a single rule hit observed on a specific LogEvent at ingest time.
+type EventRuleMatch struct {
+	RuleHit         model.RuleHit
+	MinCount        uint64
+	SanitizedSample string
+	Entropy         float64
+}
+
+// EventEvaluation captures per-event suppression, deterministic rule matches,
+// and adversarial prompt-injection signals before events are folded into windows.
+type EventEvaluation struct {
+	Suppressed         bool
+	Matches            []EventRuleMatch
+	InjectionSuspected bool
+	InjectionSignals   []string
+	InjectionSample    string
+}
+
 // EvaluationResult bundles deterministic rule hits and adversarial injection signals
-// for a single TemplateWindow.
+// for standalone evaluation of a TemplateWindow.
 type EvaluationResult struct {
 	Suppressed         bool
 	RuleHits           []model.RuleHit
 	InjectionSuspected bool
 	InjectionSignals   []string
 	SanitizedSample    string
+	InjectionSample    string
 }
 
 // DefaultRulePack returns Sentinel's built-in Track A/B starter security rules.
@@ -219,26 +239,163 @@ func LoadEngine(path string) (*Engine, error) {
 	return NewEngine(pack)
 }
 
-// Evaluate inspects a TemplateWindow (including SampleLine, Template, and any retained
-// AdditionalSamples) against suppressions, adversarial prompt-injection heuristics,
-// and compiled deterministic rules.
-func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) EvaluationResult {
-	sanitized, injSignals := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
-
-	// Also inspect retained AdditionalSamples for prompt-injection cues so an adversarial
-	// payload cannot hide behind a higher-entropy benign sample in the same cluster.
-	sigSet := make(map[string]struct{}, len(injSignals))
-	for _, s := range injSignals {
-		sigSet[s] = struct{}{}
-	}
-	for _, extra := range w.AdditionalSamples {
-		extraClean, extraSigs := security.SanitizeUntrustedLogText(extra, maxPromptBytes)
-		if len(extraSigs) > 0 && len(injSignals) == 0 {
-			sanitized = extraClean
+// MatchEvent evaluates a single incoming LogEvent BEFORE window collapsing so:
+//   - Message-pattern suppressions exclude only matching events (never sibling events in a window).
+//   - MinLength and MinEntropy are enforced on the exact same event payload.
+//   - Burst thresholds (e.g. SENT-001) count only events matching that rule's predicate.
+//   - Service/level rules see each event's true identity even when window aggregation overflows.
+//   - Deterministic signatures never depend on a bounded window sample cache.
+func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes int) EventEvaluation {
+	// 1. Check event-level suppressions (any suppression without a Template selector).
+	for _, cs := range e.suppressions {
+		if cs.supp.Template != "" {
+			continue
 		}
-		for _, s := range extraSigs {
-			if _, exists := sigSet[s]; !exists {
-				sigSet[s] = struct{}{}
+		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, ev.Service) {
+			continue
+		}
+		if cs.re != nil && !cs.re.MatchString(ev.Message) {
+			continue
+		}
+		return EventEvaluation{Suppressed: true}
+	}
+
+	var res EventEvaluation
+
+	// 2. Check adversarial prompt-injection signals across message, service, and level.
+	cleanMsg, msgSigs := security.SanitizeUntrustedLogText(ev.Message, maxPromptBytes)
+	_, svcSigs := security.SanitizeUntrustedLogText(ev.Service, 128)
+	_, lvlSigs := security.SanitizeUntrustedLogText(ev.Level, 64)
+	injSignals := mergeUniqueSignals(msgSigs, svcSigs, lvlSigs)
+	if len(injSignals) > 0 {
+		res.InjectionSuspected = true
+		res.InjectionSignals = injSignals
+		res.InjectionSample = cleanMsg
+		res.Matches = append(res.Matches, EventRuleMatch{
+			RuleHit: model.RuleHit{
+				RuleID:      "SENT-006",
+				Category:    "prompt_injection_probe",
+				Severity:    "HIGH",
+				Description: "Adversarial LLM control delimiter or prompt-injection phrase detected in untrusted log",
+			},
+			MinCount:        1,
+			SanitizedSample: cleanMsg,
+			Entropy:         evEntropy,
+		})
+	}
+
+	// 3. Evaluate every compiled rule against this exact event.
+	svcLower := strings.ToLower(ev.Service)
+	lvlUpper := strings.ToUpper(ev.Level)
+
+	for _, cr := range e.rules {
+		if len(cr.services) > 0 {
+			if _, ok := cr.services[svcLower]; !ok {
+				continue
+			}
+		}
+		if len(cr.levels) > 0 {
+			if _, ok := cr.levels[lvlUpper]; !ok {
+				continue
+			}
+		}
+		if cr.rule.MinLength > 0 && len(ev.Message) < cr.rule.MinLength {
+			continue
+		}
+		if cr.rule.MinEntropy > 0 && evEntropy < cr.rule.MinEntropy {
+			continue
+		}
+		if cr.re != nil && !cr.re.MatchString(ev.Message) {
+			continue
+		}
+		minCount := cr.rule.MinCount
+		if minCount == 0 {
+			minCount = 1
+		}
+		res.Matches = append(res.Matches, EventRuleMatch{
+			RuleHit: model.RuleHit{
+				RuleID:      cr.rule.ID,
+				Category:    cr.rule.Category,
+				Severity:    cr.rule.Severity,
+				Description: cr.rule.Description,
+			},
+			MinCount:        minCount,
+			SanitizedSample: cleanMsg,
+			Entropy:         evEntropy,
+		})
+	}
+
+	return res
+}
+
+// IsTemplateSuppressed evaluates template-scoped suppressions at window flush time.
+func (e *Engine) IsTemplateSuppressed(service, tmpl string) bool {
+	for _, cs := range e.suppressions {
+		if cs.supp.Template == "" {
+			continue
+		}
+		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
+			continue
+		}
+		if cs.supp.Template != tmpl {
+			continue
+		}
+		if cs.re != nil {
+			continue // pattern-qualified template suppressions apply per sample, not blindly to the whole template
+		}
+		return true
+	}
+	return false
+}
+
+// Evaluate inspects a standalone TemplateWindow against suppressions, adversarial
+// prompt-injection heuristics, and compiled deterministic rules.
+// Enforces message-pattern suppressions per candidate sample, tests MinLength and
+// MinEntropy on the same candidate sample, and preserves prompt-injection evidence.
+func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) EvaluationResult {
+	// Service-only or template-only suppressions suppress the entire window.
+	if e.isWindowSuppressed(w) {
+		sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
+		return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
+	}
+
+	// Build candidate list excluding any individual sample matched by a message-pattern suppression.
+	rawCandidates := make([]string, 0, 1+len(w.AdditionalSamples))
+	if w.SampleLine != "" {
+		rawCandidates = append(rawCandidates, w.SampleLine)
+	}
+	rawCandidates = append(rawCandidates, w.AdditionalSamples...)
+
+	var activeSamples []string
+	for _, cand := range rawCandidates {
+		if !e.isSamplePatternSuppressed(w.Service, w.Template, cand) {
+			activeSamples = append(activeSamples, cand)
+		}
+	}
+	if len(rawCandidates) > 0 && len(activeSamples) == 0 {
+		sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
+		return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
+	}
+
+	primarySample := w.SampleLine
+	if len(activeSamples) > 0 {
+		primarySample = activeSamples[0]
+	}
+	sanitized, _ := security.SanitizeUntrustedLogText(primarySample, maxPromptBytes)
+
+	var (
+		injSignals []string
+		injSample  string
+	)
+	sigSeen := make(map[string]struct{})
+	for _, cand := range activeSamples {
+		cleanCand, candSigs := security.SanitizeUntrustedLogText(cand, maxPromptBytes)
+		if len(candSigs) > 0 && injSample == "" {
+			injSample = cleanCand
+		}
+		for _, s := range candSigs {
+			if _, ok := sigSeen[s]; !ok {
+				sigSeen[s] = struct{}{}
 				injSignals = append(injSignals, s)
 			}
 		}
@@ -248,11 +405,10 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 		InjectionSuspected: len(injSignals) > 0,
 		InjectionSignals:   injSignals,
 		SanitizedSample:    sanitized,
+		InjectionSample:    injSample,
 	}
-
-	if e.isSuppressed(w) {
-		res.Suppressed = true
-		return res
+	if res.InjectionSuspected && injSample != "" {
+		res.SanitizedSample = injSample
 	}
 
 	if res.InjectionSuspected {
@@ -281,21 +437,15 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 		if cr.rule.MinCount > 0 && w.Count < cr.rule.MinCount {
 			continue
 		}
-		if cr.rule.MinEntropy > 0 && w.SampleEntropy < cr.rule.MinEntropy {
+
+		matchedSample, ok := matchRuleCandidates(cr, w, activeSamples)
+		if !ok {
 			continue
 		}
-		if cr.re != nil {
-			matchedSample, ok := matchRuleRegex(cr.re, w, cr.rule.MinLength)
-			if !ok {
-				continue
-			}
-			// If a secondary evidence sample matched a signature (e.g. /etc/passwd in wildcard slot),
-			// surface that sanitized evidence sample in the alert.
-			if matchedSample != "" && matchedSample != w.SampleLine {
-				res.SanitizedSample, _ = security.SanitizeUntrustedLogText(matchedSample, maxPromptBytes)
-			}
-		} else if cr.rule.MinLength > 0 && maxWindowSampleLength(w) < cr.rule.MinLength {
-			continue
+
+		// Preserve prompt-injection evidence when injection is suspected; otherwise surface matched sample.
+		if !res.InjectionSuspected && matchedSample != "" && matchedSample != primarySample {
+			res.SanitizedSample, _ = security.SanitizeUntrustedLogText(matchedSample, maxPromptBytes)
 		}
 		res.RuleHits = append(res.RuleHits, model.RuleHit{
 			RuleID:      cr.rule.ID,
@@ -308,43 +458,90 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 	return res
 }
 
-func matchRuleRegex(re *regexp.Regexp, w model.TemplateWindow, minLen int) (string, bool) {
-	if (minLen <= 0 || len(w.SampleLine) >= minLen) && re.MatchString(w.SampleLine) {
+// matchRuleCandidates checks MinLength, MinEntropy, and Pattern on the SAME candidate
+// sample so a short high-entropy sample and a long low-entropy sample cannot combine to fire.
+func matchRuleCandidates(cr compiledRule, w model.TemplateWindow, activeSamples []string) (string, bool) {
+	if cr.re == nil && cr.rule.MinLength <= 0 && cr.rule.MinEntropy <= 0 {
 		return w.SampleLine, true
 	}
-	if (minLen <= 0 || len(w.Template) >= minLen) && re.MatchString(w.Template) {
-		return w.SampleLine, true
+
+	for _, cand := range activeSamples {
+		if cr.rule.MinLength > 0 && len(cand) < cr.rule.MinLength {
+			continue
+		}
+		if cr.rule.MinEntropy > 0 {
+			ent := template.PeakShannonEntropy(cand)
+			if cand == w.SampleLine && w.SampleEntropy > ent {
+				ent = w.SampleEntropy
+			}
+			if ent < cr.rule.MinEntropy {
+				continue
+			}
+		}
+		if cr.re != nil && !cr.re.MatchString(cand) {
+			continue
+		}
+		return cand, true
 	}
-	for _, extra := range w.AdditionalSamples {
-		if (minLen <= 0 || len(extra) >= minLen) && re.MatchString(extra) {
-			return extra, true
+
+	// Fallback regex match on Template itself only when no entropy threshold applies
+	// and Template satisfies MinLength.
+	if cr.re != nil && cr.rule.MinEntropy <= 0 && (cr.rule.MinLength <= 0 || len(w.Template) >= cr.rule.MinLength) {
+		if cr.re.MatchString(w.Template) {
+			return w.SampleLine, true
 		}
 	}
 	return "", false
 }
 
-func maxWindowSampleLength(w model.TemplateWindow) int {
-	best := len(w.SampleLine)
-	for _, extra := range w.AdditionalSamples {
-		if len(extra) > best {
-			best = len(extra)
-		}
-	}
-	return best
-}
-
-func (e *Engine) isSuppressed(w model.TemplateWindow) bool {
+func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {
 	for _, cs := range e.suppressions {
+		if cs.re != nil {
+			continue // message-pattern suppressions are checked per sample, not blindly across the whole window
+		}
 		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, w.Service) {
 			continue
 		}
 		if cs.supp.Template != "" && cs.supp.Template != w.Template {
 			continue
 		}
-		if cs.re != nil && !cs.re.MatchString(w.SampleLine) {
-			continue
-		}
 		return true
 	}
 	return false
+}
+
+func (e *Engine) isSamplePatternSuppressed(service, tmpl, sample string) bool {
+	for _, cs := range e.suppressions {
+		if cs.re == nil {
+			continue
+		}
+		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
+			continue
+		}
+		if cs.supp.Template != "" && cs.supp.Template != tmpl {
+			continue
+		}
+		if cs.re.MatchString(sample) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeUniqueSignals(groups ...[]string) []string {
+	var out []string
+	var seen map[string]struct{}
+	for _, g := range groups {
+		for _, s := range g {
+			if seen == nil {
+				seen = make(map[string]struct{}, 4)
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }

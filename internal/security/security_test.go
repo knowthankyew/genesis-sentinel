@@ -128,6 +128,13 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Verify restricted client disables environment proxying (noProxyTransport)
+	defaultClient := NewLoopbackHTTPClient(2*time.Second, false, false)
+	tr, ok := defaultClient.Transport.(*http.Transport)
+	if !ok || tr == nil || tr.Proxy != nil {
+		t.Fatalf("expected restricted client to use a Transport with Proxy == nil, got %#v", defaultClient.Transport)
+	}
+
 	// Use recording transport so no public network call ever happens and policy rejection is explicitly verified.
 	rec := &recordingTransport{base: srv.Client().Transport}
 	c := NewLoopbackHTTPClient(2*time.Second, false, false)
@@ -144,7 +151,10 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected loopback redirect to succeed, got %v", err)
 	}
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK || resp.Request.URL.Path != "/ok" {
+		t.Fatalf("expected local redirect to reach /ok with 200 OK, got status=%d path=%q", resp.StatusCode, resp.Request.URL.Path)
+	}
 
 	// Strict blockRedirects client rejects even loopback redirects (e.g. DELETE /burn)
 	strict := NewLoopbackHTTPClient(2*time.Second, false, true)

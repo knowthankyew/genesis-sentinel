@@ -42,8 +42,8 @@ type QueryPollerStats struct {
 // GET /query windows over loopback HTTP, explicitly tracking ID eviction gaps
 // and serializing polls so overlapping calls never duplicate events.
 type QueryPoller struct {
-	pollMu           sync.Mutex // serializes fetch-and-commit across concurrent Poll callers
-	mu               sync.Mutex // guards cursor & stats for concurrent Reset/Stats calls
+	pollGate         chan struct{} // 1-slot semaphore for context-aware Poll serialization
+	mu               sync.Mutex    // guards cursor & stats for concurrent Reset/Stats calls
 	baseURL          string
 	authToken        string
 	client           *http.Client
@@ -75,6 +75,7 @@ func NewQueryPoller(baseURL, authToken string, limit int, allowRemote bool) *Que
 		limit = 10000
 	}
 	return &QueryPoller{
+		pollGate:         make(chan struct{}, 1),
 		baseURL:          strings.TrimRight(baseURL, "/"),
 		authToken:        authToken,
 		limit:            limit,
@@ -104,10 +105,15 @@ func (p *QueryPoller) Reset() {
 }
 
 // Poll fetches unseen LogEvents from Genesis starting at the previous timestamp cursor.
-// Concurrent Poll calls are serialized so each new ID is delivered and counted once.
+// Concurrent Poll calls are serialized with context-aware waiting so canceled callers
+// return immediately while active callers deliver and count each new ID once.
 func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
-	p.pollMu.Lock()
-	defer p.pollMu.Unlock()
+	select {
+	case p.pollGate <- struct{}{}:
+		defer func() { <-p.pollGate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	p.mu.Lock()
 	gen := p.resetGen

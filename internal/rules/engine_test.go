@@ -206,4 +206,50 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	if len(resLen.RuleHits) != 1 || resLen.RuleHits[0].RuleID != "LEN-1" {
 		t.Fatalf("expected LEN-1 hit on qualifying AdditionalSample, got %+v", resLen.RuleHits)
 	}
+
+	// Entropy and MinLength must pass on the SAME sample (short high-entropy + long low-entropy must NOT fire SENT-005)
+	shortHighEnt := "Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN" // 40 bytes (<48), high entropy
+	longLowEnt := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	resSplit := defEng.Evaluate(model.TemplateWindow{
+		Service:           "coredns",
+		Level:             "WARN",
+		Count:             2,
+		SampleLine:        shortHighEnt,
+		SampleEntropy:     template.PeakShannonEntropy(shortHighEnt),
+		AdditionalSamples: []string{longLowEnt},
+	}, 1024)
+	for _, h := range resSplit.RuleHits {
+		if h.RuleID == "SENT-005" {
+			t.Fatalf("SENT-005 falsely combined short high-entropy and long low-entropy samples: %+v", resSplit.RuleHits)
+		}
+	}
+
+	// Message-pattern suppression must suppress ONLY matching samples, not traversal evidence in AdditionalSamples
+	supEng, err := NewEngine(RulePack{
+		Version:      "1.0",
+		Rules:        DefaultRulePack().Rules,
+		Suppressions: []Suppression{{ID: "SUP-HB", Pattern: "heartbeat", Reason: "benign heartbeat"}},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine supEng: %v", err)
+	}
+	resPartialSup := supEng.Evaluate(model.TemplateWindow{
+		Service:           "nginx",
+		Level:             "WARN",
+		Count:             2,
+		SampleLine:        "heartbeat ok",
+		AdditionalSamples: []string{"GET /static/../../../../etc/passwd HTTP/1.1 403"},
+	}, 1024)
+	if resPartialSup.Suppressed {
+		t.Fatal("heartbeat suppression wrongly suppressed entire window containing /etc/passwd")
+	}
+	foundTraversal := false
+	for _, h := range resPartialSup.RuleHits {
+		if h.RuleID == "SENT-003" {
+			foundTraversal = true
+		}
+	}
+	if !foundTraversal {
+		t.Fatalf("expected SENT-003 to survive heartbeat pattern suppression, got %+v", resPartialSup.RuleHits)
+	}
 }

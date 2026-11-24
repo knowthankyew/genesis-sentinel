@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
@@ -67,9 +68,19 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	if err != nil || ev.Service != "sshd" || ev.Message != "failed login" {
 		t.Fatalf("RFC 3164 IPv6 hostname parse failed: ev=%+v err=%v", ev, err)
 	}
+	ev, err = ParseRawLog(511, []byte(`<36>Nov 24 10:00:00 2001:db8:: sentinel: alert`), 0, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != "alert" {
+		t.Fatalf("RFC 3164 IPv6 :: hostname parse failed: ev=%+v err=%v", ev, err)
+	}
 	ev, err = ParseRawLog(52, []byte(`<36>Nov 24 10:00:00 host1 cronjob completed ok`), 0, "genesis")
 	if err != nil || ev.Service != "cronjob" || ev.Message != "completed ok" {
 		t.Fatalf("RFC 3164 space-delimited tag failed: ev=%+v err=%v", ev, err)
+	}
+
+	// 5a. Extreme float timestamp 1e20 falls back cleanly without int64 overflow UB
+	ev, err = ParseRawLog(520, []byte(`{"timestamp":1e20,"service":"api","level":"INFO","msg":"overflow ts"}`), 0, "genesis")
+	if err != nil || ev.Timestamp <= 0 {
+		t.Fatalf("extreme float timestamp failed fallback: ev=%+v err=%v", ev, err)
 	}
 
 	// 5b. Trailing garbage after valid JSON object must NOT parse as JSON
@@ -85,6 +96,17 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	badUTF8 := bytes.Repeat([]byte{0x80}, DefaultMaxLineLength+16)
 	if _, err := ParseRawLog(54, badUTF8, DefaultMaxLineLength, "genesis"); !errors.Is(err, ErrEmptyInput) {
 		t.Fatalf("expected ErrEmptyInput for oversized invalid UTF-8 continuation bytes, got %v", err)
+	}
+
+	// 5d. Oversized Pipe record with service=sentinel must NOT be relabeled as plain text
+	longTracePipe := []byte("1763996400|sentinel|ERROR|" + strings.Repeat("t", DefaultMaxLineLength+10) + "|msg")
+	if _, err := ParseRawLog(55, longTracePipe, DefaultMaxLineLength, "genesis"); !errors.Is(err, ErrOversizedLine) {
+		t.Fatalf("expected ErrOversizedLine for oversized pipe header, got %v", err)
+	}
+	longMsgPipe := []byte("1763996400|sentinel|ERROR|tr-1|" + strings.Repeat("m", DefaultMaxLineLength+100))
+	ev, err = ParseRawLog(56, longMsgPipe, DefaultMaxLineLength, "genesis")
+	if err != nil || ev.Service != "sentinel" || len(ev.Message) > DefaultMaxLineLength {
+		t.Fatalf("expected oversized pipe message to preserve service=sentinel and truncate msg, got ev=%+v err=%v", ev, err)
 	}
 
 	// 6. Pipe format
@@ -242,10 +264,13 @@ func TestQueryPollerDeduplicationGapsSaturationBoundsAndConcurrency(t *testing.T
 		t.Fatalf("expected ErrQueryResponseTooLarge, got %v", err)
 	}
 
-	// Test negative synthetic count doesn't panic
+	// Test negative & over-limit synthetic counts do not panic
 	evs, _, err := ParseLogEventsFromRaw(-5, 42)
 	if err != nil || len(evs) != 0 {
 		t.Fatalf("expected empty result for negative count, got len=%d err=%v", len(evs), err)
+	}
+	if _, _, err := ParseLogEventsFromRaw(MaxSyntheticInMemoryLines+1, 42); err == nil {
+		t.Fatal("expected ParseLogEventsFromRaw to reject count > MaxSyntheticInMemoryLines")
 	}
 }
 
@@ -290,41 +315,49 @@ func TestSegReaderSegmentRotationAndIdenticalPrefixReplacement(t *testing.T) {
 		t.Fatalf("expected exact seg2 delivery without repeat/skip, got %+v err=%v", b2, err)
 	}
 
-	// 2. Identical-prefix replacement test on 00000001.seg (same prefix >= 256 bytes, larger size, new inode!)
-	segDirB := t.TempDir()
-	cursorPathB := filepath.Join(t.TempDir(), "cursorB.json")
-	segB := filepath.Join(segDirB, "00000001.seg")
-	fb1, _ := os.Create(segB)
-	_ = WriteSegmentFrame(fb1, prefixLine)
-	_ = WriteSegmentFrame(fb1, prefixLine)
-	_ = fb1.Close()
+	// 2. Identical-prefix replacement test on 00000001.seg (create replacement BEFORE unlinking original so inode is guaranteed distinct!)
+	if origInfo, statErr := os.Stat(seg1); statErr == nil && fileIdentity(origInfo) != "" {
+		segDirB := t.TempDir()
+		cursorPathB := filepath.Join(t.TempDir(), "cursorB.json")
+		segB := filepath.Join(segDirB, "00000001.seg")
+		fb1, _ := os.Create(segB)
+		_ = WriteSegmentFrame(fb1, prefixLine)
+		_ = WriteSegmentFrame(fb1, prefixLine)
+		_ = fb1.Close()
 
-	rb1, _ := NewSegReader(segDirB, cursorPathB, 0)
-	if batch, err := rb1.ReadBatch(10); err != nil || len(batch) != 2 {
-		t.Fatalf("rb1 read: len=%d err=%v", len(batch), err)
-	}
-	_ = rb1.SaveCursor()
+		rb1, _ := NewSegReader(segDirB, cursorPathB, 0)
+		if batch, err := rb1.ReadBatch(10); err != nil || len(batch) != 2 {
+			t.Fatalf("rb1 read: len=%d err=%v", len(batch), err)
+		}
+		_ = rb1.SaveCursor()
 
-	// Unlink and recreate 00000001.seg with IDENTICAL first 2 frames (>=256 bytes) + 1 new third frame
-	_ = os.Remove(segB)
-	fb2, _ := os.Create(segB)
-	_ = WriteSegmentFrame(fb2, prefixLine)
-	_ = WriteSegmentFrame(fb2, prefixLine)
-	_ = WriteSegmentFrame(fb2, []byte(`{"timestamp":200,"service":"api","level":"WARN","message":"after-identical-prefix-replacement"}`))
-	_ = fb2.Close()
+		// Create replacement at a distinct temp path WHILE original segB still exists, then rename into place
+		segBNew := filepath.Join(segDirB, "00000001.seg.new")
+		fb2, _ := os.Create(segBNew)
+		_ = WriteSegmentFrame(fb2, prefixLine)
+		_ = WriteSegmentFrame(fb2, prefixLine)
+		_ = WriteSegmentFrame(fb2, []byte(`{"timestamp":200,"service":"api","level":"WARN","message":"after-identical-prefix-replacement"}`))
+		_ = fb2.Close()
+		if err := os.Rename(segBNew, segB); err != nil {
+			t.Fatalf("rename replacement segB: %v", err)
+		}
 
-	rb2, _ := NewSegReader(segDirB, cursorPathB, 0)
-	batchRepl, err := rb2.ReadBatch(10)
-	if err != nil || len(batchRepl) != 3 {
-		t.Fatalf("expected identical-prefix replacement to rewind and deliver all 3 frames, got len=%d err=%v", len(batchRepl), err)
-	}
-	if rb2.Stats().BurnResets != 1 {
-		t.Fatalf("expected BurnResets=1 for identical-prefix replacement, got %d", rb2.Stats().BurnResets)
+		rb2, _ := NewSegReader(segDirB, cursorPathB, 0)
+		batchRepl, err := rb2.ReadBatch(10)
+		if err != nil || len(batchRepl) != 3 {
+			t.Fatalf("expected identical-prefix replacement to rewind and deliver all 3 frames, got len=%d err=%v", len(batchRepl), err)
+		}
+		if rb2.Stats().BurnResets != 1 {
+			t.Fatalf("expected BurnResets=1 for identical-prefix replacement, got %d", rb2.Stats().BurnResets)
+		}
 	}
 }
 
 func TestQueryPollerGapWithCursorRowPresentAndConcurrency(t *testing.T) {
 	gate := make(chan struct{})
+	var closeGateOnce sync.Once
+	releaseGate := func() { closeGateOnce.Do(func() { close(gate) }) }
+
 	inHandler := make(chan struct{}, 2)
 	call := 0
 	var mu sync.Mutex
@@ -355,26 +388,58 @@ func TestQueryPollerGapWithCursorRowPresentAndConcurrency(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(genesisQueryResponse{Count: 0})
 		}
 	}))
-	defer srv.Close()
+	// Release gate BEFORE srv.Close() so cleanup never hangs even if an assertion fails early.
+	defer func() {
+		releaseGate()
+		srv.Close()
+	}()
 
 	poller := NewQueryPoller(srv.URL, "", 100, false)
 	if _, err := poller.Poll(context.Background()); err != nil {
 		t.Fatalf("poll 1: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	pollDone := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		_, _ = poller.Poll(context.Background())
+		_, err := poller.Poll(context.Background())
+		pollDone <- err
 	}()
 
-	<-inHandler
-	// Exercise concurrent Stats and SetMaxResponseBytes while Poll is blocked in HTTP handler
-	_ = poller.Stats()
-	poller.SetMaxResponseBytes(DefaultMaxQueryResponseBytes)
-	close(gate)
-	wg.Wait()
+	select {
+	case <-inHandler:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for second Poll request to enter handler")
+	}
+
+	// Verify canceled caller exits Poll queue promptly without waiting for gate
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := poller.Poll(cancelCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected queued canceled Poll to return DeadlineExceeded, got %v", err)
+	}
+
+	// Exercise concurrent Stats and SetMaxResponseBytes while Poll is blocked in HTTP handler (with timeout guard)
+	statsDone := make(chan struct{})
+	go func() {
+		_ = poller.Stats()
+		poller.SetMaxResponseBytes(DefaultMaxQueryResponseBytes)
+		close(statsDone)
+	}()
+	select {
+	case <-statsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stats/SetMaxResponseBytes deadlocked while Poll was in flight")
+	}
+
+	releaseGate()
+	select {
+	case err := <-pollDone:
+		if err != nil {
+			t.Fatalf("second poll failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for second Poll to finish after releasing gate")
+	}
 
 	st := poller.Stats()
 	if st.EvictionGaps != 1 || st.EstimatedLost != 3 {

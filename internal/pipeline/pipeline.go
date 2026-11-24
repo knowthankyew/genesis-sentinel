@@ -7,8 +7,8 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +23,11 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
 )
 
+const (
+	// maxPendingRuleBuckets bounds exact per-(window, service, level) rule accumulators between flushes.
+	maxPendingRuleBuckets = 4096
+)
+
 // Stats exposes live Sentinel Tier 0 pipeline telemetry over HTTP /stats and CLI output.
 type Stats struct {
 	LinesRead        uint64  `json:"lines_read"`
@@ -35,6 +40,7 @@ type Stats struct {
 	InjectionSignals uint64  `json:"injection_signals"`
 	SinkErrors       uint64  `json:"sink_errors"`
 	CorruptedFrames  uint64  `json:"corrupted_frames"`
+	RecoveryStalls   uint64  `json:"recovery_stalls"`
 	BurnResets       uint64  `json:"burn_resets"`
 	EvictionGaps     uint64  `json:"eviction_gaps"`
 	EstimatedLost    uint64  `json:"estimated_lost"`
@@ -62,8 +68,32 @@ type BurnReport struct {
 	Note         string    `json:"note"`
 }
 
+type ruleBucketKey struct {
+	templateID string
+	service    string
+	level      string
+}
+
+type ruleAccumulator struct {
+	hit             model.RuleHit
+	minCount        uint64
+	matchCount      uint64
+	sanitizedSample string
+	maxEntropy      float64
+}
+
+type bucketAccumulator struct {
+	key             ruleBucketKey
+	lastSeenUnix    int64
+	rules           map[string]*ruleAccumulator
+	injSuspected    bool
+	injSignals      []string
+	injSample       string
+	injSignalLookup map[string]struct{}
+}
+
 // Pipeline coordinates Tier 0 ingestion, loop prevention, template collapsing,
-// deterministic rule evaluation, and Genesis alert emission.
+// per-event deterministic rule accumulation, and Genesis alert emission.
 type Pipeline struct {
 	cfg          *config.Config
 	agg          *template.Aggregator
@@ -72,9 +102,12 @@ type Pipeline struct {
 	activeSource string
 	startTime    time.Time
 
-	// burnMu coordinates Burn() with FlushWindow() (RLock during flush, Lock during Burn)
-	// so no pre-burn alert can be delivered after Burn acknowledges completion.
+	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
+	// alert can be delivered after Burn acknowledges completion.
 	burnMu      sync.RWMutex
+	hitsMu      sync.Mutex
+	pendingHits map[ruleBucketKey]*bucketAccumulator
+
 	segReader   *ingest.SegReader
 	queryPoller *ingest.QueryPoller
 
@@ -103,6 +136,7 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		sink:         sink,
 		activeSource: activeSource,
 		startTime:    time.Now(),
+		pendingHits:  make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
 }
 
@@ -120,30 +154,127 @@ func (p *Pipeline) AttachQueryPoller(q *ingest.QueryPoller) {
 	p.burnMu.Unlock()
 }
 
-// IngestEvent folds a single incoming LogEvent into Tier 0 while enforcing strict loop prevention.
+// IngestEvent folds a single incoming LogEvent into Tier 0 while enforcing strict
+// loop prevention and evaluating per-event deterministic signatures & suppressions
+// before template collapsing.
 func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	if emit.ShouldIgnoreEvent(ev, p.cfg.AlertServiceName) {
 		p.linesIgnoredSelf.Add(1)
 		return
 	}
 	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+
 	p.linesRead.Add(1)
-	p.agg.Add(ev)
-	p.burnMu.RUnlock()
+	tmplID, _, ent := p.agg.Add(ev)
+
+	evEval := p.ruleEng.MatchEvent(ev, ent, p.cfg.MaxPromptByte)
+	if evEval.Suppressed || (len(evEval.Matches) == 0 && !evEval.InjectionSuspected) {
+		return
+	}
+
+	key := ruleBucketKey{
+		templateID: tmplID,
+		service:    ev.Service,
+		level:      ev.Level,
+	}
+
+	p.hitsMu.Lock()
+	defer p.hitsMu.Unlock()
+
+	bucket, exists := p.pendingHits[key]
+	if !exists {
+		if len(p.pendingHits) >= maxPendingRuleBuckets {
+			// Still keep global-bucket attribution bounded under extreme adversarial floods.
+			key.templateID = "overflow:rules"
+			bucket, exists = p.pendingHits[key]
+		}
+		if !exists {
+			bucket = &bucketAccumulator{
+				key:   key,
+				rules: make(map[string]*ruleAccumulator, 4),
+			}
+			p.pendingHits[key] = bucket
+		}
+	}
+
+	if ev.Timestamp > bucket.lastSeenUnix {
+		bucket.lastSeenUnix = ev.Timestamp
+	}
+	if evEval.InjectionSuspected {
+		bucket.injSuspected = true
+		if bucket.injSample == "" && evEval.InjectionSample != "" {
+			bucket.injSample = evEval.InjectionSample
+		}
+		if bucket.injSignalLookup == nil {
+			bucket.injSignalLookup = make(map[string]struct{}, len(evEval.InjectionSignals))
+		}
+		for _, s := range evEval.InjectionSignals {
+			if _, seen := bucket.injSignalLookup[s]; !seen {
+				bucket.injSignalLookup[s] = struct{}{}
+				bucket.injSignals = append(bucket.injSignals, s)
+			}
+		}
+	}
+	for _, m := range evEval.Matches {
+		acc, ok := bucket.rules[m.RuleHit.RuleID]
+		if !ok {
+			acc = &ruleAccumulator{
+				hit:             m.RuleHit,
+				minCount:        m.MinCount,
+				sanitizedSample: m.SanitizedSample,
+				maxEntropy:      m.Entropy,
+			}
+			bucket.rules[m.RuleHit.RuleID] = acc
+		}
+		acc.matchCount++
+		if m.Entropy > acc.maxEntropy {
+			acc.maxEntropy = m.Entropy
+			if m.SanitizedSample != "" {
+				acc.sanitizedSample = m.SanitizedSample
+			}
+		}
+	}
 }
 
-// FlushWindow drains collapsed TemplateWindows, runs Tier 0 deterministic rules & prompt-injection
-// checks, emits structured alerts to the configured sink, and returns successfully emitted alerts
-// separately from any failed sink deliveries.
+// FlushWindow drains collapsed TemplateWindows and exact per-event rule accumulators,
+// applies MinCount thresholds per rule, emits structured alerts to the sink, and returns
+// successfully emitted alerts separately from any failed sink deliveries.
 func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	p.burnMu.RLock()
 	defer p.burnMu.RUnlock()
 
 	windows := p.agg.Flush()
-	if len(windows) == 0 {
+
+	p.hitsMu.Lock()
+	drainedHits := p.pendingHits
+	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
+	p.hitsMu.Unlock()
+
+	if len(windows) == 0 && len(drainedHits) == 0 {
 		return nil, nil
 	}
 	p.templatesEmitted.Add(uint64(len(windows)))
+
+	winByID := make(map[string]model.TemplateWindow, len(windows))
+	for _, w := range windows {
+		winByID[w.TemplateID] = w
+	}
+
+	// Deterministic alert ordering by (templateID, service, level)
+	keys := make([]ruleBucketKey, 0, len(drainedHits))
+	for k := range drainedHits {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].templateID != keys[j].templateID {
+			return keys[i].templateID < keys[j].templateID
+		}
+		if keys[i].service != keys[j].service {
+			return keys[i].service < keys[j].service
+		}
+		return keys[i].level < keys[j].level
+	})
 
 	var (
 		emitted []emit.Alert
@@ -151,63 +282,93 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	)
 	nowUnix := time.Now().Unix()
 
-	for _, w := range windows {
-		eval := p.ruleEng.Evaluate(w, p.cfg.MaxPromptByte)
-
-		// Sanitize untrusted log-derived metadata fields (Service, Level, Template)
-		// before building alert strings/fields while keeping raw values for rule evaluation.
-		cleanService, svcSigs := security.SanitizeUntrustedLogText(w.Service, 128)
-		cleanLevel, lvlSigs := security.SanitizeUntrustedLogText(w.Level, 64)
-		cleanTemplate, tmplSigs := security.SanitizeUntrustedLogText(w.Template, p.cfg.MaxPromptByte)
-
-		injSignals := mergeSignals(eval.InjectionSignals, svcSigs, lvlSigs, tmplSigs)
-		injSuspected := eval.InjectionSuspected || len(injSignals) > 0
-		if injSuspected {
-			p.injectionSignals.Add(1)
+	for _, k := range keys {
+		bucket := drainedHits[k]
+		w, hasWin := winByID[k.templateID]
+		tmplStr := "<OVERFLOW>"
+		if hasWin {
+			tmplStr = w.Template
 		}
 
-		ruleHits := eval.RuleHits
-		if !eval.Suppressed && injSuspected && !hasRuleID(ruleHits, "SENT-006") {
-			ruleHits = append(ruleHits, model.RuleHit{
-				RuleID:      "SENT-006",
-				Category:    "prompt_injection_probe",
-				Severity:    "HIGH",
-				Description: "Adversarial LLM control delimiter or prompt-injection phrase detected in untrusted log",
-			})
-		}
-
-		if eval.Suppressed || len(ruleHits) == 0 {
+		if p.ruleEng.IsTemplateSuppressed(k.service, tmplStr) {
 			continue
 		}
 
-		p.ruleHitsTotal.Add(uint64(len(ruleHits)))
+		// Collect only rules whose exact per-rule matchCount meets MinCount!
+		var (
+			qualifyingHits []model.RuleHit
+			maxMatchCount  uint64
+			bestEntropy    float64
+			bestSample     string
+		)
+		ruleKeys := make([]string, 0, len(bucket.rules))
+		for rid := range bucket.rules {
+			ruleKeys = append(ruleKeys, rid)
+		}
+		sort.Strings(ruleKeys)
+
+		for _, rid := range ruleKeys {
+			acc := bucket.rules[rid]
+			if acc.matchCount < acc.minCount {
+				continue
+			}
+			qualifyingHits = append(qualifyingHits, acc.hit)
+			if acc.matchCount > maxMatchCount {
+				maxMatchCount = acc.matchCount
+			}
+			if acc.maxEntropy > bestEntropy {
+				bestEntropy = acc.maxEntropy
+			}
+			if bestSample == "" && acc.sanitizedSample != "" {
+				bestSample = acc.sanitizedSample
+			}
+		}
+
+		if bucket.injSuspected {
+			p.injectionSignals.Add(1)
+			// Preserve prompt-injection evidence when injection fired alongside other rules.
+			if bucket.injSample != "" {
+				bestSample = bucket.injSample
+			}
+		}
+
+		if len(qualifyingHits) == 0 {
+			continue
+		}
+
+		cleanService, _ := security.SanitizeUntrustedLogText(k.service, 128)
+		cleanLevel, _ := security.SanitizeUntrustedLogText(k.level, 64)
+		cleanTemplate, _ := security.SanitizeUntrustedLogText(tmplStr, p.cfg.MaxPromptByte)
+
+		p.ruleHitsTotal.Add(uint64(len(qualifyingHits)))
 		seq := p.alertSeq.Add(1)
 		alertID := fmt.Sprintf("sentinel-%d-%d", nowUnix, seq)
-		severity := emit.HighestSeverity(ruleHits)
+		severity := emit.HighestSeverity(qualifyingHits)
 
-		ruleIDs := make([]string, 0, len(ruleHits))
-		categories := make([]string, 0, len(ruleHits))
-		for _, h := range ruleHits {
+		ruleIDs := make([]string, 0, len(qualifyingHits))
+		categories := make([]string, 0, len(qualifyingHits))
+		for _, h := range qualifyingHits {
 			ruleIDs = append(ruleIDs, h.RuleID)
 			categories = append(categories, h.Category)
 		}
 
-		ts := w.LastSeenUnix
+		ts := bucket.lastSeenUnix
+		if ts <= 0 && hasWin {
+			ts = w.LastSeenUnix
+		}
 		if ts <= 0 {
 			ts = nowUnix
 		}
 
-		// Round entropy to 4 decimal places so float64 serialization never emits a 16-digit
-		// mantissa that triggers Genesis --redact's 16-digit card regex mid-JSON number.
-		roundedEntropy := math.Round(w.SampleEntropy*10000) / 10000
+		roundedEntropy := math.Round(bestEntropy*10000) / 10000
 
 		msg := fmt.Sprintf("[%s] %s on service=%s count=%d entropy=%.2f sample=%q",
 			strings.Join(ruleIDs, ","),
 			strings.Join(categories, ","),
 			cleanService,
-			w.Count,
+			maxMatchCount,
 			roundedEntropy,
-			truncateSummary(eval.SanitizedSample, 240),
+			truncateSummary(bestSample, 240),
 		)
 
 		alert := emit.Alert{
@@ -220,16 +381,16 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			Tier:               "tier0",
 			SourceService:      cleanService,
 			SourceLevel:        cleanLevel,
-			TemplateID:         w.TemplateID,
+			TemplateID:         k.templateID,
 			Template:           cleanTemplate,
-			Count:              w.Count,
+			Count:              maxMatchCount,
 			SampleEntropy:      roundedEntropy,
 			RuleIDs:            ruleIDs,
 			Categories:         categories,
 			Severity:           severity,
-			InjectionSuspected: injSuspected,
-			InjectionSignals:   injSignals,
-			SanitizedSample:    eval.SanitizedSample,
+			InjectionSuspected: bucket.injSuspected,
+			InjectionSignals:   bucket.injSignals,
+			SanitizedSample:    bestSample,
 		}
 
 		if err := p.sink.Emit(alert); err != nil {
@@ -242,30 +403,6 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 
 	return emitted, failed
-}
-
-func mergeSignals(groups ...[]string) []string {
-	var out []string
-	seen := make(map[string]struct{})
-	for _, g := range groups {
-		for _, s := range g {
-			if _, ok := seen[s]; ok {
-				continue
-			}
-			seen[s] = struct{}{}
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func hasRuleID(hits []model.RuleHit, id string) bool {
-	for _, h := range hits {
-		if h.RuleID == id {
-			return true
-		}
-	}
-	return false
 }
 
 // Stats returns a thread-safe snapshot of pipeline metrics.
@@ -305,6 +442,7 @@ func (p *Pipeline) Stats() Stats {
 	if segReader != nil {
 		rs := segReader.Stats()
 		st.CorruptedFrames = rs.CorruptedFrames
+		st.RecoveryStalls = rs.RecoveryStalls
 		st.BurnResets = rs.BurnResets
 	}
 	if queryPoller != nil {
@@ -317,13 +455,17 @@ func (p *Pipeline) Stats() Stats {
 	return st
 }
 
-// Burn waits for any in-flight FlushWindow to finish, resets in-memory templates and
-// active ingest cursors (.seg and /query), and deletes Sentinel-owned disk state.
+// Burn waits for any in-flight FlushWindow to finish, resets in-memory templates,
+// pending hits, and active ingest cursors (.seg and /query), and deletes Sentinel-owned disk state.
 func (p *Pipeline) Burn() (BurnReport, error) {
 	p.burnMu.Lock()
 	defer p.burnMu.Unlock()
 
 	p.agg.Reset()
+	p.hitsMu.Lock()
+	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
+	p.hitsMu.Unlock()
+
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
 	}
@@ -350,25 +492,29 @@ func (p *Pipeline) HandleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleBurn serves DELETE /burn matching Genesis's CSRF-safe DELETE requirement.
+// On partial failure, returns HTTP 500 with both the error diagnostic and the partial BurnReport.
 func (p *Pipeline) HandleBurn(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, `{"error":"method not allowed; use DELETE"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	rep, err := p.Burn()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":  err.Error(),
+			"report": rep,
+		})
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rep)
 }
 
 // BurnLocalState deletes ONLY known Sentinel-owned regular files inside dataDir
-// (cursor files, baseline snapshots, and feedback/*.jsonl), confined via Go 1.24's
-// os.Root so symlinks cannot redirect deletion outside dataDir. Unrelated user
-// files are preserved, bytes are counted strictly after successful deletion, and
-// any errors are returned alongside accurate partial counts.
+// (cursor files, baseline snapshots, and Sentinel-named feedback/*.jsonl files),
+// strictly confined via Go 1.24's os.Root (and nested root.OpenRoot("feedback")
+// so enumeration and deletion stay bound to the validated directory handle).
 func BurnLocalState(dataDir string) (BurnReport, error) {
 	rep := BurnReport{
 		Status:    "burned",
@@ -401,8 +547,8 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 	defer func() { _ = root.Close() }()
 
 	var errs []error
-	removeOwnedRel := func(rel string) {
-		fi, statErr := root.Lstat(rel)
+	removeOwnedInRoot := func(r *os.Root, rel string) {
+		fi, statErr := r.Lstat(rel)
 		if statErr != nil {
 			if !os.IsNotExist(statErr) {
 				errs = append(errs, fmt.Errorf("lstat %q: %w", rel, statErr))
@@ -410,14 +556,13 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 			return
 		}
 		if !fi.Mode().IsRegular() {
-			// Refuse to follow or unlink symlinks/directories in place of regular Sentinel files.
 			if fi.Mode()&os.ModeSymlink != 0 {
 				errs = append(errs, fmt.Errorf("refusing to remove symlink at Sentinel state path %q", rel))
 			}
 			return
 		}
 		sz := fi.Size()
-		if remErr := root.Remove(rel); remErr != nil {
+		if remErr := r.Remove(rel); remErr != nil {
 			if !os.IsNotExist(remErr) {
 				errs = append(errs, fmt.Errorf("remove %q: %w", rel, remErr))
 			}
@@ -443,44 +588,49 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 		if entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
-		if isOwnedTopLevelFile(name) {
-			removeOwnedRel(name)
+		if isOwnedTopLevelFile(entry.Name()) {
+			removeOwnedInRoot(root, entry.Name())
 		}
 	}
 
-	// 2. Known Sentinel feedback JSONL files inside root-confined "feedback/" (reject symlinks!).
+	// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
 	fbInfo, statErr := root.Lstat("feedback")
 	if statErr == nil {
 		if fbInfo.Mode()&os.ModeSymlink != 0 {
-			errs = append(errs, fmt.Errorf("refusing to follow symlink at %q", filepath.Join(dataDir, "feedback")))
+			errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
 		} else if fbInfo.IsDir() {
-			fbDir, openErr := root.Open("feedback")
-			if openErr != nil {
-				errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+			fbRoot, openRootErr := root.OpenRoot("feedback")
+			if openRootErr != nil {
+				errs = append(errs, fmt.Errorf("open feedback root: %w", openRootErr))
 			} else {
-				fbEntries, readErr := fbDir.ReadDir(-1)
-				_ = fbDir.Close()
-				if readErr != nil {
-					errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+				fbDir, openErr := fbRoot.Open(".")
+				if openErr != nil {
+					errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
 				} else {
-					for _, e := range fbEntries {
-						if e.IsDir() {
-							continue
-						}
-						name := e.Name()
-						if strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.tmp") {
-							removeOwnedRel(filepath.Join("feedback", name))
+					fbEntries, readErr := fbDir.ReadDir(-1)
+					_ = fbDir.Close()
+					if readErr != nil {
+						errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+					} else {
+						for _, e := range fbEntries {
+							if e.IsDir() {
+								continue
+							}
+							if isOwnedFeedbackFile(e.Name()) {
+								removeOwnedInRoot(fbRoot, e.Name())
+							}
 						}
 					}
-					// Remove feedback/ only if now empty.
-					if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
-						if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
-							remaining, _ := checkDir.ReadDir(1)
-							_ = checkDir.Close()
-							if len(remaining) == 0 {
-								errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
-							}
+				}
+				_ = fbRoot.Close()
+
+				// Remove feedback/ only if empty (preserves any unrelated user files inside feedback/).
+				if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
+					if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
+						remaining, _ := checkDir.ReadDir(1)
+						_ = checkDir.Close()
+						if len(remaining) == 0 {
+							errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
 						}
 					}
 				}
@@ -504,6 +654,19 @@ func isOwnedTopLevelFile(name string) bool {
 	}
 	return (strings.HasPrefix(name, ".cursor-") && strings.HasSuffix(name, ".tmp")) ||
 		(strings.HasPrefix(name, ".baseline-") && strings.HasSuffix(name, ".tmp"))
+}
+
+// isOwnedFeedbackFile enforces an explicit Sentinel filename contract inside dataDir/feedback/
+// so unrelated user files (e.g. feedback/import.jsonl) are never deleted by `sentinel burn`.
+func isOwnedFeedbackFile(name string) bool {
+	if name == "sentinel-feedback.jsonl" || name == "sentinel-feedback.jsonl.tmp" {
+		return true
+	}
+	if strings.HasPrefix(name, "sentinel-feedback-") &&
+		(strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.tmp")) {
+		return true
+	}
+	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
 }
 
 func truncateSummary(s string, maxChars int) string {

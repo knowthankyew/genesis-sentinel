@@ -54,6 +54,11 @@ func TestAggregatorCollapsesRepetitiveNoiseAndKeepsStableClusterID(t *testing.T)
 }
 
 func TestTemplateHashAndRootsAvoidDelimiterCollisions(t *testing.T) {
+	// Direct hash framing check without cluster ordinals
+	if TemplateHash("svc|edge", "WARN", "connection reset") == TemplateHash("svc", "edge|WARN", "connection reset") {
+		t.Fatal("TemplateHash collided across delimiter-ambiguous service/level pairs")
+	}
+
 	agg := NewAggregator(DefaultMaxClusters)
 	agg.Add(model.LogEvent{ID: 1, Timestamp: 100, Service: "svc|edge", Level: "WARN", Message: "connection reset"})
 	agg.Add(model.LogEvent{ID: 2, Timestamp: 100, Service: "svc", Level: "edge|WARN", Message: "connection reset"})
@@ -66,35 +71,27 @@ func TestTemplateHashAndRootsAvoidDelimiterCollisions(t *testing.T) {
 
 func TestAggregatorPreservesSignatureEvidenceSeparatelyFromHighEntropySample(t *testing.T) {
 	agg := NewAggregator(DefaultMaxClusters)
-	// First: high-entropy path in token position 2 (past Drain depth 2)
-	agg.Add(model.LogEvent{
-		ID:        1,
-		Timestamp: 100,
-		Service:   "nginx",
-		Level:     "WARN",
-		Message:   "GET /proxy target=/static/Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN HTTP/1.1 404",
-	})
-	// Second: path traversal in the same generalized wildcard position with lower entropy
-	agg.Add(model.LogEvent{
-		ID:        2,
-		Timestamp: 101,
-		Service:   "nginx",
-		Level:     "WARN",
-		Message:   "GET /proxy target=/static/../../../../etc/passwd HTTP/1.1 403",
-	})
+	highEntMsg := "GET /proxy target=/static/Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN HTTP/1.1 404"
+	lfiMsg := "GET /proxy target=/static/../../../../etc/passwd HTTP/1.1 403"
+
+	agg.Add(model.LogEvent{ID: 1, Timestamp: 100, Service: "nginx", Level: "WARN", Message: highEntMsg})
+	agg.Add(model.LogEvent{ID: 2, Timestamp: 101, Service: "nginx", Level: "WARN", Message: lfiMsg})
 
 	windows := agg.Flush()
 	if len(windows) != 1 {
 		t.Fatalf("expected 1 collapsed window, got %d", len(windows))
 	}
-	foundEvidence := strings.Contains(windows[0].SampleLine, "/etc/passwd")
+	if windows[0].SampleLine != highEntMsg {
+		t.Fatalf("expected primary SampleLine to remain highest-entropy message, got %q", windows[0].SampleLine)
+	}
+	foundInAdditional := false
 	for _, s := range windows[0].AdditionalSamples {
-		if strings.Contains(s, "/etc/passwd") {
-			foundEvidence = true
+		if s == lfiMsg {
+			foundInAdditional = true
 		}
 	}
-	if !foundEvidence {
-		t.Fatalf("signature evidence /etc/passwd was lost behind high-entropy sample: %+v", windows[0])
+	if !foundInAdditional {
+		t.Fatalf("expected LFI message in AdditionalSamples, got %+v", windows[0].AdditionalSamples)
 	}
 }
 

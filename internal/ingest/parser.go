@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -73,7 +75,19 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// Bound non-JSON lines safely before format parsing.
+	// 2. Pipe format: parse BEFORE maxLineLen truncation so a long trace_id or message
+	// cannot lose the fourth '|' delimiter and relabel service=sentinel as plain text.
+	if idx1 := bytes.IndexByte(raw, '|'); idx1 > 0 && isAllDigits(raw[:idx1]) {
+		ev, pipeErr := parsePipeLine(id, raw, maxLineLen)
+		if pipeErr == nil {
+			return ev, nil
+		}
+		if errors.Is(pipeErr, ErrOversizedLine) || len(raw) > maxLineLen {
+			return model.LogEvent{}, fmt.Errorf("%w: malformed or oversized pipe record (%d bytes)", ErrOversizedLine, len(raw))
+		}
+	}
+
+	// Bound remaining non-JSON/non-pipe lines safely before format parsing.
 	if len(raw) > maxLineLen {
 		raw = truncateUTF8Bytes(raw, maxLineLen)
 		if len(raw) == 0 {
@@ -81,19 +95,11 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// 2. Syslog RFC 5424 / 3164
+	// 3. Syslog RFC 5424 / 3164
 	if raw[0] == '<' {
 		idxClose := bytes.IndexByte(raw, '>')
 		if idxClose > 1 && idxClose <= 5 {
 			return parseSyslog(id, raw, idxClose, defaultService), nil
-		}
-	}
-
-	// 3. Pipe format: <timestamp>|<service>|<level>|<trace_id>|<message>
-	idx1 := bytes.IndexByte(raw, '|')
-	if idx1 > 0 && isAllDigits(raw[:idx1]) {
-		if ev, err := parsePipeLine(id, raw); err == nil {
-			return ev, nil
 		}
 	}
 
@@ -112,6 +118,8 @@ func truncateUTF8Bytes(b []byte, maxBytes int) []byte {
 	return b[:cut]
 }
 
+// truncateUTF8String clones the bounded prefix so truncating a large decoded string
+// does not pin a multi-hundred-KiB backing allocation in memory.
 func truncateUTF8String(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
@@ -120,7 +128,7 @@ func truncateUTF8String(s string, maxBytes int) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut]
+	return strings.Clone(s[:cut])
 }
 
 func isAllDigits(b []byte) bool {
@@ -135,7 +143,7 @@ func isAllDigits(b []byte) bool {
 	return true
 }
 
-func parsePipeLine(id uint64, raw []byte) (model.LogEvent, error) {
+func parsePipeLine(id uint64, raw []byte, maxLineLen int) (model.LogEvent, error) {
 	idx1 := bytes.IndexByte(raw, '|')
 	if idx1 <= 0 {
 		return model.LogEvent{}, errors.New("malformed pipe line")
@@ -164,9 +172,14 @@ func parsePipeLine(id uint64, raw []byte) (model.LogEvent, error) {
 	if idx4 == -1 {
 		return model.LogEvent{}, errors.New("malformed pipe line")
 	}
-	tail := string(rest)
-	traceID := tail[:idx4]
-	msg := tail[idx4+1:]
+	// Reject oversized structured metadata prefix rather than truncating fields.
+	headerLen := idx1 + 1 + idx2 + 1 + idx3 + 1 + idx4
+	if headerLen > maxLineLen {
+		return model.LogEvent{}, fmt.Errorf("%w: pipe metadata header (%d bytes) exceeds %d", ErrOversizedLine, headerLen, maxLineLen)
+	}
+	traceID := string(rest[:idx4])
+	msgBytes := truncateUTF8Bytes(rest[idx4+1:], maxLineLen)
+	msg := string(msgBytes)
 
 	return model.LogEvent{
 		ID:        id,
@@ -282,29 +295,44 @@ func stringifyJSONValue(v any) string {
 	}
 }
 
+func floatToUnixSec(f float64) (int64, bool) {
+	// Reject NaN, +/-Inf, non-positive values, and magnitudes outside safe int64 range.
+	const maxSafeFloat = float64(math.MaxInt64 / 2)
+	if math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 || f > maxSafeFloat {
+		return 0, false
+	}
+	n := int64(f)
+	if n > 1e12 {
+		return n / 1000, true
+	}
+	return n, true
+}
+
 func parseTimestampValue(val any) int64 {
 	switch v := val.(type) {
 	case json.Number:
 		if n, err := v.Int64(); err == nil {
+			if n <= 0 {
+				return 0
+			}
 			if n > 1e12 {
 				return n / 1000
 			}
 			return n
 		}
 		if f, err := v.Float64(); err == nil {
-			n := int64(f)
-			if n > 1e12 {
-				return n / 1000
+			if n, ok := floatToUnixSec(f); ok {
+				return n
 			}
-			return n
 		}
 	case float64:
-		n := int64(v)
-		if n > 1e12 {
-			return n / 1000
+		if n, ok := floatToUnixSec(v); ok {
+			return n
 		}
-		return n
 	case int64:
+		if v <= 0 {
+			return 0
+		}
 		if v > 1e12 {
 			return v / 1000
 		}
@@ -316,7 +344,7 @@ func parseTimestampValue(val any) int64 {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			return t.Unix()
 		}
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			if n > 1e12 {
 				return n / 1000
 			}
@@ -460,7 +488,13 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	now := time.Now()
 	ts := now.Unix()
 	if t, err := time.ParseInLocation("Jan _2 15:04:05", s[:15], now.Location()); err == nil {
-		ts = time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location()).Unix()
+		// RFC 3164 omits year: infer current year, rolling back to now.Year()-1 if the
+		// inferred timestamp falls more than 24h in the future (e.g. Dec 31 log read on Jan 1).
+		inferred := time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
+		if inferred.After(now.Add(24 * time.Hour)) {
+			inferred = time.Date(now.Year()-1, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
+		}
+		ts = inferred.Unix()
 	}
 
 	remainder := strings.TrimSpace(s[15:])
@@ -468,12 +502,13 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	msg := remainder
 
 	// RFC 3164 layout after timestamp: HOSTNAME MSG (where MSG begins with TAG[: ]CONTENT).
-	// Split off HOSTNAME first so colons inside IPv6 hostnames (e.g. 2001:db8::1) are never
-	// mistaken for the TAG: separator.
+	// Recognize IPv6 literals (including ones ending in "::" like 2001:db8::) before testing
+	// whether firstWord is a colon-terminated TAG without a hostname.
 	if spIdx := strings.IndexByte(remainder, ' '); spIdx != -1 {
 		firstWord := remainder[:spIdx]
 		afterHost := strings.TrimSpace(remainder[spIdx+1:])
-		if !strings.HasSuffix(firstWord, ":") && afterHost != "" {
+		isIPv6Host := net.ParseIP(strings.Trim(firstWord, "[]")) != nil
+		if (isIPv6Host || !strings.HasSuffix(firstWord, ":")) && afterHost != "" {
 			remainder = afterHost
 		}
 	}

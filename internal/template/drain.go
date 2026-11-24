@@ -220,15 +220,17 @@ func NewAggregator(maxClusters int) *Aggregator {
 	}
 }
 
-// Add folds a single LogEvent into the current window's collapsed templates.
-// Both miner extraction and window insertion run under a.mu so Reset is atomic.
-func (a *Aggregator) Add(ev model.LogEvent) {
+// Add folds a single LogEvent into the current window's collapsed templates and
+// returns (windowID, isGlobalOverflow, peakEntropy). Both miner extraction and
+// window insertion run under a.mu so Reset is atomic.
+func (a *Aggregator) Add(ev model.LogEvent) (string, bool, float64) {
 	ent := PeakShannonEntropy(ev.Message)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	tmplID, tmpl, overflowed := a.miner.ExtractTemplate(ev.Service, ev.Level, ev.Message)
+	isGlobalOverflow := false
 	if overflowed {
 		tmpl = "<OVERFLOW>"
 	}
@@ -241,6 +243,7 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 			ovID := OverflowTemplateID(ev.Service, ev.Level)
 			if existingOv, ok := a.windows[ovID]; ok {
 				w = existingOv
+				tmplID = ovID
 				exists = true
 			} else if a.overflowBuckets < maxOverflowBuckets {
 				a.overflowBuckets++
@@ -248,11 +251,12 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 				tmpl = "<OVERFLOW>"
 			} else {
 				const globalOvID = "overflow:global"
+				isGlobalOverflow = true
+				tmplID = globalOvID
 				if globalOv, ok := a.windows[globalOvID]; ok {
 					w = globalOv
 					exists = true
 				} else {
-					tmplID = globalOvID
 					tmpl = "<OVERFLOW>"
 				}
 			}
@@ -260,18 +264,26 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 	}
 
 	if !exists {
+		svc := ev.Service
+		lvl := ev.Level
+		if isGlobalOverflow {
+			// Keep global overflow bucket strictly unattributed so service/level rules
+			// evaluate each event with its real identity rather than the first overflow event's.
+			svc = "<MIXED>"
+			lvl = "<MIXED>"
+		}
 		a.windows[tmplID] = &model.TemplateWindow{
 			TemplateID:    tmplID,
 			Template:      tmpl,
-			Service:       ev.Service,
-			Level:         ev.Level,
+			Service:       svc,
+			Level:         lvl,
 			Count:         1,
 			FirstSeenUnix: ev.Timestamp,
 			LastSeenUnix:  ev.Timestamp,
 			SampleLine:    ev.Message,
 			SampleEntropy: ent,
 		}
-		return
+		return tmplID, isGlobalOverflow, ent
 	}
 
 	w.Count++
@@ -285,9 +297,9 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 		w.LastSeenUnix = ev.Timestamp
 	}
 
-	// Preserve highest-entropy sample in SampleLine AND retain bounded signature-evidence
-	// samples separately so malicious payloads in wildcard slots are never hidden by an
-	// earlier higher-entropy line.
+	// Retain the highest-entropy sample in SampleLine and keep a bounded best-effort
+	// preview cache (up to maxAdditionalSamples) in AdditionalSamples. Deterministic
+	// Tier 0 rule coverage evaluates each event at ingest time rather than relying on this cache.
 	prevSample := w.SampleLine
 	if ent > w.SampleEntropy {
 		w.SampleEntropy = ent
@@ -298,6 +310,7 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 	} else if ev.Message != w.SampleLine {
 		addEvidenceSample(w, ev.Message)
 	}
+	return tmplID, isGlobalOverflow, ent
 }
 
 func addEvidenceSample(w *model.TemplateWindow, sample string) {

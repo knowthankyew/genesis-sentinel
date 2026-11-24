@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,7 +20,7 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "Path to sentinel.json configuration file")
 	yes := fs.Bool("y", false, "Confirm destructive purge of Sentinel local state")
-	httpURL := fs.String("http", "", "Optional running Sentinel HTTP URL to also trigger DELETE /burn")
+	httpURL := fs.String("http", "", "Optional running Sentinel HTTP URL to trigger DELETE /burn (also purges configured local data_dir if different)")
 	authToken := fs.String("auth-token", "", "Optional Bearer token for running Sentinel HTTP API")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -34,7 +35,6 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("refusing to purge %q without -y confirmation flag", cfg.DataDir)
 	}
 
-	// If a live Sentinel daemon URL was supplied, trigger its DELETE /burn first so in-memory state resets too.
 	if *httpURL != "" {
 		target := *httpURL
 		if !strings.Contains(target, "://") {
@@ -61,14 +61,43 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("DELETE %s/burn failed: %w", target, doErr)
 		}
 		defer func() { _ = resp.Body.Close() }()
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		if readErr != nil {
+			return fmt.Errorf("read burn response: %w", readErr)
+		}
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			return fmt.Errorf("DELETE %s/burn returned %d: %s", target, resp.StatusCode, strings.TrimSpace(string(body)))
+			return fmt.Errorf("DELETE %s/burn returned %d: %s", target, resp.StatusCode, escapeForTerminal(strings.TrimSpace(string(body))))
 		}
-		if _, copyErr := io.Copy(stdout, io.LimitReader(resp.Body, 1024*1024)); copyErr != nil {
-			return fmt.Errorf("write burn response: %w", copyErr)
+
+		var daemonRep pipeline.BurnReport
+		if err := json.Unmarshal(body, &daemonRep); err != nil {
+			if _, wErr := fmt.Fprintln(stdout, escapeForTerminal(string(body))); wErr != nil {
+				return fmt.Errorf("write burn response: %w", wErr)
+			}
+			return nil
 		}
-		return nil
+
+		// If the daemon purged a different data_dir than our locally configured cfg.DataDir,
+		// also purge cfg.DataDir so the local directory is never silently left behind.
+		daemonDir := filepath.Clean(daemonRep.DataDir)
+		localDir := filepath.Clean(cfg.DataDir)
+		if cfg.DataDir != "" && daemonDir != localDir {
+			localRep, localErr := pipeline.BurnLocalState(cfg.DataDir)
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			if encErr := enc.Encode(map[string]any{
+				"daemon": daemonRep,
+				"local":  localRep,
+			}); encErr != nil {
+				return encErr
+			}
+			return localErr
+		}
+
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(daemonRep)
 	}
 
 	rep, err := pipeline.BurnLocalState(cfg.DataDir)
