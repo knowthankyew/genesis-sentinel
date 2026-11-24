@@ -1,13 +1,14 @@
 # Genesis Sentinel: Local-First Tiered Log Triage & Anomaly Sidecar
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg)](go.mod)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
 [![Stage: Phase 1 Complete](https://img.shields.io/badge/Stage-Phase%201%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
-**Genesis Sentinel** is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
+**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.2.0-phase1<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
 
-> **Current Status (Phase 1 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, `service=sentinel` loopback alert sink, and `watch` / `scan` / `stats` / `burn` / `data` / `config` commands are implemented and race-tested. Tier 1 Laplace-LK log surprisal (Phase 2) and Tier 2 SmolLM2-Instruct LoRA triage (Phase 3) are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Current Status (Phase 1 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, `service=sentinel` loopback alert sink, `watch` / `scan` / `stats` / `burn` / `data` / `config` commands, automated claims linter (`scripts/audit-claims.py`), and CycloneDX 1.5 SBOM (`bom.json`) are implemented and race-tested. Tier 1 Laplace-LK log surprisal (Phase 2) and Tier 2 SmolLM2-Instruct LoRA triage (Phase 3) are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 
@@ -18,7 +19,7 @@ Project Genesis can ingest over one million lines per second in RAM, while local
 1. **Tier 0 — Deterministic Rules & Template Collapse (Pure Go, Phase 1):** Reads Genesis `--data-dir` CRC32 `.seg` segments losslessly (or `/query` sliding windows), collapses repetitive lines into structural templates (Drain-style), and evaluates fast JSON IOC/regex/rate rules.
 2. **Tier 1 — Laplace-LK Log Surprisal (Information-Theoretic Math, Phase 2):** Measures per-feature and joint novelty in nats using clean-room Laplace-LK equations (Hazard et al., `arXiv:2510.22809`) to surface unseen anomalies without requiring prior threat labels, with optional HTTP parity against `ml/src/surprisal-service`.
 3. **Tier 2 — FTaaS-Trained LoRA Triage (SmolLM2 First, Gemma 2B Phase 5):** Evaluates only rule-flagged or high-surprisal event windows using a locally fine-tuned LoRA adapter, classifies the threat pattern, and writes structured alerts back into Genesis (`service=sentinel`) so they appear directly in Genesis's Web UI.
-4. **Adaptive Feedback Loop ("Definition Updates", Phase 3):** Operator labels (`true positive` / `false positive`) accumulate into a redacted JSONL dataset and trigger periodic async FTaaS LoRA jobs—starting on **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default, `SmolLM2-360M-Instruct` optional step-up) for rapid local turnaround, and graduating to **Gemma 2 2B IT** in Phase 5. Experimental **BitNet b1.58** models are explicitly excluded pending upstream toolchain maturity.
+4. **Adaptive Feedback Loop ("Definition Updates", Phase 3):** Operator labels (`true positive` / `false positive`) accumulate into a redacted JSONL dataset and trigger periodic async FTaaS LoRA jobs—starting on **SmolLM2-Instruct** (`<!-- claim:default_base_model -->HuggingFaceTB/SmolLM2-135M-Instruct<!-- /claim -->` default, `<!-- claim:stepup_base_model -->HuggingFaceTB/SmolLM2-360M-Instruct<!-- /claim -->` optional step-up) for rapid local turnaround, and graduating to **Gemma 2 2B IT** in Phase 5. Experimental **BitNet b1.58** models are explicitly excluded pending upstream toolchain maturity.
 
 ---
 
@@ -110,8 +111,14 @@ make test
 # Run race detector tests
 make race
 
-# Run linter
+# Run Go vet / static checks
 make lint
+
+# Run claims, zero-dependency, diagram freshness & SBOM governance audit
+make audit
+
+# Regenerate deterministic CycloneDX 1.5 SBOM (bom.json)
+make sbom
 ```
 
 ---

@@ -1,4 +1,4 @@
-.PHONY: all build test race lint fmt clean
+.PHONY: all build test race lint fmt audit sbom claims-test clean
 
 all: build
 
@@ -23,6 +23,15 @@ lint:
 
 fmt:
 	gofmt -s -w .
+
+sbom:
+	python3 ./scripts/generate-sbom.py bom.json
+
+claims-test:
+	python3 -m unittest discover -s tests
+
+audit:
+	python3 ./scripts/audit-claims.py
 
 clean:
 	rm -rf bin/

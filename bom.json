@@ -1,0 +1,225 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:6596058e-b353-5647-b8fd-0208364d74da",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-24T19:56:25Z",
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "publisher": "knowthankyew",
+          "name": "generate-sbom",
+          "version": "1.0.0"
+        }
+      ]
+    },
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel@0.2.0-phase1?arch=amd64",
+      "name": "genesis-sentinel",
+      "version": "0.2.0-phase1",
+      "description": "Local-first, zero-egress, pure-Go standard library security triage and anomaly detection sidecar for Project Genesis combining deterministic Tier 0 rules, Drain template collapsing, Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters.",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "knowthankyew:privacy:network_egress",
+          "value": "deny"
+        },
+        {
+          "name": "knowthankyew:privacy:telemetry_mode",
+          "value": "local_disk_state"
+        },
+        {
+          "name": "knowthankyew:privacy:pillar1_variance",
+          "value": "intentional_lossless_seg_tailing_and_burnable_local_state"
+        },
+        {
+          "name": "knowthankyew:privacy:burn_enabled",
+          "value": "true"
+        },
+        {
+          "name": "knowthankyew:privacy:third_party_dependencies",
+          "value": "0"
+        },
+        {
+          "name": "knowthankyew:security:localhost_default_bind",
+          "value": "true"
+        },
+        {
+          "name": "knowthankyew:security:alert_only",
+          "value": "true"
+        },
+        {
+          "name": "knowthankyew:ml:default_base_model",
+          "value": "HuggingFaceTB/SmolLM2-135M-Instruct"
+        },
+        {
+          "name": "knowthankyew:ml:excluded_families",
+          "value": "bitnet"
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/cli@0.2.0-phase1",
+      "name": "internal/cli",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Unified CLI subcommand router (watch, scan, stats, burn, data, config, version, help) and Phase 3 stubs",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/config@0.2.0-phase1",
+      "name": "internal/config",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Layered configuration loader (defaults -> sentinel.json -> SENTINEL_* env -> flags) with fail-closed validation and token redaction",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/emit@0.2.0-phase1",
+      "name": "internal/emit",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Loopback TCP JSONL alert sink emitting structured alerts into Project Genesis (service=sentinel) with QoS severity mapping",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/ingest@0.2.0-phase1",
+      "name": "internal/ingest",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Read-only lossless Genesis .seg CRC32 segment tailer with atomic cursor persistence, HTTP /query fallback poller, multi-format parser, and Track A synthetic corpus generator",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/model@0.2.0-phase1",
+      "name": "internal/model",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Tier wire contracts (LogEvent, TemplateWindow, RuleHit, SurprisalScore, TriageVerdict, FeedbackRecord) and fail-closed base model allowlist",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/pipeline@0.2.0-phase1",
+      "name": "internal/pipeline",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Tier 0 orchestrator, self-alert loop-prevention guard, HTTP status/burn server, and safe local disk state purge",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/rules@0.2.0-phase1",
+      "name": "internal/rules",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Precompiled Go RE2 deterministic rule engine (rules.json and built-in SENT-001..SENT-008 starter pack) with burst, entropy, and suppression support",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/security@0.2.0-phase1",
+      "name": "internal/security",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Constant-time Bearer auth middleware, dial-time loopback IP enforcement, and hostile-log prompt-injection sanitizer",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/template@0.2.0-phase1",
+      "name": "internal/template",
+      "version": "0.2.0-phase1",
+      "scope": "required",
+      "description": "Bounded pure-Go Drain-style prefix-tree template collapser with linear ASCII masking and peak Shannon entropy tracking",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:golang/github.com/knowthankyew/genesis-sentinel@0.2.0-phase1?arch=amd64",
+      "dependsOn": [
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/cli@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/config@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/emit@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/ingest@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/model@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/pipeline@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/rules@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/security@0.2.0-phase1",
+        "pkg:golang/github.com/knowthankyew/genesis-sentinel/internal/template@0.2.0-phase1"
+      ]
+    }
+  ]
+}

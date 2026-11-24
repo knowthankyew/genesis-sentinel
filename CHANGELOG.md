@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tier 0 Template Collapse & Deterministic Rules (`internal/template`, `internal/rules`):** Bounded pure-Go Drain-style prefix-tree template collapser (`DefaultMaxClusters = 4096`) with linear ASCII token masking and peak Shannon entropy tracking; precompiled RE2 rule engine (`rules.json` or built-in starter pack `SENT-001`..`SENT-008`) with operator allowlist suppressions.
 - **Alert Sink & Phase 1 Pipeline (`internal/emit`, `internal/pipeline`):** Loopback TCP JSONL alert sink emitting alerts back into Genesis under `service=sentinel` (mapping `CRITICAL`/`HIGH` to Genesis `FATAL`/`ERROR` priority lanes) with strict self-alert loop prevention, HTTP `/healthz` + `/stats` + `DELETE /burn`, and local disk state burn.
 - **Phase 1 CLI (`internal/cli`):** Implemented `sentinel watch`, `sentinel scan` (`--seg-dir`, `--file`, `--synthetic`), `sentinel stats`, and `sentinel burn -y`.
+- **Portfolio Claims Governance, SBOM & CI (`scripts/`, `tests/`, `.github/`):** Added `docs/claims_registry.json`, `scripts/sync_docs.py`, `scripts/audit-claims.py`, `tests/test_claims_linter.py`, deterministic CycloneDX 1.5 SBOM generator (`scripts/generate-sbom.py` + `bom.json`), GitHub Actions CI + SLSA build provenance (`.github/workflows/ci.yml`), and grouped Dependabot configuration (`.github/dependabot.yml`).
 
 ---
 

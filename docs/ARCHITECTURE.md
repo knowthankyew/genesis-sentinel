@@ -1,6 +1,6 @@
 <!-- diagram-meta
 last-validated: 2026-11-24
-validated-commit: initial-scaffold
+validated-commit: 99cfb6a
 covers: [cmd/, internal/]
 -->
 
@@ -59,18 +59,18 @@ flowchart TD
 
 1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
    - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
-   - Merges compiled safe defaults -> `sentinel.json` -> `SENTINEL_*` environment variables -> CLI flags.
+   - Merges compiled safe defaults (`DefaultMaxMemMB = <!-- claim:default_max_mem_mb -->256 MB<!-- /claim -->`, `DefaultWindowSec = <!-- claim:default_window_sec -->10s<!-- /claim -->`) -> `sentinel.json` -> `SENTINEL_*` environment variables -> CLI flags.
    - Surfaces Sentinel's local data directory (`~/.genesis-sentinel/` by default) transparently via startup banners and `sentinel data path | status | open` without requiring hidden-folder configuration, and redacts sensitive auth tokens automatically in `sentinel config`.
 2. **Domain Contracts & Model Governance (`internal/model/types.go`):**
    - Mirrors Genesis's `parser.LogEntry` JSON contract via `LogEvent`.
    - Defines explicit wire contracts between tiers: `TemplateWindow`, `RuleHit`, `SurprisalScore`, `TriageVerdict`, and `FeedbackRecord`.
-   - Enforces a fail-closed base model allowlist (`ValidateBaseModel`): SmolLM2-Instruct (`HuggingFaceTB/SmolLM2-135M-Instruct` default, `SmolLM2-360M-Instruct` step-up, plus base `SmolLM2-135M`) for Phases 0–4, `google/gemma-2-2b-it` reserved for Phase 5, and explicit rejection (`ErrExperimentalModelExcluded`) of experimental BitNet models.
+   - Enforces a fail-closed base model allowlist (`ValidateBaseModel`): SmolLM2-Instruct (`<!-- claim:default_base_model -->HuggingFaceTB/SmolLM2-135M-Instruct<!-- /claim -->` default, `<!-- claim:stepup_base_model -->HuggingFaceTB/SmolLM2-360M-Instruct<!-- /claim -->` step-up, plus base `SmolLM2-135M`) for Phases 0–4, `<!-- claim:phase5_base_model -->google/gemma-2-2b-it<!-- /claim -->` reserved for Phase 5, and explicit rejection (`ErrExperimentalModelExcluded`) of experimental BitNet models.
 3. **Genesis Ingestion Bridge (`internal/ingest/segreader.go`, `internal/ingest/cursor.go`, `internal/ingest/parser.go`, `internal/ingest/querypoller.go`, `internal/ingest/synthetic.go`):**
-   - Primary lossless read-only follower for Genesis `--data-dir` length-prefixed IEEE CRC32 `.seg` segments, with atomic cursor persistence (`cursor.json`), rotation handling, partial-write waiting, corrupted-tail recovery, and automatic `genesis burn` rewind detection.
+   - Primary lossless read-only follower for Genesis `--data-dir` length-prefixed IEEE CRC32 `.seg` segments (`MagicHeaderLen = <!-- claim:seg_magic_header_len -->8-byte<!-- /claim -->` header), with atomic cursor persistence (`cursor.json`), rotation handling, partial-write waiting, corrupted-tail recovery, and automatic `genesis burn` rewind detection.
    - Secondary cursor-based HTTP `/query` fallback poller tracking monotonic ID eviction gaps explicitly.
    - Multi-format parser matching Genesis's JSON Lines, Syslog RFC 5424/3164, Pipe, and plain-text parsing, plus a deterministic Track A synthetic attack/noise corpus generator.
 4. **Tier 0 Template Collapse & Deterministic Rules (`internal/template/drain.go`, `internal/rules/engine.go`):**
-   - Bounded pure-Go Drain-style prefix-tree template collapser (`DefaultMaxClusters = 4096`) with fast linear ASCII masking (IPv4, UUID, RFC3339, hex, numeric/duration, path IDs) and peak Shannon entropy tracking across messages and long tokens.
+   - Bounded pure-Go Drain-style prefix-tree template collapser (`DefaultMaxClusters = <!-- claim:default_max_clusters -->4,096<!-- /claim -->`, `DefaultMaxClusterBytes = <!-- claim:default_max_cluster_mb -->8 MB<!-- /claim -->`, `DefaultMaxWindows = <!-- claim:default_max_windows -->4,096<!-- /claim -->`, `DefaultMaxRetainedSampleBytes = <!-- claim:default_max_sample_mb -->16 MB<!-- /claim -->`) with fast linear ASCII masking (IPv4, UUID, RFC3339, hex, numeric/duration, path IDs) and peak Shannon entropy tracking across messages and long tokens.
    - Precompiled Go RE2 deterministic rule engine (`rules.json` or built-in starter pack `SENT-001`..`SENT-008`) supporting regex/IOC signatures, burst thresholds, entropy thresholds, and operator allowlist suppressions.
 5. **Orchestrator, Alert Sink & Security Layer (`internal/pipeline/pipeline.go`, `internal/emit/genesis_sink.go`, `internal/security/security.go`):**
    - Strict loop-prevention guard dropping incoming `service=sentinel` events before Tier 0 processing.

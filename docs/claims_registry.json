@@ -1,0 +1,130 @@
+{
+  "version": "2.0.0",
+  "claim_terms": {
+    "verified": {
+      "term": "verified",
+      "description": "Automated Go test or governance check verification marker",
+      "evidence": [
+        "internal/security/security_test.go:TestIsLoopbackEndpoint",
+        "internal/model/types_test.go:TestValidateBaseModel",
+        "internal/config/config_test.go:TestConfigRejectsBitNetAndNonLoopback",
+        "internal/cli/cli_test.go:TestExecuteDataSubcommands"
+      ]
+    },
+    "100_pct": {
+      "term": "100%",
+      "description": "Zero-external-dependency Go standard library compliance marker",
+      "evidence": [
+        "go.mod",
+        "internal/config/config.go"
+      ]
+    }
+  },
+  "claims": {
+    "sentinel_version": {
+      "source_artifact": "internal/cli/cli.go",
+      "go_const": "Version",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Current Genesis Sentinel release version declared in CLI entrypoint"
+    },
+    "default_max_clusters": {
+      "source_artifact": "internal/template/drain.go",
+      "go_const": "DefaultMaxClusters",
+      "format_rule": "{value:,}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default maximum learned Drain template clusters retained in RAM"
+    },
+    "default_max_cluster_mb": {
+      "source_artifact": "internal/template/drain.go",
+      "go_const": "DefaultMaxClusterBytes",
+      "format_rule": "bytes_to_mb",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default maximum string bytes retained across Drain template clusters"
+    },
+    "default_max_windows": {
+      "source_artifact": "internal/template/drain.go",
+      "go_const": "DefaultMaxWindows",
+      "format_rule": "{value:,}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default maximum distinct TemplateWindow entries retained between Flush calls"
+    },
+    "default_max_sample_mb": {
+      "source_artifact": "internal/template/drain.go",
+      "go_const": "DefaultMaxRetainedSampleBytes",
+      "format_rule": "bytes_to_mb",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default maximum preview sample bytes retained across active windows"
+    },
+    "default_max_mem_mb": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultMaxMemMB",
+      "format_rule": "{value} MB",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default Sentinel Go runtime memory budget ceiling in megabytes"
+    },
+    "default_window_sec": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultWindowSec",
+      "format_rule": "{value}s",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default Tier 0 template aggregation window duration in seconds"
+    },
+    "default_max_prompt_bytes": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultMaxPromptBytes",
+      "format_rule": "{value:,} bytes",
+      "used_in": ["SECURITY.md"],
+      "description": "Default maximum sanitized prompt payload size forwarded to Tier 2"
+    },
+    "default_max_training_records": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultMaxTrainingRecords",
+      "format_rule": "{value:,}",
+      "used_in": ["docs/ROADMAP.md"],
+      "description": "Maximum FTaaS training records per feedback dataset export"
+    },
+    "default_max_training_file_mb": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultMaxTrainingFileBytes",
+      "format_rule": "bytes_to_mb",
+      "used_in": ["docs/ROADMAP.md"],
+      "description": "Maximum FTaaS training JSONL file size in megabytes"
+    },
+    "seg_magic_header_len": {
+      "source_artifact": "internal/ingest/segreader.go",
+      "go_const": "MagicHeaderLen",
+      "format_rule": "{value}-byte",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Genesis .seg frame header length (4-byte length + 4-byte IEEE CRC32)"
+    },
+    "seg_max_frame_mb": {
+      "source_artifact": "internal/ingest/segreader.go",
+      "go_const": "MaxFrameBytes",
+      "format_rule": "bytes_to_mb",
+      "used_in": ["SECURITY.md"],
+      "description": "Single-frame allocation cap protecting .seg decoding against corrupted lengths"
+    },
+    "default_base_model": {
+      "source_artifact": "internal/model/types.go",
+      "go_const": "ModelSmolLM2135MInstruct",
+      "format_rule": "{value}",
+      "used_in": ["README.md", "NOTICE.md", "docs/ARCHITECTURE.md"],
+      "description": "Default Phase 0-4 SmolLM2-Instruct base model identifier"
+    },
+    "stepup_base_model": {
+      "source_artifact": "internal/model/types.go",
+      "go_const": "ModelSmolLM2360MInstruct",
+      "format_rule": "{value}",
+      "used_in": ["README.md", "NOTICE.md", "docs/ARCHITECTURE.md"],
+      "description": "Optional Phase 0-4 SmolLM2-Instruct step-up base model identifier"
+    },
+    "phase5_base_model": {
+      "source_artifact": "internal/model/types.go",
+      "go_const": "ModelGemma22BIT",
+      "format_rule": "{value}",
+      "used_in": ["NOTICE.md", "docs/ARCHITECTURE.md"],
+      "description": "Phase 5 reasoning-tier base model identifier"
+    }
+  }
+}
