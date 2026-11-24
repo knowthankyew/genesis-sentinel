@@ -55,13 +55,36 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 		t.Fatalf("unexpected RFC 5424 LogEvent: %+v", ev)
 	}
 
-	// 5. Syslog RFC 3164
+	// 5. Syslog RFC 3164 (including IPv6 hostname with colons and space-delimited tag)
 	ev, err = ParseRawLog(5, []byte(`<36>Nov 24 10:00:00 macbook sudo[991]: user dev : command not allowed`), 0, "genesis")
 	if err != nil {
 		t.Fatalf("RFC 3164 parse failed: %v", err)
 	}
 	if ev.Service != "sudo" || ev.Level != "WARN" || ev.Message != "user dev : command not allowed" {
 		t.Fatalf("unexpected RFC 3164 LogEvent: %+v", ev)
+	}
+	ev, err = ParseRawLog(51, []byte(`<36>Nov 24 10:00:00 2001:db8::1 sshd: failed login`), 0, "genesis")
+	if err != nil || ev.Service != "sshd" || ev.Message != "failed login" {
+		t.Fatalf("RFC 3164 IPv6 hostname parse failed: ev=%+v err=%v", ev, err)
+	}
+	ev, err = ParseRawLog(52, []byte(`<36>Nov 24 10:00:00 host1 cronjob completed ok`), 0, "genesis")
+	if err != nil || ev.Service != "cronjob" || ev.Message != "completed ok" {
+		t.Fatalf("RFC 3164 space-delimited tag failed: ev=%+v err=%v", ev, err)
+	}
+
+	// 5b. Trailing garbage after valid JSON object must NOT parse as JSON
+	ev, err = ParseRawLog(53, []byte(`{"service":"sentinel","msg":"x"} trailing}`), 0, "genesis")
+	if err != nil {
+		t.Fatalf("trailing JSON fallback errored: %v", err)
+	}
+	if ev.Service == "sentinel" {
+		t.Fatalf("expected JSON with trailing garbage to be rejected as JSON, got %+v", ev)
+	}
+
+	// 5c. Oversized invalid UTF-8 continuation bytes must not panic after truncation
+	badUTF8 := bytes.Repeat([]byte{0x80}, DefaultMaxLineLength+16)
+	if _, err := ParseRawLog(54, badUTF8, DefaultMaxLineLength, "genesis"); !errors.Is(err, ErrEmptyInput) {
+		t.Fatalf("expected ErrEmptyInput for oversized invalid UTF-8 continuation bytes, got %v", err)
 	}
 
 	// 6. Pipe format
@@ -223,5 +246,138 @@ func TestQueryPollerDeduplicationGapsSaturationBoundsAndConcurrency(t *testing.T
 	evs, _, err := ParseLogEventsFromRaw(-5, 42)
 	if err != nil || len(evs) != 0 {
 		t.Fatalf("expected empty result for negative count, got len=%d err=%v", len(evs), err)
+	}
+}
+
+func TestSegReaderSegmentRotationAndIdenticalPrefixReplacement(t *testing.T) {
+	segDir := t.TempDir()
+	cursorPath := filepath.Join(t.TempDir(), "cursor.json")
+
+	// 1. Segment rotation: 00000001.seg -> 00000002.seg with cursor save & resume
+	seg1 := filepath.Join(segDir, "00000001.seg")
+	seg2 := filepath.Join(segDir, "00000002.seg")
+	prefixLine := []byte(`{"timestamp":100,"service":"api","level":"INFO","message":"identical-prefix-padding-line-repeated-across-burn-boundary-0123456789012345678901234567890123456789"}`)
+
+	f1, _ := os.Create(seg1)
+	_ = WriteSegmentFrame(f1, prefixLine)
+	_ = WriteSegmentFrame(f1, []byte(`{"timestamp":101,"service":"api","level":"INFO","message":"seg1-second"}`))
+	_ = f1.Close()
+
+	r1, err := NewSegReader(segDir, cursorPath, 0)
+	if err != nil {
+		t.Fatalf("NewSegReader: %v", err)
+	}
+	b1, err := r1.ReadBatch(10)
+	if err != nil || len(b1) != 2 {
+		t.Fatalf("seg1 read: len=%d err=%v", len(b1), err)
+	}
+	if err := r1.SaveCursor(); err != nil {
+		t.Fatalf("SaveCursor seg1: %v", err)
+	}
+
+	// Rotate to 00000002.seg and resume from saved cursor
+	f2, _ := os.Create(seg2)
+	_ = WriteSegmentFrame(f2, []byte(`{"timestamp":102,"service":"sshd","level":"ERROR","message":"seg2-first"}`))
+	_ = WriteSegmentFrame(f2, []byte(`{"timestamp":103,"service":"sshd","level":"ERROR","message":"seg2-second"}`))
+	_ = f2.Close()
+
+	r2, err := NewSegReader(segDir, cursorPath, 0)
+	if err != nil {
+		t.Fatalf("NewSegReader seg2: %v", err)
+	}
+	b2, err := r2.ReadBatch(10)
+	if err != nil || len(b2) != 2 || b2[0].Message != "seg2-first" || b2[1].Message != "seg2-second" {
+		t.Fatalf("expected exact seg2 delivery without repeat/skip, got %+v err=%v", b2, err)
+	}
+
+	// 2. Identical-prefix replacement test on 00000001.seg (same prefix >= 256 bytes, larger size, new inode!)
+	segDirB := t.TempDir()
+	cursorPathB := filepath.Join(t.TempDir(), "cursorB.json")
+	segB := filepath.Join(segDirB, "00000001.seg")
+	fb1, _ := os.Create(segB)
+	_ = WriteSegmentFrame(fb1, prefixLine)
+	_ = WriteSegmentFrame(fb1, prefixLine)
+	_ = fb1.Close()
+
+	rb1, _ := NewSegReader(segDirB, cursorPathB, 0)
+	if batch, err := rb1.ReadBatch(10); err != nil || len(batch) != 2 {
+		t.Fatalf("rb1 read: len=%d err=%v", len(batch), err)
+	}
+	_ = rb1.SaveCursor()
+
+	// Unlink and recreate 00000001.seg with IDENTICAL first 2 frames (>=256 bytes) + 1 new third frame
+	_ = os.Remove(segB)
+	fb2, _ := os.Create(segB)
+	_ = WriteSegmentFrame(fb2, prefixLine)
+	_ = WriteSegmentFrame(fb2, prefixLine)
+	_ = WriteSegmentFrame(fb2, []byte(`{"timestamp":200,"service":"api","level":"WARN","message":"after-identical-prefix-replacement"}`))
+	_ = fb2.Close()
+
+	rb2, _ := NewSegReader(segDirB, cursorPathB, 0)
+	batchRepl, err := rb2.ReadBatch(10)
+	if err != nil || len(batchRepl) != 3 {
+		t.Fatalf("expected identical-prefix replacement to rewind and deliver all 3 frames, got len=%d err=%v", len(batchRepl), err)
+	}
+	if rb2.Stats().BurnResets != 1 {
+		t.Fatalf("expected BurnResets=1 for identical-prefix replacement, got %d", rb2.Stats().BurnResets)
+	}
+}
+
+func TestQueryPollerGapWithCursorRowPresentAndConcurrency(t *testing.T) {
+	gate := make(chan struct{})
+	inHandler := make(chan struct{}, 2)
+	call := 0
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		call++
+		c := call
+		mu.Unlock()
+		switch c {
+		case 1:
+			_ = json.NewEncoder(w).Encode(genesisQueryResponse{
+				Count: 1,
+				Logs:  []model.LogEvent{{ID: 10, Timestamp: 1000, Service: "api", Level: "INFO", Message: "m10"}},
+			})
+		case 2:
+			inHandler <- struct{}{}
+			<-gate
+			// Page includes already-seen ID 10 plus ID 14 => IDs 11, 12, 13 were lost!
+			_ = json.NewEncoder(w).Encode(genesisQueryResponse{
+				Count: 2,
+				Logs: []model.LogEvent{
+					{ID: 10, Timestamp: 1000, Service: "api", Level: "INFO", Message: "m10"},
+					{ID: 14, Timestamp: 1004, Service: "api", Level: "ERROR", Message: "m14"},
+				},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(genesisQueryResponse{Count: 0})
+		}
+	}))
+	defer srv.Close()
+
+	poller := NewQueryPoller(srv.URL, "", 100, false)
+	if _, err := poller.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = poller.Poll(context.Background())
+	}()
+
+	<-inHandler
+	// Exercise concurrent Stats and SetMaxResponseBytes while Poll is blocked in HTTP handler
+	_ = poller.Stats()
+	poller.SetMaxResponseBytes(DefaultMaxQueryResponseBytes)
+	close(gate)
+	wg.Wait()
+
+	st := poller.Stats()
+	if st.EvictionGaps != 1 || st.EstimatedLost != 3 {
+		t.Fatalf("cursor 10 + page [10, 14]: expected EvictionGaps=1 EstimatedLost=3, got %+v", st)
 	}
 }

@@ -97,6 +97,24 @@ func TestSanitizeUntrustedLogText(t *testing.T) {
 	}
 }
 
+type recordingTransport struct {
+	base            http.RoundTripper
+	externalAttempt bool
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !IsLoopbackEndpoint(req.URL.String()) {
+		rt.externalAttempt = true
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	}
+	return rt.base.RoundTrip(req)
+}
+
 func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -110,11 +128,18 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Loopback client blocks external redirect but allows loopback redirect
+	// Use recording transport so no public network call ever happens and policy rejection is explicitly verified.
+	rec := &recordingTransport{base: srv.Client().Transport}
 	c := NewLoopbackHTTPClient(2*time.Second, false, false)
-	if _, err := c.Get(srv.URL + "/to-external"); err == nil {
-		t.Fatal("expected external redirect to be blocked by loopback policy")
+	c.Transport = rec
+	_, err := c.Get(srv.URL + "/to-external")
+	if err == nil || !strings.Contains(err.Error(), "blocked by loopback policy") {
+		t.Fatalf("expected explicit loopback policy error on external redirect, got err=%v", err)
 	}
+	if rec.externalAttempt {
+		t.Fatal("transport received an external request despite loopback redirect policy")
+	}
+
 	resp, err := c.Get(srv.URL + "/to-local")
 	if err != nil {
 		t.Fatalf("expected loopback redirect to succeed, got %v", err)
@@ -123,7 +148,9 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 
 	// Strict blockRedirects client rejects even loopback redirects (e.g. DELETE /burn)
 	strict := NewLoopbackHTTPClient(2*time.Second, false, true)
-	if _, err := strict.Get(srv.URL + "/to-local"); err == nil {
-		t.Fatal("expected blockRedirects=true to reject all redirects")
+	strict.Transport = rec
+	_, err = strict.Get(srv.URL + "/to-local")
+	if err == nil || !strings.Contains(err.Error(), "blocked by security policy") {
+		t.Fatalf("expected explicit redirect block error, got err=%v", err)
 	}
 }

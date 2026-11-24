@@ -237,6 +237,7 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 	if !exists {
 		// Enforce window count cap between flushes under adversarial random floods.
 		if len(a.windows) >= a.maxWindows {
+			overflowed = true
 			ovID := OverflowTemplateID(ev.Service, ev.Level)
 			if existingOv, ok := a.windows[ovID]; ok {
 				w = existingOv

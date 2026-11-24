@@ -248,11 +248,14 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 		skipping  bool
 	)
 
+	// Allow up to MaxFrameBytes of payload plus up to 2 bytes for CRLF line ending.
+	const maxRawLineWithCRLF = ingest.MaxFrameBytes + 2
+
 	for {
 		chunk, readErr := reader.ReadSlice('\n')
 		if errors.Is(readErr, bufio.ErrBufferFull) {
 			if !skipping {
-				if len(acc)+len(chunk) > ingest.MaxFrameBytes {
+				if len(acc)+len(chunk) > maxRawLineWithCRLF {
 					skipping = true
 					acc = acc[:0]
 					oversized++
@@ -279,7 +282,7 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 
 		var line []byte
 		if len(acc) > 0 {
-			if len(acc)+len(chunk) > ingest.MaxFrameBytes {
+			if len(acc)+len(chunk) > maxRawLineWithCRLF {
 				oversized++
 				acc = acc[:0]
 				if errors.Is(readErr, io.EOF) {
@@ -293,9 +296,13 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 			line = chunk
 		}
 
-		if len(line) > 0 {
+		// Strip trailing LF / CRLF before enforcing MaxFrameBytes on payload bytes.
+		payload := trimLineEnding(line)
+		if len(payload) > ingest.MaxFrameBytes {
+			oversized++
+		} else if len(payload) > 0 {
 			id++
-			ev, parseErr := ingest.ParseRawLog(id, line, 0, defaultSvc)
+			ev, parseErr := ingest.ParseRawLog(id, payload, 0, defaultSvc)
 			if parseErr == nil {
 				pipe.IngestEvent(ev)
 			} else if errors.Is(parseErr, ingest.ErrOversizedLine) {
@@ -311,4 +318,14 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 
 	alerts, _ := pipe.FlushWindow()
 	return pipe, alerts, oversized, nil
+}
+
+func trimLineEnding(b []byte) []byte {
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	if len(b) > 0 && b[len(b)-1] == '\r' {
+		b = b[:len(b)-1]
+	}
+	return b
 }

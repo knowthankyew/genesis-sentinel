@@ -178,4 +178,32 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	if !foundLFI {
 		t.Fatalf("expected SENT-003 hit from AdditionalSamples, got %+v", resExtra.RuleHits)
 	}
+
+	// MinLength must evaluate against the matching AdditionalSample, not reject upfront because SampleLine is short
+	lenEng, err := NewEngine(RulePack{
+		Version: "1.0",
+		Rules: []Rule{{
+			ID:          "LEN-1",
+			Category:    "long_marker",
+			Severity:    "MEDIUM",
+			Description: "marker on >=48 byte sample",
+			Pattern:     "marker",
+			MinLength:   48,
+			MinCount:    1,
+			Enabled:     true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine LEN-1: %v", err)
+	}
+	resLen := lenEng.Evaluate(model.TemplateWindow{
+		Service:           "app",
+		Level:             "INFO",
+		Count:             2,
+		SampleLine:        "short",
+		AdditionalSamples: []string{"this-is-a-long-secondary-evidence-line-containing-marker-value-12345"},
+	}, 1024)
+	if len(resLen.RuleHits) != 1 || resLen.RuleHits[0].RuleID != "LEN-1" {
+		t.Fatalf("expected LEN-1 hit on qualifying AdditionalSample, got %+v", resLen.RuleHits)
+	}
 }

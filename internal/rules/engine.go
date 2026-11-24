@@ -281,14 +281,11 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 		if cr.rule.MinCount > 0 && w.Count < cr.rule.MinCount {
 			continue
 		}
-		if cr.rule.MinLength > 0 && len(w.SampleLine) < cr.rule.MinLength {
-			continue
-		}
 		if cr.rule.MinEntropy > 0 && w.SampleEntropy < cr.rule.MinEntropy {
 			continue
 		}
 		if cr.re != nil {
-			matchedSample, ok := matchRuleRegex(cr.re, w)
+			matchedSample, ok := matchRuleRegex(cr.re, w, cr.rule.MinLength)
 			if !ok {
 				continue
 			}
@@ -297,6 +294,8 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 			if matchedSample != "" && matchedSample != w.SampleLine {
 				res.SanitizedSample, _ = security.SanitizeUntrustedLogText(matchedSample, maxPromptBytes)
 			}
+		} else if cr.rule.MinLength > 0 && maxWindowSampleLength(w) < cr.rule.MinLength {
+			continue
 		}
 		res.RuleHits = append(res.RuleHits, model.RuleHit{
 			RuleID:      cr.rule.ID,
@@ -309,19 +308,29 @@ func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) Evaluation
 	return res
 }
 
-func matchRuleRegex(re *regexp.Regexp, w model.TemplateWindow) (string, bool) {
-	if re.MatchString(w.SampleLine) {
+func matchRuleRegex(re *regexp.Regexp, w model.TemplateWindow, minLen int) (string, bool) {
+	if (minLen <= 0 || len(w.SampleLine) >= minLen) && re.MatchString(w.SampleLine) {
 		return w.SampleLine, true
 	}
-	if re.MatchString(w.Template) {
+	if (minLen <= 0 || len(w.Template) >= minLen) && re.MatchString(w.Template) {
 		return w.SampleLine, true
 	}
 	for _, extra := range w.AdditionalSamples {
-		if re.MatchString(extra) {
+		if (minLen <= 0 || len(extra) >= minLen) && re.MatchString(extra) {
 			return extra, true
 		}
 	}
 	return "", false
+}
+
+func maxWindowSampleLength(w model.TemplateWindow) int {
+	best := len(w.SampleLine)
+	for _, extra := range w.AdditionalSamples {
+		if len(extra) > best {
+			best = len(extra)
+		}
+	}
+	return best
 }
 
 func (e *Engine) isSuppressed(w model.TemplateWindow) bool {

@@ -23,9 +23,9 @@ const (
 	MagicHeaderLen = 8
 	// MaxFrameBytes bounds single-frame allocation to protect against corrupted length headers.
 	MaxFrameBytes = 1024 * 1024 // 1 MiB
-	// maxFingerprintBytes is the prefix length hashed to identify segment identity across burn resets.
+	// maxFingerprintBytes is the prefix length hashed alongside POSIX file identity.
 	maxFingerprintBytes = 256
-	// maxRecoveryScanBytes bounds byte-by-byte forward resync after a corrupted frame.
+	// maxRecoveryScanBytes bounds byte-by-byte forward resync per poll after a corrupted frame.
 	maxRecoveryScanBytes = 256 * 1024
 )
 
@@ -35,12 +35,14 @@ type SegReaderStats struct {
 	CurrentOffset    int64  `json:"current_offset"`
 	FramesRead       uint64 `json:"frames_read"`
 	CorruptedFrames  uint64 `json:"corrupted_frames"`
+	RecoveryStalls   uint64 `json:"recovery_stalls"`
 	BurnResets       uint64 `json:"burn_resets"`
 }
 
 // SegReader follows Genesis append-only .seg segment files read-only without dropping
-// events during traffic bursts. It safely handles rotation, partial writes, bounded
-// CRC recovery, and `genesis burn` replacement detection.
+// events during traffic bursts. It validates segment identity on the exact open file
+// handle before seeking, handles rotation, partial writes, incremental bounded CRC
+// recovery across polls, and `genesis burn` replacement detection.
 type SegReader struct {
 	mu             sync.Mutex
 	saveMu         sync.Mutex // serializes cursor snapshot + file writes without blocking ReadBatch across disk I/O
@@ -50,8 +52,14 @@ type SegReader struct {
 	maxLineLen     int
 	defaultService string
 
+	// recoveryScanSeg and recoveryScanOffset track forward resync progress across polls
+	// when a corrupted frame spans more than maxRecoveryScanBytes before the next valid frame.
+	recoveryScanSeg    uint64
+	recoveryScanOffset int64
+
 	framesRead      uint64
 	corruptedFrames uint64
+	recoveryStalls  uint64
 	burnResets      uint64
 }
 
@@ -99,34 +107,13 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 
 	latestSegID := segments[len(segments)-1]
 
-	// Detect `genesis burn` (segment rollback, truncation, OR replacement file with new content
-	// even if the replacement grew >= saved offset).
 	if r.cursor.SegmentID > 0 {
 		if r.cursor.SegmentID > latestSegID {
+			// Segment numbering rolled back (e.g. `genesis burn` reset to 00000001.seg).
 			r.resetCursorToLocked(segments[0], true)
 		} else if !containsSegment(segments, r.cursor.SegmentID) {
 			// Cursor segment was pruned by retention; advance to earliest surviving segment.
 			r.resetCursorToLocked(segments[0], false)
-		} else {
-			curPath := segmentPath(r.segDir, r.cursor.SegmentID)
-			info, statErr := os.Stat(curPath)
-			if statErr != nil {
-				if os.IsNotExist(statErr) {
-					r.resetCursorToLocked(segments[0], true)
-				} else {
-					return nil, fmt.Errorf("stat segment %q: %w", curPath, statErr)
-				}
-			} else if info.Size() < r.cursor.Offset {
-				r.resetCursorToLocked(segments[0], true)
-			} else if r.cursor.SegmentFingerprint != "" && r.cursor.FingerprintLen > 0 {
-				fp, fpLen, fpErr := computeSegmentFingerprint(curPath, r.cursor.FingerprintLen)
-				if fpErr != nil {
-					return nil, fmt.Errorf("verify segment identity %q: %w", curPath, fpErr)
-				}
-				if fpLen < r.cursor.FingerprintLen || fp != r.cursor.SegmentFingerprint {
-					r.resetCursorToLocked(segments[0], true)
-				}
-			}
 		}
 	} else {
 		r.resetCursorToLocked(segments[0], false)
@@ -139,10 +126,7 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 		}
 		isLatest := idx == len(segments)-1
 		if segID > r.cursor.SegmentID {
-			r.cursor.SegmentID = segID
-			r.cursor.Offset = 0
-			r.cursor.SegmentFingerprint = ""
-			r.cursor.FingerprintLen = 0
+			r.resetCursorToLocked(segID, false)
 		}
 
 		segEvents, advancedToNext, readErr := r.readSegmentLocked(segID, isLatest, maxEvents-len(events))
@@ -165,11 +149,18 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 func (r *SegReader) resetCursorToLocked(segID uint64, isBurn bool) {
 	r.cursor.SegmentID = segID
 	r.cursor.Offset = 0
+	r.cursor.FileIdentity = ""
 	r.cursor.SegmentFingerprint = ""
 	r.cursor.FingerprintLen = 0
+	r.clearRecoveryStateLocked()
 	if isBurn {
 		r.burnResets++
 	}
+}
+
+func (r *SegReader) clearRecoveryStateLocked() {
+	r.recoveryScanSeg = 0
+	r.recoveryScanOffset = 0
 }
 
 func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) ([]model.LogEvent, bool, error) {
@@ -183,13 +174,40 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 	}
 	defer func() { _ = f.Close() }()
 
+	// Validate size and file identity strictly on the SAME open file handle before seeking
+	// so a concurrent `genesis burn` replacement between stat and open cannot skip records.
 	info, err := f.Stat()
 	if err != nil {
 		return nil, false, fmt.Errorf("stat segment %q: %w", segPath, err)
 	}
 	fileSize := info.Size()
+	currentFileID := fileIdentity(info)
 
-	// Capture segment identity fingerprint as soon as enough header bytes exist.
+	if r.cursor.Offset > 0 || r.cursor.FileIdentity != "" || r.cursor.SegmentFingerprint != "" {
+		replaced := false
+		if fileSize < r.cursor.Offset {
+			replaced = true
+		} else if r.cursor.FileIdentity != "" && currentFileID != "" && currentFileID != r.cursor.FileIdentity {
+			// POSIX dev:ino changed — file was unlinked and recreated even if prefix and size match!
+			replaced = true
+		} else if r.cursor.SegmentFingerprint != "" && r.cursor.FingerprintLen > 0 {
+			fp, fpLen, fpErr := computeSegmentFingerprintFromFile(f, r.cursor.FingerprintLen)
+			if fpErr != nil {
+				return nil, false, fmt.Errorf("verify segment identity %q: %w", segPath, fpErr)
+			}
+			if fpLen < r.cursor.FingerprintLen || fp != r.cursor.SegmentFingerprint {
+				replaced = true
+			}
+		}
+		if replaced {
+			r.resetCursorToLocked(segID, true)
+		}
+	}
+
+	// Capture file identity + prefix fingerprint on the open handle once header bytes exist.
+	if r.cursor.FileIdentity == "" && currentFileID != "" {
+		r.cursor.FileIdentity = currentFileID
+	}
 	if r.cursor.SegmentFingerprint == "" && fileSize >= MagicHeaderLen {
 		fp, fpLen, fpErr := computeSegmentFingerprintFromFile(f, maxFingerprintBytes)
 		if fpErr != nil {
@@ -235,42 +253,31 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 
 		if payloadLen == 0 || payloadLen > MaxFrameBytes {
 			r.corruptedFrames++
-			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
-			if scanErr != nil {
-				return events, false, scanErr
+			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, isLatest)
+			if recErr != nil {
+				return events, false, recErr
 			}
-			if found {
-				r.cursor.Offset = nextOff
-				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
-					return events, false, seekErr
-				}
+			if recovered {
 				continue
 			}
-			if isLatest {
-				return events, false, nil
-			}
-			return events, true, nil
+			return events, doneSeg, nil
 		}
 
 		frameBytes := int64(MagicHeaderLen) + int64(payloadLen)
 		if remaining < frameBytes {
 			if isLatest {
-				// Partial in-flight write; leave cursor at frame start.
+				// Partial in-flight write; leave cursor at frame start without triggering recovery.
 				return events, false, nil
 			}
 			r.corruptedFrames++
-			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
-			if scanErr != nil {
-				return events, false, scanErr
+			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, false)
+			if recErr != nil {
+				return events, false, recErr
 			}
-			if found {
-				r.cursor.Offset = nextOff
-				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
-					return events, false, seekErr
-				}
+			if recovered {
 				continue
 			}
-			return events, true, nil
+			return events, doneSeg, nil
 		}
 
 		payload := make([]byte, payloadLen)
@@ -288,25 +295,17 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 		actualCRC := crc32.ChecksumIEEE(payload)
 		if actualCRC != expectedCRC {
 			r.corruptedFrames++
-			// Bounded recovery: scan forward for the next CRC-validated frame boundary.
-			// Never advance past an unvalidated tail on the active segment.
-			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
-			if scanErr != nil {
-				return events, false, scanErr
+			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, isLatest)
+			if recErr != nil {
+				return events, false, recErr
 			}
-			if found {
-				r.cursor.Offset = nextOff
-				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
-					return events, false, seekErr
-				}
+			if recovered {
 				continue
 			}
-			if isLatest {
-				return events, false, nil
-			}
-			return events, true, nil
+			return events, doneSeg, nil
 		}
 
+		r.clearRecoveryStateLocked()
 		r.cursor.Offset += frameBytes
 		r.cursor.NextID++
 		r.framesRead++
@@ -321,19 +320,61 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 	return events, r.cursor.Offset >= fileSize && !isLatest, nil
 }
 
+// advanceRecoveryLocked performs bounded forward resync from a corrupted frame,
+// persisting scan progress across polls so large corrupt regions eventually resync
+// instead of rescanning the same window indefinitely.
+func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int64, isLatest bool) (recovered bool, doneSegment bool, err error) {
+	scanStart := r.cursor.Offset + 1
+	if r.recoveryScanSeg == segID && r.recoveryScanOffset > scanStart {
+		scanStart = r.recoveryScanOffset
+	}
+
+	for {
+		nextOff, scannedTo, found, scanErr := findNextValidFrame(f, scanStart, fileSize)
+		if scanErr != nil {
+			return false, false, scanErr
+		}
+		if found {
+			r.clearRecoveryStateLocked()
+			r.cursor.Offset = nextOff
+			if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
+				return false, false, seekErr
+			}
+			return true, false, nil
+		}
+
+		// Update progressive scan watermark so the next poll continues where this window stopped.
+		r.recoveryScanSeg = segID
+		r.recoveryScanOffset = scannedTo
+
+		if isLatest {
+			// Yield after one bounded scan window per poll on the active segment; report stall.
+			r.recoveryStalls++
+			return false, false, nil
+		}
+
+		// On a closed older segment, continue chunk-by-chunk until EOF so valid later frames are never skipped.
+		if scannedTo >= fileSize-MagicHeaderLen || scannedTo <= scanStart {
+			r.clearRecoveryStateLocked()
+			return false, true, nil
+		}
+		scanStart = scannedTo
+	}
+}
+
 // findNextValidFrame scans forward up to maxRecoveryScanBytes from startOff looking
 // for the next byte offset whose 8-byte [len][crc32] header points to a complete
 // payload within fileSize that passes IEEE CRC32 verification.
-func findNextValidFrame(f *os.File, startOff, fileSize int64) (int64, bool, error) {
+func findNextValidFrame(f *os.File, startOff, fileSize int64) (foundOff int64, nextScanOff int64, found bool, err error) {
 	if startOff+MagicHeaderLen >= fileSize {
-		return 0, false, nil
+		return 0, startOff, false, nil
 	}
 	limit := min(fileSize-MagicHeaderLen, startOff+maxRecoveryScanBytes)
 	scanWindowSize := int(min(fileSize-startOff, maxRecoveryScanBytes+MaxFrameBytes+MagicHeaderLen))
 	buf := make([]byte, scanWindowSize)
-	n, err := f.ReadAt(buf, startOff)
-	if err != nil && !isEOFError(err) {
-		return 0, false, fmt.Errorf("scan recovery window at %d: %w", startOff, err)
+	n, readErr := f.ReadAt(buf, startOff)
+	if readErr != nil && !isEOFError(readErr) {
+		return 0, startOff, false, fmt.Errorf("scan recovery window at %d: %w", startOff, readErr)
 	}
 	buf = buf[:n]
 
@@ -352,23 +393,21 @@ func findNextValidFrame(f *os.File, startOff, fileSize int64) (int64, bool, erro
 		}
 		wantCRC := binary.BigEndian.Uint32(buf[rel+4 : rel+8])
 		if crc32.ChecksumIEEE(buf[rel+MagicHeaderLen:end]) == wantCRC {
-			return startOff + int64(rel), true, nil
+			return startOff + int64(rel), startOff + int64(rel), true, nil
 		}
 	}
-	return 0, false, nil
+	nextOff := startOff + int64(maxRel) + 1
+	if nextOff > fileSize-MagicHeaderLen {
+		nextOff = fileSize - MagicHeaderLen
+	}
+	if nextOff < startOff {
+		nextOff = startOff
+	}
+	return 0, nextOff, false, nil
 }
 
 func isEOFError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-func computeSegmentFingerprint(path string, maxBytes int) (string, int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer func() { _ = f.Close() }()
-	return computeSegmentFingerprintFromFile(f, maxBytes)
 }
 
 func computeSegmentFingerprintFromFile(f *os.File, maxBytes int) (string, int, error) {
@@ -407,6 +446,7 @@ func (r *SegReader) ResetCursor() {
 
 	r.mu.Lock()
 	r.cursor = SegCursor{}
+	r.clearRecoveryStateLocked()
 	r.mu.Unlock()
 }
 
@@ -419,12 +459,13 @@ func (r *SegReader) Stats() SegReaderStats {
 		CurrentOffset:    r.cursor.Offset,
 		FramesRead:       r.framesRead,
 		CorruptedFrames:  r.corruptedFrames,
+		RecoveryStalls:   r.recoveryStalls,
 		BurnResets:       r.burnResets,
 	}
 }
 
 // WriteSegmentFrame appends a single Genesis-compatible CRC32 frame to w.
-// Rejects payloads exceeding MaxFrameBytes before writing any bytes.
+// Rejects empty payloads or payloads exceeding MaxFrameBytes before writing any bytes.
 func WriteSegmentFrame(w io.Writer, raw []byte) error {
 	if len(raw) == 0 {
 		return fmt.Errorf("segment frame payload must not be empty")

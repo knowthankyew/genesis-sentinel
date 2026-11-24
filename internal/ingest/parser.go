@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,9 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 	// Bound non-JSON lines safely before format parsing.
 	if len(raw) > maxLineLen {
 		raw = truncateUTF8Bytes(raw, maxLineLen)
+		if len(raw) == 0 {
+			return model.LogEvent{}, ErrEmptyInput
+		}
 	}
 
 	// 2. Syslog RFC 5424 / 3164
@@ -180,6 +184,11 @@ func parseJSONLine(id uint64, raw []byte, maxLineLen int, defaultService string)
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return model.LogEvent{}, false
+	}
+	// Require EOF after the single JSON object so trailing non-whitespace text or a second object is rejected.
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		return model.LogEvent{}, false
 	}
 
@@ -457,19 +466,21 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	remainder := strings.TrimSpace(s[15:])
 	service := defaultService
 	msg := remainder
-	if idxColon := strings.Index(remainder, ":"); idxColon != -1 {
-		prefix := strings.TrimSpace(remainder[:idxColon])
-		msg = strings.TrimSpace(remainder[idxColon+1:])
-		fields := strings.Fields(prefix)
-		if len(fields) > 0 {
-			tag := fields[len(fields)-1]
-			if idxBracket := strings.IndexByte(tag, '['); idxBracket > 0 {
-				tag = tag[:idxBracket]
-			}
-			if tag != "" {
-				service = tag
-			}
+
+	// RFC 3164 layout after timestamp: HOSTNAME MSG (where MSG begins with TAG[: ]CONTENT).
+	// Split off HOSTNAME first so colons inside IPv6 hostnames (e.g. 2001:db8::1) are never
+	// mistaken for the TAG: separator.
+	if spIdx := strings.IndexByte(remainder, ' '); spIdx != -1 {
+		firstWord := remainder[:spIdx]
+		afterHost := strings.TrimSpace(remainder[spIdx+1:])
+		if !strings.HasSuffix(firstWord, ":") && afterHost != "" {
+			remainder = afterHost
 		}
+	}
+
+	if tag, body, ok := splitRFC3164Tag(remainder); ok {
+		service = tag
+		msg = body
 	}
 
 	return model.LogEvent{
@@ -480,6 +491,53 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 		Message:   msg,
 		SizeBytes: rawLen,
 	}
+}
+
+// splitRFC3164Tag extracts the leading program TAG (up to 32 ASCII alphanumeric/symbol chars,
+// stripping optional [PID]) from an RFC 3164 MSG field when delimited by ':' or space.
+func splitRFC3164Tag(remainder string) (string, string, bool) {
+	if remainder == "" {
+		return "", "", false
+	}
+	// Prefer colon delimiter if it appears before the first space (e.g. "sudo[991]: msg" or "sshd: msg").
+	firstSpace := strings.IndexByte(remainder, ' ')
+	firstColon := strings.IndexByte(remainder, ':')
+	if firstColon > 0 && (firstSpace == -1 || firstColon < firstSpace) {
+		rawTag := remainder[:firstColon]
+		tag := stripPIDBracket(rawTag)
+		if isValidSyslogTag(tag) {
+			return tag, strings.TrimSpace(remainder[firstColon+1:]), true
+		}
+	}
+	// Space-delimited tag without colon (RFC 3164 §4.1.3 allows any non-alphanumeric delimiter including space).
+	if firstSpace > 0 {
+		rawTag := remainder[:firstSpace]
+		tag := stripPIDBracket(rawTag)
+		if isValidSyslogTag(tag) {
+			return tag, strings.TrimSpace(remainder[firstSpace+1:]), true
+		}
+	}
+	return "", "", false
+}
+
+func stripPIDBracket(rawTag string) string {
+	if idx := strings.IndexByte(rawTag, '['); idx > 0 {
+		return rawTag[:idx]
+	}
+	return rawTag
+}
+
+func isValidSyslogTag(tag string) bool {
+	if len(tag) == 0 || len(tag) > 32 {
+		return false
+	}
+	for i := 0; i < len(tag); i++ {
+		c := tag[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/') {
+			return false
+		}
+	}
+	return true
 }
 
 func parsePlainText(id uint64, raw []byte, defaultService string) model.LogEvent {

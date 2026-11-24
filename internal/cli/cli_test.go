@@ -109,6 +109,49 @@ func TestExecuteScanFileContinuesPastOversizedLine(t *testing.T) {
 	}
 }
 
+func TestExecuteScanFileExactMaxFramePayloadBoundaries(t *testing.T) {
+	// Verify exact 1 MiB payload passes with LF, CRLF, and EOF, while 1 MiB + 1 byte is skipped.
+	prefix := `{"timestamp":1763996400,"service":"api","level":"INFO","message":"`
+	suffix := `"}`
+	padLen := 1024*1024 - len(prefix) - len(suffix)
+	exactPayload := prefix + strings.Repeat("a", padLen) + suffix
+	overPayload := prefix + strings.Repeat("b", padLen+1) + suffix
+
+	tmpFile := filepath.Join(t.TempDir(), "bounds.log")
+	content := exactPayload + "\n" + exactPayload + "\r\n" + overPayload + "\n" + exactPayload
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write bounds.log: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"scan", "--file", tmpFile, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("scan bounds.log failed: %v", err)
+	}
+	var rep ScanReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode scan JSON: %v", err)
+	}
+	if rep.LinesRead != 3 || rep.OversizedLines != 1 {
+		t.Fatalf("expected 3 exact-limit payloads read (LF, CRLF, EOF) and 1 oversized skipped, got %+v", rep)
+	}
+}
+
+func TestExecuteStatsEscapesControlBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("raw \x1b[31mred\x1b[0m text"))
+	}))
+	defer srv.Close()
+
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"stats", "--http", srv.URL}, &out, &errBuf); err != nil {
+		t.Fatalf("stats non-JSON failed: %v", err)
+	}
+	if strings.ContainsRune(out.String(), '\x1b') {
+		t.Fatalf("stats output leaked raw terminal ESC byte: %q", out.String())
+	}
+}
+
 func TestExecuteWatchRejectsNonPositivePollInterval(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	if err := ExecuteWithOutput([]string{"watch", "--poll-interval", "0s"}, &out, &errBuf); err == nil {

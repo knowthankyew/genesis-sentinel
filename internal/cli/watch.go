@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,16 +25,43 @@ import (
 )
 
 func runWatch(args []string, stdout, stderr io.Writer) error {
-	// Pre-scan for -config / --config matching Genesis's flag precedence
-	var configPath string
-	for i, arg := range args {
-		if (arg == "-config" || arg == "--config") && i+1 < len(args) {
-			configPath = args[i+1]
-		} else if len(arg) > 8 && arg[:8] == "-config=" {
-			configPath = arg[8:]
-		} else if len(arg) > 9 && arg[:9] == "--config=" {
-			configPath = arg[9:]
-		}
+	// Parse CLI flags once so repeated flags (e.g. --config=/missing --config=)
+	// honor standard flag-parser last-value-wins semantics, then apply only explicitly
+	// supplied flag overrides on top of LoadConfig(configPath).
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		configPath     string
+		genesisDataDir string
+		genesisHTTP    string
+		genesisTCP     string
+		httpAddr       string
+		dataDir        string
+		windowStr      string
+		rulesPath      string
+		pollInterval   time.Duration
+		dryRun         bool
+		stdoutAlerts   bool
+	)
+
+	fs.StringVar(&configPath, "config", "", "Path to sentinel.json config file")
+	fs.StringVar(&genesisDataDir, "genesis-data-dir", "", "Genesis --data-dir path for lossless .seg tailing (primary)")
+	fs.StringVar(&genesisHTTP, "genesis-http", "", "Genesis HTTP base URL for /query fallback")
+	fs.StringVar(&genesisTCP, "genesis-tcp", "", "Genesis TCP ingest address for alert emission")
+	fs.StringVar(&httpAddr, "http", "", "Sentinel HTTP stats/health/burn listen address")
+	fs.StringVar(&dataDir, "data-dir", "", "Sentinel local state directory (cursors, baselines, feedback)")
+	fs.StringVar(&windowStr, "window", "", "Tier 0 template collapse flush window (e.g. 10s)")
+	fs.StringVar(&rulesPath, "rules", "", "Optional path to custom JSON rules.json pack")
+	fs.DurationVar(&pollInterval, "poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
+	fs.BoolVar(&dryRun, "dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
+	fs.BoolVar(&stdoutAlerts, "stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if pollInterval <= 0 {
+		return fmt.Errorf("invalid -poll-interval %v: must be positive", pollInterval)
 	}
 
 	cfg, err := config.LoadConfig(configPath)
@@ -41,35 +69,24 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.StringVar(&configPath, "config", configPath, "Path to sentinel.json config file")
-	genesisDataDir := fs.String("genesis-data-dir", cfg.GenesisDataDir, "Genesis --data-dir path for lossless .seg tailing (primary)")
-	genesisHTTP := fs.String("genesis-http", cfg.GenesisHTTPAddr, "Genesis HTTP base URL for /query fallback")
-	genesisTCP := fs.String("genesis-tcp", cfg.GenesisTCPAddr, "Genesis TCP ingest address for alert emission")
-	httpAddr := fs.String("http", cfg.HTTPAddr, "Sentinel HTTP stats/health/burn listen address")
-	dataDir := fs.String("data-dir", cfg.DataDir, "Sentinel local state directory (cursors, baselines, feedback)")
-	windowStr := fs.String("window", cfg.WindowStr, "Tier 0 template collapse flush window (e.g. 10s)")
-	rulesPath := fs.String("rules", cfg.RulesPath, "Optional path to custom JSON rules.json pack")
-	pollInterval := fs.Duration("poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
-	dryRun := fs.Bool("dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
-	stdoutAlerts := fs.Bool("stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if *pollInterval <= 0 {
-		return fmt.Errorf("invalid -poll-interval %v: must be positive", *pollInterval)
-	}
-
-	cfg.GenesisDataDir = *genesisDataDir
-	cfg.GenesisHTTPAddr = *genesisHTTP
-	cfg.GenesisTCPAddr = *genesisTCP
-	cfg.HTTPAddr = *httpAddr
-	cfg.DataDir = *dataDir
-	cfg.WindowStr = *windowStr
-	cfg.RulesPath = *rulesPath
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "genesis-data-dir":
+			cfg.GenesisDataDir = genesisDataDir
+		case "genesis-http":
+			cfg.GenesisHTTPAddr = genesisHTTP
+		case "genesis-tcp":
+			cfg.GenesisTCPAddr = genesisTCP
+		case "http":
+			cfg.HTTPAddr = httpAddr
+		case "data-dir":
+			cfg.DataDir = dataDir
+		case "window":
+			cfg.WindowStr = windowStr
+		case "rules":
+			cfg.RulesPath = rulesPath
+		}
+	})
 
 	if d, parseErr := time.ParseDuration(cfg.WindowStr); parseErr != nil || d <= 0 {
 		return fmt.Errorf("invalid -window duration %q", cfg.WindowStr)
@@ -96,9 +113,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	defer func() { _ = ln.Close() }()
 
 	var sink emit.Sink
-	if *dryRun {
+	if dryRun {
 		sink = emit.NewWriterSink(stdout)
-	} else if *stdoutAlerts {
+	} else if stdoutAlerts {
 		sink = emit.NewMultiSink(
 			emit.NewGenesisTCPSink(cfg.GenesisTCPAddr, 2*time.Second),
 			emit.NewWriterSink(stdout),
@@ -146,12 +163,12 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	} else {
 		logger.Printf("[Source] Volatile /query   : %s (tip: pass --genesis-data-dir for lossless .seg tailing)", cfg.GenesisHTTPAddr)
 	}
-	if *dryRun {
+	if dryRun {
 		logger.Println("[Sink]   Dry-Run Mode      : Alerts printed to stdout only")
 	} else {
 		logger.Printf("[Sink]   Genesis TCP Alert : %s (service=%s)", cfg.GenesisTCPAddr, cfg.AlertServiceName)
 	}
-	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, *pollInterval)
+	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, pollInterval)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", pipe.HandleHealthz)
@@ -176,11 +193,14 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pollTicker := time.NewTicker(*pollInterval)
+	pollTicker := time.NewTicker(pollInterval)
 	defer pollTicker.Stop()
 
 	flushTicker := time.NewTicker(cfg.WindowDuration)
 	defer flushTicker.Stop()
+
+	// Track unsaved cursor progress so transient SaveCursor errors retry on subsequent idle polls.
+	cursorDirty := false
 
 	for {
 		select {
@@ -190,6 +210,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			if len(emitted) > 0 || len(failed) > 0 {
 				logger.Printf("[Shutdown] Emitted %d final alert(s) (%d sink failure(s)).", len(emitted), len(failed))
 			}
+
 			var finalSaveErr error
 			if segReader != nil {
 				if saveErr := segReader.SaveCursor(); saveErr != nil {
@@ -197,10 +218,17 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 					finalSaveErr = fmt.Errorf("final cursor save failed: %w", saveErr)
 				}
 			}
+
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = httpSrv.Shutdown(shutdownCtx)
+			shutdownErr := httpSrv.Shutdown(shutdownCtx)
 			cancel()
-			return finalSaveErr
+			if shutdownErr != nil {
+				logger.Printf("[Shutdown] HTTP graceful shutdown incomplete (%v); forcing server close.", shutdownErr)
+				if closeErr := httpSrv.Close(); closeErr != nil {
+					shutdownErr = errors.Join(shutdownErr, closeErr)
+				}
+			}
+			return errors.Join(finalSaveErr, shutdownErr)
 
 		case <-pollTicker.C:
 			if segReader != nil {
@@ -213,8 +241,13 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 					pipe.IngestEvent(ev)
 				}
 				if len(batch) > 0 {
+					cursorDirty = true
+				}
+				if cursorDirty {
 					if saveErr := segReader.SaveCursor(); saveErr != nil {
-						logger.Printf("[Cursor] save error (will retry next batch): %v", saveErr)
+						logger.Printf("[Cursor] save error (will retry on next poll): %v", saveErr)
+					} else {
+						cursorDirty = false
 					}
 				}
 			} else if queryPoller != nil {

@@ -172,17 +172,22 @@ func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
 		return nil, nil
 	}
 
-	// Detect observed eviction or drop gaps using Genesis's monotonic LogEntry.ID counter.
+	// Detect observed eviction or drop gaps strictly across rows newer than lastID.
 	if initialized && lastID > 0 {
-		minReturnedID := parsed.Logs[0].ID
-		for _, ev := range parsed.Logs[1:] {
-			if ev.ID < minReturnedID {
-				minReturnedID = ev.ID
+		var minNewID uint64
+		foundNew := false
+		for _, ev := range parsed.Logs {
+			if ev.ID <= lastID {
+				continue
+			}
+			if !foundNew || ev.ID < minNewID {
+				minNewID = ev.ID
+				foundNew = true
 			}
 		}
-		if minReturnedID > lastID+1 {
+		if foundNew && minNewID > lastID+1 {
 			p.evictionGaps++
-			p.estimatedLost += minReturnedID - lastID - 1
+			p.estimatedLost += minNewID - lastID - 1
 		}
 	}
 

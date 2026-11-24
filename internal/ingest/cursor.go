@@ -9,13 +9,15 @@ import (
 )
 
 // SegCursor records Sentinel's lossless read position across Genesis .seg files.
-// SegmentFingerprint stores the SHA-256 hex digest of the first FingerprintLen bytes
-// of SegmentID so replacement files created after `genesis burn` are detected even
-// if they grow past Offset before the next poll.
+// FileIdentity (POSIX device+inode where supported) and SegmentFingerprint
+// (SHA-256 of the initial FingerprintLen bytes) let SegReader detect replacement
+// files created after `genesis burn` even when they grow past Offset or repeat
+// an identical prefix before the next poll.
 type SegCursor struct {
 	SegmentID          uint64    `json:"segment_id"`
 	Offset             int64     `json:"offset"`
 	NextID             uint64    `json:"next_id"`
+	FileIdentity       string    `json:"file_identity,omitempty"`
 	SegmentFingerprint string    `json:"segment_fingerprint,omitempty"`
 	FingerprintLen     int       `json:"fingerprint_len,omitempty"`
 	UpdatedAt          time.Time `json:"updated_at"`
@@ -41,10 +43,12 @@ func LoadCursor(path string) (SegCursor, error) {
 	return c, nil
 }
 
-// SaveCursor writes c to a unique temporary file in path's directory, fsyncs the
-// file, and atomically replaces path via os.Rename (with best-effort parent
-// directory fsync on POSIX filesystems). Atomic replacement prevents readers from
-// observing partial files; full power-loss durability depends on OS/filesystem support.
+// SaveCursor writes c to a unique temporary file in path's directory, calls Sync on
+// the temp file, and replaces path via os.Rename (with best-effort parent directory
+// Sync). On Unix/POSIX filesystems within a single directory, os.Rename replaces the
+// destination atomically so concurrent readers never see partial contents; non-Unix
+// platforms do not guarantee atomic rename, and power-loss durability depends on
+// OS/filesystem fsync semantics.
 func SaveCursor(path string, c SegCursor) error {
 	if path == "" {
 		return nil

@@ -133,3 +133,30 @@ func TestDrainAndAggregatorRespectClusterAndWindowBounds(t *testing.T) {
 		t.Fatalf("expected bounded window count under random flood, got %d", len(windows))
 	}
 }
+
+func TestAggregatorPreservesOverflowMarkerOnRepeatedEmptyMessages(t *testing.T) {
+	agg := NewAggregator(1)
+	agg.Add(model.LogEvent{ID: 1, Timestamp: 100, Service: "api", Level: "INFO", Message: "alpha"})
+	agg.Add(model.LogEvent{ID: 2, Timestamp: 101, Service: "api", Level: "INFO", Message: ""})
+	agg.Add(model.LogEvent{ID: 3, Timestamp: 102, Service: "api", Level: "INFO", Message: ""})
+
+	windows := agg.Flush()
+	if len(windows) != 2 {
+		t.Fatalf("expected 2 windows (1 cluster + 1 overflow), got %d: %+v", len(windows), windows)
+	}
+	foundOverflow := false
+	for _, w := range windows {
+		if strings.HasPrefix(w.TemplateID, "overflow:") {
+			foundOverflow = true
+			if w.Template != "<OVERFLOW>" {
+				t.Fatalf("expected overflow window Template=<OVERFLOW>, got %q", w.Template)
+			}
+			if w.Count != 2 {
+				t.Fatalf("expected overflow window Count=2, got %d", w.Count)
+			}
+		}
+	}
+	if !foundOverflow {
+		t.Fatalf("expected overflow window in %+v", windows)
+	}
+}

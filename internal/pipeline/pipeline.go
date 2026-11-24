@@ -364,10 +364,11 @@ func (p *Pipeline) HandleBurn(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(rep)
 }
 
-// BurnLocalState deletes ONLY known Sentinel-owned local state files inside dataDir
-// (cursor files, baseline snapshots, and feedback/*.jsonl), leaving any unrelated
-// user files untouched. Bytes and file counts are recorded strictly after deletion
-// succeeds, and any read/unlink errors are returned alongside accurate partial counts.
+// BurnLocalState deletes ONLY known Sentinel-owned regular files inside dataDir
+// (cursor files, baseline snapshots, and feedback/*.jsonl), confined via Go 1.24's
+// os.Root so symlinks cannot redirect deletion outside dataDir. Unrelated user
+// files are preserved, bytes are counted strictly after successful deletion, and
+// any errors are returned alongside accurate partial counts.
 func BurnLocalState(dataDir string) (BurnReport, error) {
 	rep := BurnReport{
 		Status:    "burned",
@@ -392,22 +393,33 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 		return rep, fmt.Errorf("data dir %q is not a directory", dataDir)
 	}
 
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		rep.Status = "failed"
+		return rep, fmt.Errorf("open root %q: %w", dataDir, err)
+	}
+	defer func() { _ = root.Close() }()
+
 	var errs []error
-	removeOwnedFile := func(path string) {
-		fi, statErr := os.Stat(path)
+	removeOwnedRel := func(rel string) {
+		fi, statErr := root.Lstat(rel)
 		if statErr != nil {
 			if !os.IsNotExist(statErr) {
-				errs = append(errs, fmt.Errorf("stat %q: %w", path, statErr))
+				errs = append(errs, fmt.Errorf("lstat %q: %w", rel, statErr))
 			}
 			return
 		}
-		if fi.IsDir() {
+		if !fi.Mode().IsRegular() {
+			// Refuse to follow or unlink symlinks/directories in place of regular Sentinel files.
+			if fi.Mode()&os.ModeSymlink != 0 {
+				errs = append(errs, fmt.Errorf("refusing to remove symlink at Sentinel state path %q", rel))
+			}
 			return
 		}
 		sz := fi.Size()
-		if remErr := os.Remove(path); remErr != nil {
+		if remErr := root.Remove(rel); remErr != nil {
 			if !os.IsNotExist(remErr) {
-				errs = append(errs, fmt.Errorf("remove %q: %w", path, remErr))
+				errs = append(errs, fmt.Errorf("remove %q: %w", rel, remErr))
 			}
 			return
 		}
@@ -416,7 +428,13 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 	}
 
 	// 1. Known top-level Sentinel state files and atomic cursor temp files.
-	entries, err := os.ReadDir(dataDir)
+	topDir, err := root.Open(".")
+	if err != nil {
+		rep.Status = "failed"
+		return rep, fmt.Errorf("open root dir %q: %w", dataDir, err)
+	}
+	entries, err := topDir.ReadDir(-1)
+	_ = topDir.Close()
 	if err != nil {
 		rep.Status = "failed"
 		return rep, fmt.Errorf("read data dir %q: %w", dataDir, err)
@@ -427,36 +445,49 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 		}
 		name := entry.Name()
 		if isOwnedTopLevelFile(name) {
-			removeOwnedFile(filepath.Join(dataDir, name))
+			removeOwnedRel(name)
 		}
 	}
 
-	// 2. Known Sentinel feedback JSONL files inside dataDir/feedback/ (remove dir only if empty).
-	feedbackDir := filepath.Join(dataDir, "feedback")
-	if fbInfo, statErr := os.Stat(feedbackDir); statErr == nil && fbInfo.IsDir() {
-		fbEntries, readErr := os.ReadDir(feedbackDir)
-		if readErr != nil {
-			errs = append(errs, fmt.Errorf("read feedback dir %q: %w", feedbackDir, readErr))
-		} else {
-			for _, e := range fbEntries {
-				if e.IsDir() {
-					continue
-				}
-				name := e.Name()
-				if strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.tmp") {
-					removeOwnedFile(filepath.Join(feedbackDir, name))
-				}
-			}
-			// Remove feedback/ only if empty (os.Remove fails safely on non-empty dirs).
-			if remErr := os.Remove(feedbackDir); remErr != nil && !os.IsNotExist(remErr) {
-				// Ignore non-empty directory containing user-owned files.
-				if remaining, _ := os.ReadDir(feedbackDir); len(remaining) == 0 {
-					errs = append(errs, fmt.Errorf("remove empty feedback dir %q: %w", feedbackDir, remErr))
+	// 2. Known Sentinel feedback JSONL files inside root-confined "feedback/" (reject symlinks!).
+	fbInfo, statErr := root.Lstat("feedback")
+	if statErr == nil {
+		if fbInfo.Mode()&os.ModeSymlink != 0 {
+			errs = append(errs, fmt.Errorf("refusing to follow symlink at %q", filepath.Join(dataDir, "feedback")))
+		} else if fbInfo.IsDir() {
+			fbDir, openErr := root.Open("feedback")
+			if openErr != nil {
+				errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+			} else {
+				fbEntries, readErr := fbDir.ReadDir(-1)
+				_ = fbDir.Close()
+				if readErr != nil {
+					errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+				} else {
+					for _, e := range fbEntries {
+						if e.IsDir() {
+							continue
+						}
+						name := e.Name()
+						if strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.tmp") {
+							removeOwnedRel(filepath.Join("feedback", name))
+						}
+					}
+					// Remove feedback/ only if now empty.
+					if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
+						if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
+							remaining, _ := checkDir.ReadDir(1)
+							_ = checkDir.Close()
+							if len(remaining) == 0 {
+								errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
+							}
+						}
+					}
 				}
 			}
 		}
-	} else if statErr != nil && !os.IsNotExist(statErr) {
-		errs = append(errs, fmt.Errorf("stat feedback dir %q: %w", feedbackDir, statErr))
+	} else if !os.IsNotExist(statErr) {
+		errs = append(errs, fmt.Errorf("lstat feedback dir: %w", statErr))
 	}
 
 	if len(errs) > 0 {

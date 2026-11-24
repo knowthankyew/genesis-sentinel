@@ -113,15 +113,23 @@ func TestPipelineEndToEnd100kSyntheticSegmentReplay(t *testing.T) {
 		t.Fatalf("expected huge collapse ratio (>1000x) on 100k logs, got %.2fx (%d templates)", st.CollapseRatio, st.TemplatesEmitted)
 	}
 
-	// Decode every JSONL line written to the sink buffer and validate decoded alert fields!
+	// Snapshot raw serialized output BEFORE scanning so both JSON decode and raw card-regex inspect the full buffer!
+	rawAlerts := append([]byte(nil), alertBuf.Bytes()...)
+	if len(rawAlerts) == 0 {
+		t.Fatal("expected non-empty raw alert output in sink buffer")
+	}
+
 	var decodedAlerts []emit.Alert
-	scanner := bufio.NewScanner(&alertBuf)
+	scanner := bufio.NewScanner(bytes.NewReader(rawAlerts))
 	for scanner.Scan() {
 		var a emit.Alert
 		if err := json.Unmarshal(scanner.Bytes(), &a); err != nil {
 			t.Fatalf("invalid alert JSON line: %v", err)
 		}
 		decodedAlerts = append(decodedAlerts, a)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan rawAlerts: %v", err)
 	}
 	if len(decodedAlerts) != len(alerts) || len(decodedAlerts) == 0 {
 		t.Fatalf("decoded sink alerts (%d) mismatch returned alerts (%d)", len(decodedAlerts), len(alerts))
@@ -144,9 +152,9 @@ func TestPipelineEndToEnd100kSyntheticSegmentReplay(t *testing.T) {
 		}
 	}
 
-	// Raw JSON regression check: no 16-digit float mantissas that collide with Genesis --redact card regex
+	// Raw JSON regression check over full non-empty output: no 16-digit float mantissas that collide with Genesis --redact
 	genesisCardPattern := regexp.MustCompile(`\b(?:\d{4}[ -]?){3}\d{4}\b`)
-	if match := genesisCardPattern.FindString(alertBuf.String()); match != "" {
+	if match := genesisCardPattern.FindString(string(rawAlerts)); match != "" {
 		t.Fatalf("emitted alert JSON contains 16-digit sequence %q that breaks Genesis --redact JSON parsing", match)
 	}
 
@@ -194,5 +202,24 @@ func TestPipelineCountsOnlySuccessfulSinkEmissions(t *testing.T) {
 	st := pipe.Stats()
 	if st.AlertsEmitted != 0 || st.SinkErrors != 1 {
 		t.Fatalf("expected AlertsEmitted=0 SinkErrors=1, got %+v", st)
+	}
+}
+
+func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
+	dataDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "precious.jsonl")
+	if err := os.WriteFile(outsideFile, []byte(`{"keep":true}`), 0600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(dataDir, "feedback")); err != nil {
+		t.Skipf("symlink creation unsupported: %v", err)
+	}
+
+	if _, err := BurnLocalState(dataDir); err == nil {
+		t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
+	}
+	if _, err := os.Stat(outsideFile); err != nil {
+		t.Fatalf("outside file was deleted through feedback symlink: %v", err)
 	}
 }
