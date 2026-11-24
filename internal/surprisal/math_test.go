@@ -167,16 +167,21 @@ func TestOverflowSafeMathOnExtremeFiniteRanges(t *testing.T) {
 	if math.IsNaN(elkHuge) || math.IsInf(elkHuge, 0) || math.Abs(elkHuge-wantELK)/wantELK > 1e-12 {
 		t.Fatalf("LukaszykKarmowskiDiff(5e307, 5e307) = %v, want %v", elkHuge, wantELK)
 	}
+	// LukaszykKarmowskiDiff(0, math.MaxFloat64) = 1.5*MaxFloat64 overflows float64 and must saturate at MaxFloat64.
+	if elkSat := LukaszykKarmowskiDiff(0, math.MaxFloat64); elkSat != math.MaxFloat64 {
+		t.Fatalf("LukaszykKarmowskiDiff(0, MaxFloat64) = %v, want MaxFloat64", elkSat)
+	}
 
-	// Joint pairSurprisal across two saturated continuous dimensions must saturate cleanly at MaxFloat64 (never +Inf).
+	// Joint pairSurprisal across two large finite continuous marginals (~1.2e308 each) must
+	// exercise saturatingAdd and saturate cleanly at MaxFloat64 (never +Inf).
 	var a, b LogFeatures
-	a.Continuous[0], a.Continuous[1] = 1e308, 1e308
+	a.Continuous[0], a.Continuous[1] = 3e307, 3e307
 	var d [ContinuousFeatureCount]float64
 	for i := range d {
 		d[i] = MinDeviationFloor
 	}
 	joint, _ := pairSurprisal(a, b, d)
-	if math.IsNaN(joint) || math.IsInf(joint, 0) || joint <= 0 {
-		t.Fatalf("expected finite saturated joint surprisal, got %v", joint)
+	if joint != math.MaxFloat64 {
+		t.Fatalf("expected pairSurprisal saturatingAdd to clamp at MaxFloat64, got %v", joint)
 	}
 }

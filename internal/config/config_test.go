@@ -45,6 +45,16 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected AllowRemoteEndpoints=true to permit explicit remote address, got %v", err)
 	}
+
+	cfg = DefaultConfig()
+	cfg.BaselineWindowSize = MaxBaselineWindowSize
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected BaselineWindowSize=%d to validate, got %v", MaxBaselineWindowSize, err)
+	}
+	cfg.BaselineWindowSize = MaxBaselineWindowSize + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected BaselineWindowSize=%d to fail validation", MaxBaselineWindowSize+1)
+	}
 }
 
 func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {

@@ -283,7 +283,9 @@ func extractProtoClass(sample string) string {
 	}
 
 	// 2. HTTP status family when an HTTP method/version or status= token is present.
+	hasHTTPVer := false
 	if idx := strings.Index(trimmed, "HTTP/"); idx >= 0 {
+		hasHTTPVer = true
 		rest := trimmed[idx+5:]
 		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
 			after := strings.TrimLeft(rest[sp+1:], " ")
@@ -317,12 +319,12 @@ func extractProtoClass(sample string) string {
 			}
 		}
 	}
-	if hasHTTPMethodPrefix(trimmed) {
-		// Common compact access-log tail: "GET /path 403" or "POST /login 200 12ms"
-		for tok := range strings.FieldsSeq(scanStr) {
-			if len(tok) == 3 && tok[0] >= '1' && tok[0] <= '5' && isAllDigits(tok) {
-				return "http_" + tok[:1] + "xx"
-			}
+	if !hasHTTPVer {
+		// Common compact access-log tail without an HTTP/x.y version token:
+		// "GET /path 403" or "POST /login 200 12ms" — match strictly the token immediately
+		// following the request-target so later byte counts (e.g. "- 512") are never misread.
+		if fam := extractCompactHTTPStatus(trimmed); fam != "" {
+			return fam
 		}
 	}
 
@@ -358,13 +360,42 @@ func stripHTTPRequestTarget(s string) string {
 	return s
 }
 
-func hasHTTPMethodPrefix(s string) bool {
+func extractCompactHTTPStatus(s string) string {
 	for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "} {
-		if strings.HasPrefix(s, m) || strings.Contains(s, `"`+m) {
-			return true
+		idx := -1
+		if strings.HasPrefix(s, m) {
+			idx = 0
+		} else if pos := strings.Index(s, `"`+m); pos >= 0 {
+			idx = pos + 1
+		}
+		if idx < 0 {
+			continue
+		}
+		p := idx + len(m)
+		for p < len(s) && (s[p] == ' ' || s[p] == '\t') {
+			p++
+		}
+		targetStart := p
+		for p < len(s) && s[p] != ' ' && s[p] != '\t' && s[p] != '"' {
+			p++
+		}
+		if p == targetStart {
+			continue
+		}
+		if p < len(s) && s[p] == '"' {
+			p++
+		}
+		if p >= len(s) || (s[p] != ' ' && s[p] != '\t') {
+			continue
+		}
+		for p < len(s) && (s[p] == ' ' || s[p] == '\t') {
+			p++
+		}
+		if fam := parseHTTPStatusFamily(s[p:]); fam != "" {
+			return fam
 		}
 	}
-	return false
+	return ""
 }
 
 func parseHTTPStatusFamily(s string) string {
@@ -420,9 +451,13 @@ func isStatusKeyBoundary(s string, idx int) bool {
 	return !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-')
 }
 
-// clampStr truncates s to at most maxBytes at a valid UTF-8 character boundary so
-// multi-byte runes are never split into invalid UTF-8 sequences.
+// clampStr canonicalizes malformed UTF-8 (matching Go's JSON encoder replacement with U+FFFD)
+// and truncates s to at most maxBytes at a valid UTF-8 rune boundary so in-memory nominal
+// features always match their persisted JSON representation byte-for-byte.
 func clampStr(s string, maxBytes int) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}

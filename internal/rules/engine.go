@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,8 +55,9 @@ type compiledRule struct {
 }
 
 type compiledSuppression struct {
-	supp Suppression
-	re   *regexp.Regexp
+	supp             Suppression
+	serviceLowerHash [sha256.Size]byte
+	re               *regexp.Regexp
 }
 
 // Engine evaluates incoming LogEvents and collapsed Tier 0 TemplateWindows against
@@ -227,6 +229,9 @@ func NewEngine(pack RulePack) (*Engine, error) {
 			return nil, fmt.Errorf("suppression %q must specify at least one selector (service, template, or pattern)", s.ID)
 		}
 		cs := compiledSuppression{supp: s}
+		if s.Service != "" {
+			cs.serviceLowerHash = sha256.Sum256([]byte(strings.ToLower(s.Service)))
+		}
 		if s.Pattern != "" {
 			re, err := regexp.Compile(s.Pattern)
 			if err != nil {
@@ -665,7 +670,11 @@ func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {
 			continue // message-pattern suppressions are checked per sample, not blindly across the whole window
 		}
 		if cs.supp.Service != "" {
-			if w.ServiceTruncated || !strings.EqualFold(cs.supp.Service, w.Service) {
+			if w.ServiceTruncated {
+				if !w.HasIdentityHash || cs.serviceLowerHash != w.ServiceLowerHash {
+					continue
+				}
+			} else if !strings.EqualFold(cs.supp.Service, w.Service) {
 				continue
 			}
 		}

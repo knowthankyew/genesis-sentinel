@@ -736,3 +736,68 @@ func TestPipelinePatternSuppressedEventSkippedByTier1(t *testing.T) {
 		t.Fatalf("expected pattern-suppressed event not to enter baseline (%d -> %d)", baseBefore, got)
 	}
 }
+
+func TestPipelineRound4LongServiceSuppressionAndHigherSeverity(t *testing.T) {
+	// 1. 129-byte service + exact template suppression must skip both Tier 1 alerting and baseline absorption.
+	longSvc := strings.Repeat("s", 128) + "Z"
+	cfg := config.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.SurprisalThreshold = 5.0
+
+	pack := rules.DefaultRulePack()
+	pack.Rules = append(pack.Rules, rules.Rule{
+		ID:          "SENT-LOW-TEST",
+		Category:    "test_low",
+		Severity:    "LOW",
+		Description: "Low severity marker for tier0+tier1 severity merge test",
+		Pattern:     "custom_low_marker",
+		MinCount:    1,
+		Enabled:     true,
+	})
+	pack.Suppressions = append(pack.Suppressions, rules.Suppression{
+		ID:       "SUP-LONG-SVC",
+		Service:  longSvc,
+		Template: "scheduled relay reset during maintenance",
+	})
+	ruleEng, err := rules.NewEngine(pack)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	for w := 0; w < 22; w++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID: uint64(w + 1), Timestamp: 1763996000 + int64(w*10),
+			Service: "nginx", Level: "INFO", Message: "GET /healthz HTTP/1.1 200 3ms",
+		})
+		_, _ = pipe.FlushWindow()
+	}
+	baseBefore := pipe.Stats().SurprisalBaselineCases
+
+	pipe.IngestEvent(model.LogEvent{
+		ID: 9101, Timestamp: 1763997000,
+		Service: longSvc, Level: "ERROR",
+		Message: "scheduled relay reset during maintenance",
+	})
+	alerts, failed := pipe.FlushWindow()
+	if len(alerts) != 0 || len(failed) != 0 {
+		t.Fatalf("expected long-service+template suppression to produce 0 alerts, got alerts=%+v failed=%+v", alerts, failed)
+	}
+	if got := pipe.Stats().SurprisalBaselineCases; got != baseBefore {
+		t.Fatalf("expected long-service+template suppressed window not to enter baseline (%d -> %d)", baseBefore, got)
+	}
+
+	// 2. LOW Tier 0 rule + HIGH Tier 1 anomaly (ERROR level + high surprisal) must keep HIGH severity on tier0+tier1 alert.
+	pipe.IngestEvent(model.LogEvent{
+		ID: 9102, Timestamp: 1763997010,
+		Service: "unseen-edge-svc", Level: "ERROR",
+		Message: "custom_low_marker unexpected relay disconnect during archive sync retry",
+	})
+	mergedAlerts, failed := pipe.FlushWindow()
+	if len(failed) != 0 || len(mergedAlerts) != 1 {
+		t.Fatalf("expected 1 unified tier0+tier1 alert, got alerts=%+v failed=%+v", mergedAlerts, failed)
+	}
+	if mergedAlerts[0].Tier != "tier0+tier1" || mergedAlerts[0].Severity != "HIGH" {
+		t.Fatalf("expected tier0+tier1 alert to preserve higher Tier 1 severity HIGH over LOW Tier 0 rule, got %+v", mergedAlerts[0])
+	}
+}

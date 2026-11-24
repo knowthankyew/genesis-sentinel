@@ -77,6 +77,31 @@ func MapSeverityToGenesisLevel(severity string) string {
 	}
 }
 
+// HigherSeverity returns whichever of a or b has the higher severity rank.
+func HigherSeverity(a, b string) string {
+	rank := func(s string) int {
+		switch strings.ToUpper(strings.TrimSpace(s)) {
+		case "CRITICAL":
+			return 4
+		case "HIGH":
+			return 3
+		case "MEDIUM":
+			return 2
+		case "LOW":
+			return 1
+		default:
+			return 0
+		}
+	}
+	if rank(b) > rank(a) {
+		return strings.ToUpper(strings.TrimSpace(b))
+	}
+	if rank(a) > 0 {
+		return strings.ToUpper(strings.TrimSpace(a))
+	}
+	return "INFO"
+}
+
 // HighestSeverity returns the highest severity label among hits.
 func HighestSeverity(hits []model.RuleHit) string {
 	rank := func(s string) int {

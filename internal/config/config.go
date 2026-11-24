@@ -21,6 +21,7 @@ const (
 	DefaultMaxPromptBytes       = 2048
 	DefaultMaxTrainingRecords   = 50000
 	DefaultMaxTrainingFileBytes = 25 * 1024 * 1024
+	MaxBaselineWindowSize       = 10000
 )
 
 // Config represents all operational configuration options for Genesis Sentinel.
@@ -154,8 +155,8 @@ func (c *Config) Validate() error {
 	if c.SurprisalThreshold <= 0 {
 		return fmt.Errorf("surprisal_threshold_nats must be positive, got %v", c.SurprisalThreshold)
 	}
-	if c.BaselineWindowSize <= 0 {
-		return fmt.Errorf("baseline_window_size must be positive, got %d", c.BaselineWindowSize)
+	if c.BaselineWindowSize <= 0 || c.BaselineWindowSize > MaxBaselineWindowSize {
+		return fmt.Errorf("baseline_window_size must be between 1 and %d, got %d", MaxBaselineWindowSize, c.BaselineWindowSize)
 	}
 	if c.MaxPromptByte <= 0 {
 		return fmt.Errorf("max_prompt_bytes must be positive, got %d", c.MaxPromptByte)

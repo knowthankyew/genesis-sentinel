@@ -24,6 +24,9 @@ const (
 	DefaultMaxCandidateCases = 120
 	// DefaultBaselineWindowSize is the default rolling baseline ring buffer capacity.
 	DefaultBaselineWindowSize = 2000
+	// MaxBaselineWindowSize caps rolling baseline capacity so valid snapshots fit safely
+	// within MaxBaselineSnapshotBytes (16 MiB) on disk.
+	MaxBaselineWindowSize = 10000
 	// DefaultThresholdNats is the default Tier 1 surprisal threshold in nats.
 	DefaultThresholdNats = 5.0
 	// MaxBaselineSnapshotBytes bounds disk reads when loading baseline.json.
@@ -112,8 +115,11 @@ func LukaszykKarmowskiDiff(d, delta float64) float64 {
 		return d
 	}
 	corr := 0.5 * math.Exp(-u) * (3.0 + u) * delta
-	if math.IsNaN(corr) || math.IsInf(corr, 0) {
+	if math.IsNaN(corr) {
 		return d
+	}
+	if math.IsInf(corr, 1) {
+		return math.MaxFloat64
 	}
 	return saturatingAdd(d, corr)
 }

@@ -160,6 +160,35 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 	if !utf8.ValidString(utf8Feat.Nominal[0]) || len(utf8Feat.Nominal[0]) != 127 {
 		t.Fatalf("expected valid 127-byte UTF-8 clamped service, got len=%d valid=%v", len(utf8Feat.Nominal[0]), utf8.ValidString(utf8Feat.Nominal[0]))
 	}
+
+	// Missing HTTP response status followed by a 3-digit byte count must NOT be misread as http_5xx.
+	missingStatus := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-missing-http",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: `10.0.0.1 - - [24/Nov/2026:12:00:00 +0000] "GET /orders HTTP/1.1" - 512`,
+	})
+	if missingStatus.Nominal[3] != "none" {
+		t.Fatalf("expected missing HTTP status with 512 body bytes -> none, got %q", missingStatus.Nominal[3])
+	}
+	normalAccess := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-normal-http",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: `10.0.0.1 - - [24/Nov/2026:12:00:00 +0000] "GET /orders HTTP/1.1" 200 512`,
+	})
+	if normalAccess.Nominal[3] != "http_2xx" {
+		t.Fatalf("expected standard access log 200 512 -> http_2xx, got %q", normalAccess.Nominal[3])
+	}
+	compactMissing := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-compact-missing",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: "GET /orders - 512",
+	})
+	if compactMissing.Nominal[3] != "none" {
+		t.Fatalf("expected compact HTTP log with dash status and 512 bytes -> none, got %q", compactMissing.Nominal[3])
+	}
 }
 
 func TestEngineWarmupSeparationAndPoisoningDefense(t *testing.T) {
@@ -805,4 +834,88 @@ func TestEngineConcurrentEvaluateSaveResetRaceFree(t *testing.T) {
 		eng.Reset()
 	}()
 	wg.Wait()
+}
+
+func TestRound4MalformedUTF8HybridDisagreementAndPeerSelection(t *testing.T) {
+	// 1. Malformed UTF-8 bytes in nominal fields must canonicalize identically in memory and across JSON persistence.
+	badWin := model.TemplateWindow{
+		TemplateID: "t-\xff-bad",
+		Service:    "svc-\xff",
+		Level:      "INFO",
+		Count:      5,
+		SampleLine: "ok",
+	}
+	engUTF8 := NewEngine(Options{Mode: "inprocess", ThresholdNats: 5.0, BaselineWindowSize: 20, WarmupMinCases: 3})
+	for i := 0; i < 4; i++ {
+		engUTF8.LearnBaseline(badWin)
+	}
+	beforeUTF8 := engUTF8.Evaluate(context.Background(), badWin, true)
+	path := filepath.Join(t.TempDir(), "utf8.json")
+	if err := engUTF8.SaveToFile(path, true); err != nil {
+		t.Fatalf("SaveToFile: %v", err)
+	}
+	engUTF8Loaded := NewEngine(Options{Mode: "inprocess", ThresholdNats: 5.0, BaselineWindowSize: 20, WarmupMinCases: 3})
+	if _, err := engUTF8Loaded.LoadFromFile(path); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	afterUTF8 := engUTF8Loaded.Evaluate(context.Background(), badWin, true)
+	if beforeUTF8.TotalNats != 0 || afterUTF8.TotalNats != 0 {
+		t.Fatalf("malformed UTF-8 nominal drifted across save/restore: before=%v after=%v", beforeUTF8.TotalNats, afterUTF8.TotalNats)
+	}
+
+	// 2. Hybrid mode tracks HTTPDisagreements when sidecar disagrees with local anomaly verdict and resets cleanly.
+	permissiveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.1}`))
+	}))
+	defer permissiveSrv.Close()
+	client, err := NewHTTPClient(permissiveSrv.URL, time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	engHybrid := NewEngine(Options{
+		Mode:               "hybrid",
+		ThresholdNats:      5.0,
+		BaselineWindowSize: 50,
+		WarmupMinCases:     4,
+		HTTPClient:         client,
+	})
+	for i := 0; i < 5; i++ {
+		engHybrid.LearnBaseline(model.TemplateWindow{
+			TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200",
+		})
+	}
+	hybSc := engHybrid.Evaluate(context.Background(), model.TemplateWindow{
+		TemplateID: "t-anom", Service: "unknown-worker", Level: "ERROR", Count: 200, SampleLine: "POST /dump 503 !!!@@@###",
+	}, false)
+	st := engHybrid.Stats()
+	if !hybSc.Anomalous || st.HTTPChecks != 1 || st.HTTPDisagreements != 1 {
+		t.Fatalf("expected hybrid local anomaly + HTTPDisagreements=1, score=%+v stats=%+v", hybSc, st)
+	}
+	engHybrid.Reset()
+	if stReset := engHybrid.Stats(); stReset.HTTPDisagreements != 0 {
+		t.Fatalf("expected Reset() to zero HTTPDisagreements, got %+v", stReset)
+	}
+
+	// 3. When KNeighbors > MaxCandidateCases, effective k is clamped to MaxCandidateCases before peer check
+	// so 2 exact same-service peers at positions 1 and 3 are selected instead of falling back to global stride [0, 2].
+	engPeer := NewEngine(Options{
+		Mode:               "inprocess",
+		ThresholdNats:      5.0,
+		BaselineWindowSize: 4,
+		WarmupMinCases:     4,
+		KNeighbors:         3,
+		MaxCandidateCases:  2,
+	})
+	otherWin := model.TemplateWindow{TemplateID: "t-other", Service: "other", Level: "ERROR", Count: 500, SampleLine: "POST /x 503 !!!@@@###"}
+	peerWin := model.TemplateWindow{TemplateID: "t-peer", Service: "target", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}
+	// Ring positions: 0=other, 1=target, 2=other, 3=target. Global stride with cap=2 would pick [0, 2] (both other!).
+	engPeer.LearnBaseline(otherWin)
+	engPeer.LearnBaseline(peerWin)
+	engPeer.LearnBaseline(otherWin)
+	engPeer.LearnBaseline(peerWin)
+	peerSc := engPeer.Evaluate(context.Background(), peerWin, true)
+	if peerSc.TotalNats != 0 {
+		t.Fatalf("expected peer selection with effective k=min(KNeighbors,MaxCandidateCases)=2 to score 0.0 against exact peers, got %+v", peerSc)
+	}
 }

@@ -28,17 +28,18 @@ type Options struct {
 
 // Stats reports diagnostic counters for Tier 1 surprisal scoring.
 type Stats struct {
-	Mode             string  `json:"mode"`
-	ThresholdNats    float64 `json:"threshold_nats"`
-	ScoredTotal      uint64  `json:"scored_total"`
-	AnomaliesTotal   uint64  `json:"anomalies_total"`
-	BaselineCases    int     `json:"baseline_cases"`
-	BaselineCapacity int     `json:"baseline_capacity"`
-	WarmupMinCases   int     `json:"warmup_min_cases"`
-	WarmupComplete   bool    `json:"warmup_complete"`
-	MaxNatsObserved  float64 `json:"max_nats_observed"`
-	HTTPChecks       uint64  `json:"http_checks"`
-	HTTPFallbacks    uint64  `json:"http_fallbacks"`
+	Mode              string  `json:"mode"`
+	ThresholdNats     float64 `json:"threshold_nats"`
+	ScoredTotal       uint64  `json:"scored_total"`
+	AnomaliesTotal    uint64  `json:"anomalies_total"`
+	BaselineCases     int     `json:"baseline_cases"`
+	BaselineCapacity  int     `json:"baseline_capacity"`
+	WarmupMinCases    int     `json:"warmup_min_cases"`
+	WarmupComplete    bool    `json:"warmup_complete"`
+	MaxNatsObserved   float64 `json:"max_nats_observed"`
+	HTTPChecks        uint64  `json:"http_checks"`
+	HTTPFallbacks     uint64  `json:"http_fallbacks"`
+	HTTPDisagreements uint64  `json:"http_disagreements"`
 }
 
 // Engine scores collapsed Tier 0 TemplateWindows using a bounded rolling Laplace-LK
@@ -66,11 +67,12 @@ type Engine struct {
 	devsDirty bool
 	dirtyDisk bool
 
-	scoredTotal     uint64
-	anomaliesTotal  uint64
-	maxNatsObserved float64
-	httpChecks      uint64
-	httpFallbacks   uint64
+	scoredTotal       uint64
+	anomaliesTotal    uint64
+	maxNatsObserved   float64
+	httpChecks        uint64
+	httpFallbacks     uint64
+	httpDisagreements uint64
 }
 
 // NewEngine builds a Tier 1 Laplace-LK Surprisal Engine with safe operational defaults.
@@ -89,6 +91,8 @@ func NewEngine(opts Options) *Engine {
 	maxSize := opts.BaselineWindowSize
 	if maxSize <= 0 {
 		maxSize = DefaultBaselineWindowSize
+	} else if maxSize > MaxBaselineWindowSize {
+		maxSize = MaxBaselineWindowSize
 	}
 	warmup := opts.WarmupMinCases
 	if warmup <= 0 {
@@ -234,6 +238,7 @@ func (e *Engine) Reset() {
 	e.maxNatsObserved = 0
 	e.httpChecks = 0
 	e.httpFallbacks = 0
+	e.httpDisagreements = 0
 }
 
 // LearnBaseline inserts a known-benign window directly into the rolling baseline
@@ -369,6 +374,9 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		anomalous = localAnomalous
 	} else if err == nil && mode == "http" {
 		sidecarAnomalous := !vResp.IsConforming || vResp.MeasuredSurprisalNats >= threshold
+		if sidecarAnomalous != localAnomalous {
+			e.httpDisagreements++
+		}
 		if sidecarAnomalous || !localAnomalous {
 			// Adopt sidecar measurement and clear local contributions so attributions never
 			// describe a different calculation than the score that produced the verdict.
@@ -380,6 +388,13 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 			// that a general-purpose sidecar missed, fail closed on local detection and keep
 			// local attributions so anomalies never poison the rolling baseline.
 			anomalous = true
+		}
+	} else if err == nil && mode == "hybrid" {
+		// Keep local verdict authoritative in hybrid mode while recording whether
+		// the sidecar cross-check agreed with the local anomaly verdict.
+		sidecarAnomalous := !vResp.IsConforming || vResp.MeasuredSurprisalNats >= threshold
+		if sidecarAnomalous != localAnomalous {
+			e.httpDisagreements++
 		}
 	}
 
@@ -411,17 +426,18 @@ func (e *Engine) Stats() Stats {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return Stats{
-		Mode:             e.mode,
-		ThresholdNats:    e.thresholdNats,
-		ScoredTotal:      e.scoredTotal,
-		AnomaliesTotal:   e.anomaliesTotal,
-		BaselineCases:    e.count,
-		BaselineCapacity: e.maxSize,
-		WarmupMinCases:   e.warmupMinCases,
-		WarmupComplete:   e.count >= e.warmupMinCases,
-		MaxNatsObserved:  round4(e.maxNatsObserved),
-		HTTPChecks:       e.httpChecks,
-		HTTPFallbacks:    e.httpFallbacks,
+		Mode:              e.mode,
+		ThresholdNats:     e.thresholdNats,
+		ScoredTotal:       e.scoredTotal,
+		AnomaliesTotal:    e.anomaliesTotal,
+		BaselineCases:     e.count,
+		BaselineCapacity:  e.maxSize,
+		WarmupMinCases:    e.warmupMinCases,
+		WarmupComplete:    e.count >= e.warmupMinCases,
+		MaxNatsObserved:   round4(e.maxNatsObserved),
+		HTTPChecks:        e.httpChecks,
+		HTTPFallbacks:     e.httpFallbacks,
+		HTTPDisagreements: e.httpDisagreements,
 	}
 }
 
@@ -541,6 +557,9 @@ func (e *Engine) scoreAgainstBaselineLocked(cand LogFeatures) (float64, map[stri
 	k := e.kNeighbors
 	if k > n {
 		k = n
+	}
+	if k > e.maxCandidates {
+		k = e.maxCandidates
 	}
 
 	// Collect chronological positions of same-service peers so rare benign services

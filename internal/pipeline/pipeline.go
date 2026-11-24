@@ -34,38 +34,39 @@ const (
 
 // Stats exposes live Sentinel Tier 0 + Tier 1 pipeline telemetry over HTTP /stats and CLI output.
 type Stats struct {
-	LinesRead                uint64  `json:"lines_read"`
-	LinesIgnoredSelf         uint64  `json:"lines_ignored_self"`
-	TemplatesEmitted         uint64  `json:"templates_emitted"`
-	CollapseRatio            float64 `json:"collapse_ratio"`
-	ClustersActive           int     `json:"clusters_active"`
-	RuleHitsTotal            uint64  `json:"rule_hits_total"`
-	AlertsEmitted            uint64  `json:"alerts_emitted"`
-	InjectionSignals         uint64  `json:"injection_signals"`
-	RuleBucketsDropped       uint64  `json:"rule_buckets_dropped"`
-	OverflowThresholdSkipped uint64  `json:"overflow_threshold_skipped"`
-	SinkErrors               uint64  `json:"sink_errors"`
-	SurprisalMode            string  `json:"surprisal_mode"`
-	SurprisalThresholdNats   float64 `json:"surprisal_threshold_nats"`
-	SurprisalScored          uint64  `json:"surprisal_scored"`
-	SurprisalAnomalies       uint64  `json:"surprisal_anomalies"`
-	SurprisalBaselineCases   int     `json:"surprisal_baseline_cases"`
-	SurprisalBaselineCap     int     `json:"surprisal_baseline_capacity"`
-	SurprisalWarmupComplete  bool    `json:"surprisal_warmup_complete"`
-	SurprisalMaxNats         float64 `json:"surprisal_max_nats"`
-	SurprisalHTTPChecks      uint64  `json:"surprisal_http_checks"`
-	SurprisalHTTPFallbacks   uint64  `json:"surprisal_http_fallbacks"`
-	CorruptedFrames          uint64  `json:"corrupted_frames"`
-	RecoveryStalls           uint64  `json:"recovery_stalls"`
-	BurnResets               uint64  `json:"burn_resets"`
-	EvictionGaps             uint64  `json:"eviction_gaps"`
-	EstimatedLost            uint64  `json:"estimated_lost"`
-	SaturatedPages           uint64  `json:"saturated_pages"`
-	ActiveSource             string  `json:"active_source"`
-	DataDir                  string  `json:"data_dir"`
-	GenesisDataDir           string  `json:"genesis_data_dir,omitempty"`
-	HeapBytes                uint64  `json:"heap_bytes"`
-	UptimeSeconds            int64   `json:"uptime_seconds"`
+	LinesRead                  uint64  `json:"lines_read"`
+	LinesIgnoredSelf           uint64  `json:"lines_ignored_self"`
+	TemplatesEmitted           uint64  `json:"templates_emitted"`
+	CollapseRatio              float64 `json:"collapse_ratio"`
+	ClustersActive             int     `json:"clusters_active"`
+	RuleHitsTotal              uint64  `json:"rule_hits_total"`
+	AlertsEmitted              uint64  `json:"alerts_emitted"`
+	InjectionSignals           uint64  `json:"injection_signals"`
+	RuleBucketsDropped         uint64  `json:"rule_buckets_dropped"`
+	OverflowThresholdSkipped   uint64  `json:"overflow_threshold_skipped"`
+	SinkErrors                 uint64  `json:"sink_errors"`
+	SurprisalMode              string  `json:"surprisal_mode"`
+	SurprisalThresholdNats     float64 `json:"surprisal_threshold_nats"`
+	SurprisalScored            uint64  `json:"surprisal_scored"`
+	SurprisalAnomalies         uint64  `json:"surprisal_anomalies"`
+	SurprisalBaselineCases     int     `json:"surprisal_baseline_cases"`
+	SurprisalBaselineCap       int     `json:"surprisal_baseline_capacity"`
+	SurprisalWarmupComplete    bool    `json:"surprisal_warmup_complete"`
+	SurprisalMaxNats           float64 `json:"surprisal_max_nats"`
+	SurprisalHTTPChecks        uint64  `json:"surprisal_http_checks"`
+	SurprisalHTTPFallbacks     uint64  `json:"surprisal_http_fallbacks"`
+	SurprisalHTTPDisagreements uint64  `json:"surprisal_http_disagreements"`
+	CorruptedFrames            uint64  `json:"corrupted_frames"`
+	RecoveryStalls             uint64  `json:"recovery_stalls"`
+	BurnResets                 uint64  `json:"burn_resets"`
+	EvictionGaps               uint64  `json:"eviction_gaps"`
+	EstimatedLost              uint64  `json:"estimated_lost"`
+	SaturatedPages             uint64  `json:"saturated_pages"`
+	ActiveSource               string  `json:"active_source"`
+	DataDir                    string  `json:"data_dir"`
+	GenesisDataDir             string  `json:"genesis_data_dir,omitempty"`
+	HeapBytes                  uint64  `json:"heap_bytes"`
+	UptimeSeconds              int64   `json:"uptime_seconds"`
 }
 
 // FailedAlert pairs an alert with the sink delivery error that prevented emission.
@@ -564,6 +565,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			topFeats = surprisal.TopFeatures(sc.FeatureContribs, 4)
 			if sc.Anomalous {
 				tierLabel = "tier0+tier1"
+				// Preserve the higher severity across both tiers so a LOW Tier 0 rule
+				// never downgrades a HIGH Tier 1 anomaly on the same window.
+				severity = emit.HigherSeverity(severity, mapSurprisalSeverity(sc.TotalNats, sc.ThresholdNats, cleanLevel))
 			}
 		}
 
@@ -767,6 +771,7 @@ func (p *Pipeline) Stats() Stats {
 		st.SurprisalMaxNats = ss.MaxNatsObserved
 		st.SurprisalHTTPChecks = ss.HTTPChecks
 		st.SurprisalHTTPFallbacks = ss.HTTPFallbacks
+		st.SurprisalHTTPDisagreements = ss.HTTPDisagreements
 	}
 	if segReader != nil {
 		rs := segReader.Stats()
