@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
@@ -20,6 +21,9 @@ const (
 var (
 	// ErrEmptyInput is returned for blank log lines.
 	ErrEmptyInput = errors.New("empty log line")
+	// ErrOversizedLine is returned when an untrusted structured line exceeds safe bounds
+	// and cannot be decoded without risking metadata/service corruption.
+	ErrOversizedLine = errors.New("oversized log line")
 )
 
 var syslogSeverityMap = []string{
@@ -35,7 +39,8 @@ var syslogSeverityMap = []string{
 
 // ParseRawLog decodes a raw Genesis log line (JSON Lines, Syslog RFC 5424/3164,
 // Pipe format, or plain text) into a structured model.LogEvent, matching
-// Genesis's internal/parser/multiformat.go semantics.
+// Genesis's internal/parser/multiformat.go semantics while preserving structured
+// JSON metadata (such as service=sentinel) even on oversized messages.
 func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (model.LogEvent, error) {
 	if maxLineLen <= 0 {
 		maxLineLen = DefaultMaxLineLength
@@ -44,23 +49,39 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 	if len(raw) == 0 {
 		return model.LogEvent{}, ErrEmptyInput
 	}
-	if len(raw) > maxLineLen {
-		raw = raw[:maxLineLen]
+	if len(raw) > MaxFrameBytes {
+		return model.LogEvent{}, fmt.Errorf("%w: %d bytes exceeds hard frame bound %d", ErrOversizedLine, len(raw), MaxFrameBytes)
 	}
 	if defaultService == "" {
 		defaultService = "genesis"
 	}
 
-	// 1. JSON Lines
-	if raw[0] == '{' && raw[len(raw)-1] == '}' {
-		return parseJSONLine(id, raw, defaultService)
+	// 1. JSON Lines: inspect a JSON-whitespace-trimmed view BEFORE applying maxLineLen
+	// truncation so trailing spaces or large messages never drop the closing '}' and
+	// relabel a structured record (e.g. service=sentinel) as plain text.
+	trimmedJSON := bytes.TrimSpace(raw)
+	if len(trimmedJSON) > 0 && trimmedJSON[0] == '{' {
+		if trimmedJSON[len(trimmedJSON)-1] == '}' {
+			ev, ok := parseJSONLine(id, trimmedJSON, maxLineLen, defaultService)
+			if ok {
+				return ev, nil
+			}
+		}
+		if len(raw) > maxLineLen {
+			return model.LogEvent{}, fmt.Errorf("%w: malformed oversized JSON record (%d bytes)", ErrOversizedLine, len(raw))
+		}
+	}
+
+	// Bound non-JSON lines safely before format parsing.
+	if len(raw) > maxLineLen {
+		raw = truncateUTF8Bytes(raw, maxLineLen)
 	}
 
 	// 2. Syslog RFC 5424 / 3164
 	if raw[0] == '<' {
 		idxClose := bytes.IndexByte(raw, '>')
 		if idxClose > 1 && idxClose <= 5 {
-			return parseSyslog(id, raw, idxClose, defaultService)
+			return parseSyslog(id, raw, idxClose, defaultService), nil
 		}
 	}
 
@@ -72,8 +93,30 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// 4. Plain text fallback
+	// 4. Plain text fallback (preserves original untrimmed whitespace)
 	return parsePlainText(id, raw, defaultService), nil
+}
+
+func truncateUTF8Bytes(b []byte, maxBytes int) []byte {
+	if len(b) <= maxBytes {
+		return b
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return b[:cut]
+}
+
+func truncateUTF8String(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func isAllDigits(b []byte) bool {
@@ -132,12 +175,12 @@ func parsePipeLine(id uint64, raw []byte) (model.LogEvent, error) {
 	}, nil
 }
 
-func parseJSONLine(id uint64, raw []byte, defaultService string) (model.LogEvent, error) {
+func parseJSONLine(id uint64, raw []byte, maxLineLen int, defaultService string) (model.LogEvent, bool) {
 	var obj map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	if err := dec.Decode(&obj); err != nil {
-		return parsePlainText(id, raw, defaultService), nil
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return model.LogEvent{}, false
 	}
 
 	var ts int64
@@ -188,7 +231,7 @@ func parseJSONLine(id uint64, raw []byte, defaultService string) (model.LogEvent
 	var message string
 	for _, k := range []string{"msg", "message"} {
 		if val, ok := obj[k]; ok {
-			message = stringifyJSONValue(val)
+			message = truncateUTF8String(stringifyJSONValue(val), maxLineLen)
 			delete(obj, k)
 			break
 		}
@@ -198,7 +241,7 @@ func parseJSONLine(id uint64, raw []byte, defaultService string) (model.LogEvent
 	if len(obj) > 0 {
 		attrs = make(map[string]string, len(obj))
 		for k, v := range obj {
-			attrs[k] = stringifyJSONValue(v)
+			attrs[k] = truncateUTF8String(stringifyJSONValue(v), maxLineLen)
 		}
 	}
 
@@ -211,7 +254,7 @@ func parseJSONLine(id uint64, raw []byte, defaultService string) (model.LogEvent
 		Message:    message,
 		Attributes: attrs,
 		SizeBytes:  len(raw),
-	}, nil
+	}, true
 }
 
 func stringifyJSONValue(v any) string {
@@ -295,18 +338,18 @@ func normalizeLevel(s string) string {
 	}
 }
 
-func parseSyslog(id uint64, raw []byte, idxClose int, defaultService string) (model.LogEvent, error) {
+func parseSyslog(id uint64, raw []byte, idxClose int, defaultService string) model.LogEvent {
 	pri, err := strconv.Atoi(string(raw[1:idxClose]))
 	if err != nil || pri < 0 {
-		return parsePlainText(id, raw, defaultService), nil
+		return parsePlainText(id, raw, defaultService)
 	}
 	level := syslogSeverityMap[pri&7]
 	rest := bytes.TrimSpace(raw[idxClose+1:])
 
 	if bytes.HasPrefix(rest, []byte("1 ")) {
-		return parseSyslogRFC5424(id, rest[2:], level, defaultService, len(raw)), nil
+		return parseSyslogRFC5424(id, rest[2:], level, defaultService, len(raw))
 	}
-	return parseSyslogRFC3164(id, rest, level, defaultService, len(raw)), nil
+	return parseSyslogRFC3164(id, rest, level, defaultService, len(raw))
 }
 
 func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
@@ -335,13 +378,7 @@ func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, ra
 	if traceID == "-" {
 		traceID = ""
 	}
-	if strings.HasPrefix(msg, "[") {
-		if idxClose := strings.Index(msg, "]"); idxClose != -1 && idxClose+1 < len(msg) {
-			msg = strings.TrimSpace(msg[idxClose+1:])
-		}
-	} else if strings.HasPrefix(msg, "- ") {
-		msg = strings.TrimSpace(msg[2:])
-	}
+	msg = stripRFC5424StructuredData(msg)
 
 	return model.LogEvent{
 		ID:        id,
@@ -352,6 +389,55 @@ func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, ra
 		Message:   msg,
 		SizeBytes: rawLen,
 	}
+}
+
+// stripRFC5424StructuredData consumes either NILVALUE ("-") or all adjacent
+// [sd-id param="val"] structured-data elements, honoring RFC 5424 backslash
+// escapes inside quoted parameter values (`\"`, `\\`, `\]`).
+func stripRFC5424StructuredData(s string) string {
+	if s == "-" {
+		return ""
+	}
+	if strings.HasPrefix(s, "- ") {
+		return strings.TrimSpace(s[2:])
+	}
+	if !strings.HasPrefix(s, "[") {
+		return s
+	}
+
+	i := 0
+	for i < len(s) && s[i] == '[' {
+		i++ // skip '['
+		inQuotes := false
+		escaped := false
+		closed := false
+		for i < len(s) {
+			c := s[i]
+			i++
+			if escaped {
+				escaped = false
+				continue
+			}
+			if inQuotes {
+				if c == '\\' {
+					escaped = true
+				} else if c == '"' {
+					inQuotes = false
+				}
+				continue
+			}
+			if c == '"' {
+				inQuotes = true
+			} else if c == ']' {
+				closed = true
+				break
+			}
+		}
+		if !closed {
+			return s
+		}
+	}
+	return strings.TrimSpace(s[i:])
 }
 
 func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
@@ -377,7 +463,6 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 		fields := strings.Fields(prefix)
 		if len(fields) > 0 {
 			tag := fields[len(fields)-1]
-			// Strip optional PID suffix like sshd[1234]
 			if idxBracket := strings.IndexByte(tag, '['); idxBracket > 0 {
 				tag = tag[:idxBracket]
 			}

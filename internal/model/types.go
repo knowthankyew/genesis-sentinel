@@ -108,16 +108,17 @@ type RuleHit struct {
 // TemplateWindow represents a collapsed batch of structurally identical log lines
 // produced by Tier 0 template mining over a bounded time window.
 type TemplateWindow struct {
-	TemplateID    string    `json:"template_id"`
-	Template      string    `json:"template"`
-	Service       string    `json:"service"`
-	Level         string    `json:"level"`
-	Count         uint64    `json:"count"`
-	FirstSeenUnix int64     `json:"first_seen_unix"`
-	LastSeenUnix  int64     `json:"last_seen_unix"`
-	SampleLine    string    `json:"sample_line"`
-	SampleEntropy float64   `json:"sample_entropy"`
-	RuleHits      []RuleHit `json:"rule_hits,omitempty"`
+	TemplateID        string    `json:"template_id"`
+	Template          string    `json:"template"`
+	Service           string    `json:"service"`
+	Level             string    `json:"level"`
+	Count             uint64    `json:"count"`
+	FirstSeenUnix     int64     `json:"first_seen_unix"`
+	LastSeenUnix      int64     `json:"last_seen_unix"`
+	SampleLine        string    `json:"sample_line"`
+	SampleEntropy     float64   `json:"sample_entropy"`
+	AdditionalSamples []string  `json:"additional_samples,omitempty"`
+	RuleHits          []RuleHit `json:"rule_hits,omitempty"`
 }
 
 // SurprisalScore captures Tier 1 Laplace-LK information-theoretic novelty output

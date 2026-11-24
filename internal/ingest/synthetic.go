@@ -7,6 +7,10 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
 
+// MinSyntheticAllClasses is the minimum totalLines required for GenerateSyntheticCorpus
+// to emit all six starter threat classes (the final class, prompt injection, is placed at index 105).
+const MinSyntheticAllClasses = 106
+
 // SyntheticSummary summarizes the ground-truth composition of a Track A synthetic corpus.
 type SyntheticSummary struct {
 	TotalLines          int
@@ -21,7 +25,8 @@ type SyntheticSummary struct {
 
 // GenerateSyntheticCorpus produces a deterministic Track A log stream interleaving
 // realistic benign web/cron/system noise with known security attack bursts.
-// Uses a local xorshift64 PRNG so runs are 100% reproducible given the same seed.
+// Uses a local xorshift64 PRNG so runs are reproducible given the same seed.
+// Pass totalLines >= MinSyntheticAllClasses (106) to include all six threat classes.
 func GenerateSyntheticCorpus(totalLines int, seed uint64, emitFn func(raw []byte) error) (SyntheticSummary, error) {
 	if totalLines <= 0 {
 		return SyntheticSummary{}, nil
@@ -64,7 +69,7 @@ func GenerateSyntheticCorpus(totalLines int, seed uint64, emitFn func(raw []byte
 		},
 	}
 
-	// Inject compact, realistic attack bursts at deterministic offsets so even small runs include every threat class.
+	// Inject compact attack bursts at fixed offsets (requires >= MinSyntheticAllClasses for all 6 classes).
 	for i := 0; i < totalLines; i++ {
 		r := nextU64()
 		ts := baseTS + int64(i/200)
@@ -111,6 +116,9 @@ func GenerateSyntheticCorpus(totalLines int, seed uint64, emitFn func(raw []byte
 
 // ParseLogEventsFromRaw is a convenience helper converting raw synthetic lines directly to LogEvents.
 func ParseLogEventsFromRaw(totalLines int, seed uint64) ([]model.LogEvent, SyntheticSummary, error) {
+	if totalLines <= 0 {
+		return nil, SyntheticSummary{}, nil
+	}
 	events := make([]model.LogEvent, 0, totalLines)
 	var id uint64
 	sum, err := GenerateSyntheticCorpus(totalLines, seed, func(raw []byte) error {

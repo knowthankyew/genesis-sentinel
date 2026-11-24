@@ -86,6 +86,36 @@ func TestExecuteScanSyntheticJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteScanFileContinuesPastOversizedLine(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "mixed.log")
+	oversized := strings.Repeat("X", 1024*1024+128) + "\n"
+	content := `{"timestamp":1763996400,"service":"api","level":"INFO","message":"before oversized"}` + "\n" +
+		oversized +
+		`{"timestamp":1763996401,"service":"nginx","level":"WARN","message":"GET /../../etc/passwd HTTP/1.1 403"}` + "\n"
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write mixed.log: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"scan", "--file", tmpFile, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("scan --file failed: %v", err)
+	}
+	var rep ScanReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode scan JSON: %v", err)
+	}
+	if rep.OversizedLines != 1 || rep.LinesRead != 2 || rep.AlertsEmitted != 1 {
+		t.Fatalf("expected OversizedLines=1 LinesRead=2 AlertsEmitted=1, got %+v", rep)
+	}
+}
+
+func TestExecuteWatchRejectsNonPositivePollInterval(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"watch", "--poll-interval", "0s"}, &out, &errBuf); err == nil {
+		t.Fatal("expected watch --poll-interval=0s to return error")
+	}
+}
+
 func TestExecuteStatsAndBurn(t *testing.T) {
 	// Test `sentinel stats` against loopback httptest server
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

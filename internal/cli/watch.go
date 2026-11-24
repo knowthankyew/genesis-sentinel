@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -58,6 +59,10 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	if *pollInterval <= 0 {
+		return fmt.Errorf("invalid -poll-interval %v: must be positive", *pollInterval)
+	}
+
 	cfg.GenesisDataDir = *genesisDataDir
 	cfg.GenesisHTTPAddr = *genesisHTTP
 	cfg.GenesisTCPAddr = *genesisTCP
@@ -82,6 +87,13 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// Bind HTTP listener synchronously before opening ingestion or starting loops so bind errors fail fast.
+	ln, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("bind sentinel HTTP listener on %s: %w", cfg.HTTPAddr, err)
+	}
+	defer func() { _ = ln.Close() }()
 
 	var sink emit.Sink
 	if *dryRun {
@@ -116,7 +128,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		}
 	} else {
 		activeSource = "query_fallback"
-		queryPoller = ingest.NewQueryPoller(cfg.GenesisHTTPAddr, cfg.GenesisAuthToken, 10000)
+		queryPoller = ingest.NewQueryPoller(cfg.GenesisHTTPAddr, cfg.GenesisAuthToken, 10000, cfg.AllowRemoteEndpoints)
 	}
 
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
@@ -141,14 +153,12 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, *pollInterval)
 
-	// Start loopback HTTP stats/health/burn server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", pipe.HandleHealthz)
 	mux.HandleFunc("/stats", pipe.HandleStats)
 	mux.HandleFunc("/burn", pipe.HandleBurn)
 
 	httpSrv := &http.Server{
-		Addr:              cfg.HTTPAddr,
 		Handler:           security.AuthMiddleware(cfg.AuthToken, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -157,8 +167,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 
 	go func() {
-		logger.Printf("[HTTP]   Stats & Health    : http://%s (/healthz, /stats, DELETE /burn)", cfg.HTTPAddr)
-		if serveErr := httpSrv.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+		logger.Printf("[HTTP]   Stats & Health    : http://%s (/healthz, /stats, DELETE /burn)", ln.Addr().String())
+		if serveErr := httpSrv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			logger.Printf("[HTTP]   Server error: %v", serveErr)
 		}
 	}()
@@ -176,17 +186,21 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		select {
 		case <-ctx.Done():
 			logger.Println("[Shutdown] Flushing final Tier 0 window and saving cursor...")
-			alerts := pipe.FlushWindow()
-			if len(alerts) > 0 {
-				logger.Printf("[Shutdown] Emitted %d final alert(s).", len(alerts))
+			emitted, failed := pipe.FlushWindow()
+			if len(emitted) > 0 || len(failed) > 0 {
+				logger.Printf("[Shutdown] Emitted %d final alert(s) (%d sink failure(s)).", len(emitted), len(failed))
 			}
+			var finalSaveErr error
 			if segReader != nil {
-				_ = segReader.SaveCursor()
+				if saveErr := segReader.SaveCursor(); saveErr != nil {
+					logger.Printf("[Shutdown] Final cursor save failed: %v", saveErr)
+					finalSaveErr = fmt.Errorf("final cursor save failed: %w", saveErr)
+				}
 			}
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			_ = httpSrv.Shutdown(shutdownCtx)
 			cancel()
-			return nil
+			return finalSaveErr
 
 		case <-pollTicker.C:
 			if segReader != nil {
@@ -199,7 +213,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 					pipe.IngestEvent(ev)
 				}
 				if len(batch) > 0 {
-					_ = segReader.SaveCursor()
+					if saveErr := segReader.SaveCursor(); saveErr != nil {
+						logger.Printf("[Cursor] save error (will retry next batch): %v", saveErr)
+					}
 				}
 			} else if queryPoller != nil {
 				batch, pollErr := queryPoller.Poll(ctx)
@@ -215,9 +231,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			}
 
 		case <-flushTicker.C:
-			alerts := pipe.FlushWindow()
-			if len(alerts) > 0 {
-				logger.Printf("[Tier0] Emitted %d alert(s) (total_lines=%d)", len(alerts), pipe.Stats().LinesRead)
+			emitted, failed := pipe.FlushWindow()
+			if len(emitted) > 0 || len(failed) > 0 {
+				logger.Printf("[Tier0] Emitted %d alert(s), %d sink failure(s) (total_lines=%d)", len(emitted), len(failed), pipe.Stats().LinesRead)
 			}
 		}
 	}

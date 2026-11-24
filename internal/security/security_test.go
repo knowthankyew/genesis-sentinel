@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsLoopbackEndpoint(t *testing.T) {
@@ -93,5 +94,36 @@ func TestSanitizeUntrustedLogText(t *testing.T) {
 	}
 	if len(benignSignals) != 0 {
 		t.Fatalf("unexpected injection signals on benign log: %v", benignSignals)
+	}
+}
+
+func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/to-external":
+			http.Redirect(w, r, "https://example.com/evil", http.StatusTemporaryRedirect)
+		case "/to-local":
+			http.Redirect(w, r, "/ok", http.StatusTemporaryRedirect)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	// Loopback client blocks external redirect but allows loopback redirect
+	c := NewLoopbackHTTPClient(2*time.Second, false, false)
+	if _, err := c.Get(srv.URL + "/to-external"); err == nil {
+		t.Fatal("expected external redirect to be blocked by loopback policy")
+	}
+	resp, err := c.Get(srv.URL + "/to-local")
+	if err != nil {
+		t.Fatalf("expected loopback redirect to succeed, got %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Strict blockRedirects client rejects even loopback redirects (e.g. DELETE /burn)
+	strict := NewLoopbackHTTPClient(2*time.Second, false, true)
+	if _, err := strict.Get(srv.URL + "/to-local"); err == nil {
+		t.Fatal("expected blockRedirects=true to reject all redirects")
 	}
 }

@@ -15,16 +15,28 @@ const (
 	// DefaultMaxClusters bounds unique template clusters in RAM to prevent memory exhaustion
 	// under adversarial random-token log floods.
 	DefaultMaxClusters = 4096
+	// DefaultMaxWindows bounds distinct TemplateWindow entries retained between Flush calls.
+	DefaultMaxWindows = 4096
 	// DefaultSimilarityThreshold is the Drain token match ratio required to merge into an existing cluster.
 	DefaultSimilarityThreshold = 0.50
 	// DefaultMaxDepth is the fixed prefix-tree token depth before cluster leaf lookup.
 	DefaultMaxDepth = 2
-	// minEntropyTokenLen is the minimum token length considered for peak-segment entropy checks
-	// (catches high-entropy DNS tunneling or base64 blobs embedded in normal log sentences).
+	// minEntropyTokenLen is the minimum token length checked for whitespace/dot-delimited entropy peaks.
 	minEntropyTokenLen = 24
+	// maxAdditionalSamples bounds extra signature-evidence samples retained per TemplateWindow.
+	maxAdditionalSamples = 16
+	// maxOverflowBuckets bounds distinct (service, level) overflow windows when at maxWindows.
+	maxOverflowBuckets = 256
 )
 
+type drainRootKey struct {
+	service    string
+	level      string
+	tokenCount int
+}
+
 type drainCluster struct {
+	id     string // stable aggregation ID preserved across token generalizations
 	tokens []string
 }
 
@@ -35,11 +47,11 @@ type drainNode struct {
 
 // DrainMiner implements a fast, bounded, pure-Go Drain-style log template miner.
 // Dynamic parameters (IPs, UUIDs, timestamps, hex values, numbers) are pre-masked
-// before fixed-depth prefix lookup so millions of repetitive log lines collapse
-// into stable structural templates.
+// before fixed-depth prefix lookup so repetitive log lines collapse into stable
+// structural templates with bounded RAM even under adversarial token floods.
 type DrainMiner struct {
 	mu                  sync.Mutex
-	roots               map[string]*drainNode // keyed by service|level|tokenCount
+	roots               map[drainRootKey]*drainNode
 	maxClusters         int
 	clusterCount        int
 	similarityThreshold float64
@@ -54,28 +66,40 @@ func NewDrainMiner(maxClusters int, similarityThreshold float64) *DrainMiner {
 		similarityThreshold = DefaultSimilarityThreshold
 	}
 	return &DrainMiner{
-		roots:               make(map[string]*drainNode, 64),
+		roots:               make(map[drainRootKey]*drainNode, 64),
 		maxClusters:         maxClusters,
 		similarityThreshold: similarityThreshold,
 	}
 }
 
 // ExtractTemplate normalizes msg into masked tokens, merges it into the Drain prefix
-// tree for (service, level), and returns (templateID, templateString).
-func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string) {
+// tree for (service, level), and returns (stableTemplateID, templateString, overflowed).
+// Once maxClusters is reached, lookup continues across existing clusters without allocating
+// any new tree nodes; unmatched events return a bounded overflow ID.
+func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string, bool) {
 	tokens := NormalizeTokens(msg)
 	if len(tokens) == 0 {
 		tmpl := "<EMPTY>"
-		return TemplateHash(service, level, tmpl), tmpl
+		return TemplateHash(service, level, tmpl), tmpl, false
 	}
 
-	rootKey := fmt.Sprintf("%s|%s|%d", service, level, len(tokens))
+	rootKey := drainRootKey{
+		service:    service,
+		level:      level,
+		tokenCount: len(tokens),
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	atCap := m.clusterCount >= m.maxClusters
+
 	root, ok := m.roots[rootKey]
 	if !ok {
+		if atCap {
+			tmpl := strings.Join(tokens, " ")
+			return OverflowTemplateID(service, level), tmpl, true
+		}
 		root = &drainNode{}
 		m.roots[rootKey] = root
 	}
@@ -88,12 +112,23 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 			tok = "<*>"
 		}
 		if node.children == nil {
+			if atCap {
+				tmpl := strings.Join(tokens, " ")
+				return OverflowTemplateID(service, level), tmpl, true
+			}
 			node.children = make(map[string]*drainNode, 8)
 		}
 		child, exists := node.children[tok]
 		if !exists {
-			// Bound branching factor under adversarial random-prefix floods.
-			if len(node.children) >= 64 {
+			if atCap {
+				// Fallback read-only check into wildcard branch if one already exists.
+				wild, hasWild := node.children["<*>"]
+				if !hasWild {
+					tmpl := strings.Join(tokens, " ")
+					return OverflowTemplateID(service, level), tmpl, true
+				}
+				child = wild
+			} else if len(node.children) >= 64 {
 				child, exists = node.children["<*>"]
 				if !exists {
 					child = &drainNode{}
@@ -124,30 +159,32 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 				best.tokens[i] = "<*>"
 			}
 		}
-		tmpl := strings.Join(best.tokens, " ")
-		return TemplateHash(service, level, tmpl), tmpl
+		// Keep stable best.id even after token generalization so counts stay aggregated in one window.
+		return best.id, strings.Join(best.tokens, " "), false
 	}
 
-	// If global cluster cap reached, emit normalized template directly without unbounded growth.
-	if m.clusterCount >= m.maxClusters {
+	if atCap {
 		tmpl := strings.Join(tokens, " ")
-		return TemplateHash(service, level, tmpl), tmpl
+		return OverflowTemplateID(service, level), tmpl, true
 	}
 
 	copied := make([]string, len(tokens))
 	copy(copied, tokens)
-	c := &drainCluster{tokens: copied}
-	node.clusters = append(node.clusters, c)
-	m.clusterCount++
-
 	tmpl := strings.Join(copied, " ")
-	return TemplateHash(service, level, tmpl), tmpl
+	m.clusterCount++
+	c := &drainCluster{
+		id:     TemplateHash(service, level, fmt.Sprintf("cluster:%d:%s", m.clusterCount, tmpl)),
+		tokens: copied,
+	}
+	node.clusters = append(node.clusters, c)
+
+	return c.id, tmpl, false
 }
 
 // Reset clears all learned prefix-tree clusters (used by `sentinel burn`).
 func (m *DrainMiner) Reset() {
 	m.mu.Lock()
-	m.roots = make(map[string]*drainNode, 64)
+	m.roots = make(map[drainRootKey]*drainNode, 64)
 	m.clusterCount = 0
 	m.mu.Unlock()
 }
@@ -161,29 +198,66 @@ func (m *DrainMiner) ClusterCount() int {
 
 // Aggregator collects incoming model.LogEvents over a window and collapses identical
 // templates into bounded model.TemplateWindow records for Tier 0/1/2 evaluation.
+// A single mutex coordinates Add, Flush, and Reset across both miner and window map.
 type Aggregator struct {
-	mu      sync.Mutex
-	miner   *DrainMiner
-	windows map[string]*model.TemplateWindow
+	mu              sync.Mutex
+	miner           *DrainMiner
+	windows         map[string]*model.TemplateWindow
+	maxWindows      int
+	overflowBuckets int
 }
 
-// NewAggregator creates a window aggregator backed by a DrainMiner.
+// NewAggregator creates a window aggregator backed by a bounded DrainMiner.
 func NewAggregator(maxClusters int) *Aggregator {
+	maxWin := maxClusters
+	if maxWin <= 0 {
+		maxWin = DefaultMaxWindows
+	}
 	return &Aggregator{
-		miner:   NewDrainMiner(maxClusters, DefaultSimilarityThreshold),
-		windows: make(map[string]*model.TemplateWindow, 128),
+		miner:      NewDrainMiner(maxClusters, DefaultSimilarityThreshold),
+		windows:    make(map[string]*model.TemplateWindow, 128),
+		maxWindows: maxWin,
 	}
 }
 
 // Add folds a single LogEvent into the current window's collapsed templates.
+// Both miner extraction and window insertion run under a.mu so Reset is atomic.
 func (a *Aggregator) Add(ev model.LogEvent) {
-	tmplID, tmpl := a.miner.ExtractTemplate(ev.Service, ev.Level, ev.Message)
 	ent := PeakShannonEntropy(ev.Message)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	tmplID, tmpl, overflowed := a.miner.ExtractTemplate(ev.Service, ev.Level, ev.Message)
+	if overflowed {
+		tmpl = "<OVERFLOW>"
+	}
+
 	w, exists := a.windows[tmplID]
+	if !exists {
+		// Enforce window count cap between flushes under adversarial random floods.
+		if len(a.windows) >= a.maxWindows {
+			ovID := OverflowTemplateID(ev.Service, ev.Level)
+			if existingOv, ok := a.windows[ovID]; ok {
+				w = existingOv
+				exists = true
+			} else if a.overflowBuckets < maxOverflowBuckets {
+				a.overflowBuckets++
+				tmplID = ovID
+				tmpl = "<OVERFLOW>"
+			} else {
+				const globalOvID = "overflow:global"
+				if globalOv, ok := a.windows[globalOvID]; ok {
+					w = globalOv
+					exists = true
+				} else {
+					tmplID = globalOvID
+					tmpl = "<OVERFLOW>"
+				}
+			}
+		}
+	}
+
 	if !exists {
 		a.windows[tmplID] = &model.TemplateWindow{
 			TemplateID:    tmplID,
@@ -200,17 +274,69 @@ func (a *Aggregator) Add(ev model.LogEvent) {
 	}
 
 	w.Count++
+	if !overflowed && tmpl != "<OVERFLOW>" {
+		w.Template = tmpl
+	}
 	if ev.Timestamp > 0 && (w.FirstSeenUnix == 0 || ev.Timestamp < w.FirstSeenUnix) {
 		w.FirstSeenUnix = ev.Timestamp
 	}
 	if ev.Timestamp > w.LastSeenUnix {
 		w.LastSeenUnix = ev.Timestamp
 	}
-	// Retain highest-entropy sample within the window so embedded exfil payloads aren't hidden by an earlier benign line.
+
+	// Preserve highest-entropy sample in SampleLine AND retain bounded signature-evidence
+	// samples separately so malicious payloads in wildcard slots are never hidden by an
+	// earlier higher-entropy line.
+	prevSample := w.SampleLine
 	if ent > w.SampleEntropy {
 		w.SampleEntropy = ent
 		w.SampleLine = ev.Message
+		if prevSample != "" && prevSample != ev.Message {
+			addEvidenceSample(w, prevSample)
+		}
+	} else if ev.Message != w.SampleLine {
+		addEvidenceSample(w, ev.Message)
 	}
+}
+
+func addEvidenceSample(w *model.TemplateWindow, sample string) {
+	if sample == "" || sample == w.SampleLine {
+		return
+	}
+	for _, existing := range w.AdditionalSamples {
+		if existing == sample {
+			return
+		}
+	}
+	if len(w.AdditionalSamples) < maxAdditionalSamples {
+		w.AdditionalSamples = append(w.AdditionalSamples, sample)
+		return
+	}
+	// When full, prioritize retaining samples carrying security-relevant cues over plain lines.
+	if hasSecurityCue(sample) {
+		for i, existing := range w.AdditionalSamples {
+			if !hasSecurityCue(existing) {
+				w.AdditionalSamples[i] = sample
+				return
+			}
+		}
+	}
+}
+
+func hasSecurityCue(s string) bool {
+	lower := strings.ToLower(s)
+	for _, cue := range []string{
+		"../", "%2e%2e", "/etc/passwd", "/etc/shadow",
+		"union ", "select ", "information_schema", "xp_cmdshell",
+		"<|", "<start_of_turn>", "ignore previous", "disregard",
+		"curl ", "wget ", "/dev/tcp/", "bash -i", "command not allowed",
+		"failed password", "invalid user", "authentication failure",
+	} {
+		if strings.Contains(lower, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 // Flush drains and returns all collapsed TemplateWindows accumulated since the last Flush,
@@ -223,11 +349,16 @@ func (a *Aggregator) Flush() []model.TemplateWindow {
 	}
 	drained := a.windows
 	a.windows = make(map[string]*model.TemplateWindow, 128)
+	a.overflowBuckets = 0
 	a.mu.Unlock()
 
 	out := make([]model.TemplateWindow, 0, len(drained))
 	for _, w := range drained {
-		out = append(out, *w)
+		copied := *w
+		if len(w.AdditionalSamples) > 0 {
+			copied.AdditionalSamples = append([]string(nil), w.AdditionalSamples...)
+		}
+		out = append(out, copied)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].FirstSeenUnix != out[j].FirstSeenUnix {
@@ -238,12 +369,13 @@ func (a *Aggregator) Flush() []model.TemplateWindow {
 	return out
 }
 
-// Reset wipes both buffered windows and learned Drain clusters (used by `sentinel burn`).
+// Reset atomically wipes both buffered windows and learned Drain clusters under a.mu.
 func (a *Aggregator) Reset() {
 	a.mu.Lock()
 	a.windows = make(map[string]*model.TemplateWindow, 128)
-	a.mu.Unlock()
+	a.overflowBuckets = 0
 	a.miner.Reset()
+	a.mu.Unlock()
 }
 
 // ClusterCount reports total learned template clusters in the underlying DrainMiner.
@@ -271,7 +403,6 @@ func maskToken(tok string) string {
 		return tok
 	}
 
-	// Preserve key=<masked> structure for structured kv pairs like client=10.0.2.15 or rows=4021.
 	if eqIdx := strings.IndexByte(tok, '='); eqIdx > 0 && eqIdx < len(tok)-1 {
 		key := tok[:eqIdx]
 		val := tok[eqIdx+1:]
@@ -284,8 +415,6 @@ func maskToken(tok string) string {
 }
 
 func maskScalar(tok string) string {
-	// Mask path numeric/UUID segments (e.g. /api/v1/orders/4821 -> /api/v1/orders/<NUM>)
-	// while preserving traversal patterns like ../etc/passwd intact.
 	if strings.HasPrefix(tok, "/") && !strings.Contains(tok, "..") && !strings.Contains(tok, "?") {
 		return maskPathSegments(tok)
 	}
@@ -345,7 +474,6 @@ func isSimpleKey(s string) bool {
 }
 
 func isIPv4(s string) bool {
-	// Allow optional :port suffix (e.g., 198.51.100.42:51922)
 	if colon := strings.LastIndexByte(s, ':'); colon > 0 && isAllDigitsStr(s[colon+1:]) {
 		s = s[:colon]
 	}
@@ -436,7 +564,6 @@ func isNumericOrDuration(s string) bool {
 	if s == "" {
 		return false
 	}
-	// Strip common duration/size unit suffixes (ms, us, ns, s, kb, mb, gb, %)
 	trimmed := s
 	for _, suffix := range []string{"ms", "us", "ns", "kb", "mb", "gb", "s", "%"} {
 		if len(trimmed) > len(suffix) && strings.HasSuffix(strings.ToLower(trimmed), suffix) {
@@ -506,15 +633,26 @@ func tokenSimilarity(a, b []string) float64 {
 	return float64(matches) / float64(len(a))
 }
 
-// TemplateHash computes a deterministic 64-bit FNV-1a hex identifier for a template.
+// TemplateHash computes a deterministic 64-bit FNV-1a hex identifier using
+// unambiguous length-prefixed framing so delimiter characters inside service
+// or level values cannot collide.
 func TemplateHash(service, level, tmpl string) string {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(service))
-	_, _ = h.Write([]byte{'|'})
-	_, _ = h.Write([]byte(level))
-	_, _ = h.Write([]byte{'|'})
-	_, _ = h.Write([]byte(tmpl))
+	writeFramed(h, service)
+	writeFramed(h, level)
+	writeFramed(h, tmpl)
 	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// OverflowTemplateID returns a deterministic overflow bucket ID for (service, level).
+func OverflowTemplateID(service, level string) string {
+	return "overflow:" + TemplateHash(service, level, "<OVERFLOW>")
+}
+
+func writeFramed(h interface{ Write([]byte) (int, error) }, s string) {
+	_, _ = fmt.Fprintf(h, "%d:", len(s))
+	_, _ = h.Write([]byte(s))
+	_, _ = h.Write([]byte{0})
 }
 
 // ShannonEntropy computes byte-level Shannon entropy in bits/byte (0.0 to 8.0).
@@ -538,10 +676,11 @@ func ShannonEntropy(s string) float64 {
 	return ent
 }
 
-// PeakShannonEntropy returns the maximum of full-message Shannon entropy and
-// the highest entropy of any >=24-byte whitespace/dot-delimited token inside msg.
-// This ensures high-entropy DNS tunneling or base64 C2 blobs are not diluted by
-// surrounding boilerplate words.
+// PeakShannonEntropy computes the maximum byte-level Shannon entropy across:
+// (1) the entire message, (2) any whitespace-delimited field of length >= 24 bytes,
+// and (3) any dot-delimited label of length >= 24 bytes inside a long field.
+// High-entropy spans delimited only by other punctuation (e.g. '=' or '/') remain
+// scored at their enclosing field boundary.
 func PeakShannonEntropy(msg string) float64 {
 	peak := ShannonEntropy(msg)
 	for _, field := range strings.Fields(msg) {
@@ -549,7 +688,6 @@ func PeakShannonEntropy(msg string) float64 {
 			if e := ShannonEntropy(field); e > peak {
 				peak = e
 			}
-			// Also inspect dot-separated DNS labels inside long hostnames
 			if strings.ContainsRune(field, '.') {
 				for _, label := range strings.Split(field, ".") {
 					if len(label) >= minEntropyTokenLen {

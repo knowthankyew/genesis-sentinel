@@ -146,4 +146,36 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	if resHit.Suppressed || len(resHit.RuleHits) != 1 || resHit.RuleHits[0].RuleID != "CUST-1" {
 		t.Fatalf("expected CUST-1 hit, got %+v", resHit)
 	}
+
+	// Empty-selector suppression must be rejected so global alerting cannot be silenced accidentally
+	_, err = NewEngine(RulePack{
+		Version:      "1.0",
+		Rules:        DefaultRulePack().Rules,
+		Suppressions: []Suppression{{ID: "BAD-EMPTY", Reason: "oops"}},
+	})
+	if err == nil {
+		t.Fatal("expected NewEngine to reject suppression with empty selectors")
+	}
+
+	// Signature hidden in AdditionalSamples behind a high-entropy primary sample must still trigger
+	defEng, err := NewEngine(DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine default: %v", err)
+	}
+	resExtra := defEng.Evaluate(model.TemplateWindow{
+		Service:           "nginx",
+		Level:             "WARN",
+		Count:             2,
+		SampleLine:        "GET /static/normal_high_var_item HTTP/1.1 404",
+		AdditionalSamples: []string{"GET /static/../../../../etc/passwd HTTP/1.1 403"},
+	}, 1024)
+	foundLFI := false
+	for _, h := range resExtra.RuleHits {
+		if h.RuleID == "SENT-003" {
+			foundLFI = true
+		}
+	}
+	if !foundLFI {
+		t.Fatalf("expected SENT-003 hit from AdditionalSamples, got %+v", resExtra.RuleHits)
+	}
 }

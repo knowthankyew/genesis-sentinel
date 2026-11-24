@@ -1,7 +1,10 @@
 package ingest
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -20,6 +23,10 @@ const (
 	MagicHeaderLen = 8
 	// MaxFrameBytes bounds single-frame allocation to protect against corrupted length headers.
 	MaxFrameBytes = 1024 * 1024 // 1 MiB
+	// maxFingerprintBytes is the prefix length hashed to identify segment identity across burn resets.
+	maxFingerprintBytes = 256
+	// maxRecoveryScanBytes bounds byte-by-byte forward resync after a corrupted frame.
+	maxRecoveryScanBytes = 256 * 1024
 )
 
 // SegReaderStats reports diagnostic counters for lossless .seg ingestion.
@@ -32,9 +39,11 @@ type SegReaderStats struct {
 }
 
 // SegReader follows Genesis append-only .seg segment files read-only without dropping
-// events during traffic bursts. It safely handles rotation, partial writes, and `genesis burn`.
+// events during traffic bursts. It safely handles rotation, partial writes, bounded
+// CRC recovery, and `genesis burn` replacement detection.
 type SegReader struct {
 	mu             sync.Mutex
+	saveMu         sync.Mutex // serializes cursor snapshot + file writes without blocking ReadBatch across disk I/O
 	segDir         string
 	cursorPath     string
 	cursor         SegCursor
@@ -90,27 +99,37 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 
 	latestSegID := segments[len(segments)-1]
 
-	// Detect `genesis burn` (which unlinks all segments and resets to 00000001.seg at size 0).
+	// Detect `genesis burn` (segment rollback, truncation, OR replacement file with new content
+	// even if the replacement grew >= saved offset).
 	if r.cursor.SegmentID > 0 {
 		if r.cursor.SegmentID > latestSegID {
-			r.cursor.SegmentID = segments[0]
-			r.cursor.Offset = 0
-			r.burnResets++
+			r.resetCursorToLocked(segments[0], true)
 		} else if !containsSegment(segments, r.cursor.SegmentID) {
 			// Cursor segment was pruned by retention; advance to earliest surviving segment.
-			r.cursor.SegmentID = segments[0]
-			r.cursor.Offset = 0
+			r.resetCursorToLocked(segments[0], false)
 		} else {
 			curPath := segmentPath(r.segDir, r.cursor.SegmentID)
-			if info, statErr := os.Stat(curPath); statErr == nil && info.Size() < r.cursor.Offset {
-				r.cursor.SegmentID = segments[0]
-				r.cursor.Offset = 0
-				r.burnResets++
+			info, statErr := os.Stat(curPath)
+			if statErr != nil {
+				if os.IsNotExist(statErr) {
+					r.resetCursorToLocked(segments[0], true)
+				} else {
+					return nil, fmt.Errorf("stat segment %q: %w", curPath, statErr)
+				}
+			} else if info.Size() < r.cursor.Offset {
+				r.resetCursorToLocked(segments[0], true)
+			} else if r.cursor.SegmentFingerprint != "" && r.cursor.FingerprintLen > 0 {
+				fp, fpLen, fpErr := computeSegmentFingerprint(curPath, r.cursor.FingerprintLen)
+				if fpErr != nil {
+					return nil, fmt.Errorf("verify segment identity %q: %w", curPath, fpErr)
+				}
+				if fpLen < r.cursor.FingerprintLen || fp != r.cursor.SegmentFingerprint {
+					r.resetCursorToLocked(segments[0], true)
+				}
 			}
 		}
 	} else {
-		r.cursor.SegmentID = segments[0]
-		r.cursor.Offset = 0
+		r.resetCursorToLocked(segments[0], false)
 	}
 
 	var events []model.LogEvent
@@ -122,13 +141,15 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 		if segID > r.cursor.SegmentID {
 			r.cursor.SegmentID = segID
 			r.cursor.Offset = 0
+			r.cursor.SegmentFingerprint = ""
+			r.cursor.FingerprintLen = 0
 		}
 
 		segEvents, advancedToNext, readErr := r.readSegmentLocked(segID, isLatest, maxEvents-len(events))
+		events = append(events, segEvents...)
 		if readErr != nil {
 			return events, readErr
 		}
-		events = append(events, segEvents...)
 
 		if len(events) >= maxEvents {
 			break
@@ -139,6 +160,16 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 	}
 
 	return events, nil
+}
+
+func (r *SegReader) resetCursorToLocked(segID uint64, isBurn bool) {
+	r.cursor.SegmentID = segID
+	r.cursor.Offset = 0
+	r.cursor.SegmentFingerprint = ""
+	r.cursor.FingerprintLen = 0
+	if isBurn {
+		r.burnResets++
+	}
 }
 
 func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) ([]model.LogEvent, bool, error) {
@@ -154,15 +185,26 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("stat segment %q: %w", segPath, err)
 	}
 	fileSize := info.Size()
+
+	// Capture segment identity fingerprint as soon as enough header bytes exist.
+	if r.cursor.SegmentFingerprint == "" && fileSize >= MagicHeaderLen {
+		fp, fpLen, fpErr := computeSegmentFingerprintFromFile(f, maxFingerprintBytes)
+		if fpErr != nil {
+			return nil, false, fmt.Errorf("fingerprint segment %q: %w", segPath, fpErr)
+		}
+		r.cursor.SegmentFingerprint = fp
+		r.cursor.FingerprintLen = fpLen
+	}
+
 	if r.cursor.Offset >= fileSize {
 		return nil, !isLatest, nil
 	}
 
 	if _, err := f.Seek(r.cursor.Offset, io.SeekStart); err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("seek segment %q: %w", segPath, err)
 	}
 
 	var events []model.LogEvent
@@ -171,11 +213,10 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 	for len(events) < budget {
 		remaining := fileSize - r.cursor.Offset
 		if remaining < MagicHeaderLen {
-			// Active segment may still be flushing a frame; wait without advancing.
 			if isLatest {
+				// Active segment may still be flushing a frame; wait without advancing.
 				return events, false, nil
 			}
-			// Sealed older segment has truncated trailing bytes; skip remainder and move on.
 			if remaining > 0 {
 				r.corruptedFrames++
 			}
@@ -183,15 +224,28 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 		}
 
 		if _, err := io.ReadFull(f, header[:]); err != nil {
-			return events, !isLatest, nil
+			if isEOFError(err) {
+				return events, !isLatest, nil
+			}
+			return events, false, fmt.Errorf("read header in %q at %d: %w", segPath, r.cursor.Offset, err)
 		}
 
 		payloadLen := binary.BigEndian.Uint32(header[0:4])
 		expectedCRC := binary.BigEndian.Uint32(header[4:8])
 
-		if payloadLen > MaxFrameBytes {
+		if payloadLen == 0 || payloadLen > MaxFrameBytes {
 			r.corruptedFrames++
-			// Cannot trust length in this segment; advance past sealed segment or pause active.
+			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
+			if scanErr != nil {
+				return events, false, scanErr
+			}
+			if found {
+				r.cursor.Offset = nextOff
+				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
+					return events, false, seekErr
+				}
+				continue
+			}
 			if isLatest {
 				return events, false, nil
 			}
@@ -201,27 +255,53 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 		frameBytes := int64(MagicHeaderLen) + int64(payloadLen)
 		if remaining < frameBytes {
 			if isLatest {
-				// Partial write in progress; leave cursor at frame start.
+				// Partial in-flight write; leave cursor at frame start.
 				return events, false, nil
 			}
 			r.corruptedFrames++
+			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
+			if scanErr != nil {
+				return events, false, scanErr
+			}
+			if found {
+				r.cursor.Offset = nextOff
+				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
+					return events, false, seekErr
+				}
+				continue
+			}
 			return events, true, nil
 		}
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(f, payload); err != nil {
-			if isLatest {
-				return events, false, nil
+			if isEOFError(err) {
+				if isLatest {
+					return events, false, nil
+				}
+				r.corruptedFrames++
+				return events, true, nil
 			}
-			r.corruptedFrames++
-			return events, true, nil
+			return events, false, fmt.Errorf("read payload in %q at %d: %w", segPath, r.cursor.Offset, err)
 		}
 
 		actualCRC := crc32.ChecksumIEEE(payload)
 		if actualCRC != expectedCRC {
 			r.corruptedFrames++
+			// Bounded recovery: scan forward for the next CRC-validated frame boundary.
+			// Never advance past an unvalidated tail on the active segment.
+			nextOff, found, scanErr := findNextValidFrame(f, r.cursor.Offset+1, fileSize)
+			if scanErr != nil {
+				return events, false, scanErr
+			}
+			if found {
+				r.cursor.Offset = nextOff
+				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
+					return events, false, seekErr
+				}
+				continue
+			}
 			if isLatest {
-				// Torn write or mid-flush CRC mismatch at tail; wait for Genesis flush or rotation.
 				return events, false, nil
 			}
 			return events, true, nil
@@ -241,17 +321,90 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget int) (
 	return events, r.cursor.Offset >= fileSize && !isLatest, nil
 }
 
-// SaveCursor flushes the current read cursor atomically to disk.
+// findNextValidFrame scans forward up to maxRecoveryScanBytes from startOff looking
+// for the next byte offset whose 8-byte [len][crc32] header points to a complete
+// payload within fileSize that passes IEEE CRC32 verification.
+func findNextValidFrame(f *os.File, startOff, fileSize int64) (int64, bool, error) {
+	if startOff+MagicHeaderLen >= fileSize {
+		return 0, false, nil
+	}
+	limit := min(fileSize-MagicHeaderLen, startOff+maxRecoveryScanBytes)
+	scanWindowSize := int(min(fileSize-startOff, maxRecoveryScanBytes+MaxFrameBytes+MagicHeaderLen))
+	buf := make([]byte, scanWindowSize)
+	n, err := f.ReadAt(buf, startOff)
+	if err != nil && !isEOFError(err) {
+		return 0, false, fmt.Errorf("scan recovery window at %d: %w", startOff, err)
+	}
+	buf = buf[:n]
+
+	maxRel := int(limit - startOff)
+	if maxRel > len(buf)-MagicHeaderLen {
+		maxRel = len(buf) - MagicHeaderLen
+	}
+	for rel := 0; rel <= maxRel; rel++ {
+		pLen := binary.BigEndian.Uint32(buf[rel : rel+4])
+		if pLen == 0 || pLen > MaxFrameBytes {
+			continue
+		}
+		end := rel + MagicHeaderLen + int(pLen)
+		if end > len(buf) {
+			continue
+		}
+		wantCRC := binary.BigEndian.Uint32(buf[rel+4 : rel+8])
+		if crc32.ChecksumIEEE(buf[rel+MagicHeaderLen:end]) == wantCRC {
+			return startOff + int64(rel), true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func isEOFError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+func computeSegmentFingerprint(path string, maxBytes int) (string, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = f.Close() }()
+	return computeSegmentFingerprintFromFile(f, maxBytes)
+}
+
+func computeSegmentFingerprintFromFile(f *os.File, maxBytes int) (string, int, error) {
+	if maxBytes <= 0 {
+		maxBytes = maxFingerprintBytes
+	}
+	buf := make([]byte, maxBytes)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && !isEOFError(err) {
+		return "", 0, err
+	}
+	sum := sha256.Sum256(buf[:n])
+	return hex.EncodeToString(sum[:]), n, nil
+}
+
+// SaveCursor snapshots the current cursor and persists it to disk serialized by
+// saveMu so concurrent saves and resets publish strictly in snapshot order without
+// holding r.mu across file I/O.
 func (r *SegReader) SaveCursor() error {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+
 	r.mu.Lock()
 	cur := r.cursor
 	path := r.cursorPath
 	r.mu.Unlock()
+
 	return SaveCursor(path, cur)
 }
 
-// ResetCursor zeros the in-memory cursor (used by `sentinel burn`).
+// ResetCursor zeros the in-memory cursor under saveMu + r.mu so an earlier
+// in-flight SaveCursor snapshot cannot overwrite the reset.
 func (r *SegReader) ResetCursor() {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+
 	r.mu.Lock()
 	r.cursor = SegCursor{}
 	r.mu.Unlock()
@@ -271,8 +424,14 @@ func (r *SegReader) Stats() SegReaderStats {
 }
 
 // WriteSegmentFrame appends a single Genesis-compatible CRC32 frame to w.
-// Exported for deterministic testing, benchmarks, and synthetic corpus generation.
+// Rejects payloads exceeding MaxFrameBytes before writing any bytes.
 func WriteSegmentFrame(w io.Writer, raw []byte) error {
+	if len(raw) == 0 {
+		return fmt.Errorf("segment frame payload must not be empty")
+	}
+	if len(raw) > MaxFrameBytes {
+		return fmt.Errorf("segment frame payload (%d bytes) exceeds MaxFrameBytes (%d)", len(raw), MaxFrameBytes)
+	}
 	var header [MagicHeaderLen]byte
 	binary.BigEndian.PutUint32(header[0:4], uint32(len(raw)))
 	binary.BigEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(raw))

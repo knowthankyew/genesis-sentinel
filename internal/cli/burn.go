@@ -54,7 +54,8 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		client := &http.Client{Timeout: 5 * time.Second}
+		// Reject redirects on DELETE /burn so a 307/308 redirect cannot bypass the endpoint policy.
+		client := security.NewLoopbackHTTPClient(5*time.Second, cfg.AllowRemoteEndpoints, true)
 		resp, doErr := client.Do(req)
 		if doErr != nil {
 			return fmt.Errorf("DELETE %s/burn failed: %w", target, doErr)
@@ -64,7 +65,9 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			return fmt.Errorf("DELETE %s/burn returned %d: %s", target, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
-		_, _ = io.Copy(stdout, resp.Body)
+		if _, copyErr := io.Copy(stdout, io.LimitReader(resp.Body, 1024*1024)); copyErr != nil {
+			return fmt.Errorf("write burn response: %w", copyErr)
+		}
 		return nil
 	}
 

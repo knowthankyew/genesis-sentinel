@@ -14,6 +14,8 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
 )
 
+const maxStatsResponseBytes = 1024 * 1024 // 1 MiB
+
 func runStats(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -37,7 +39,8 @@ func runStats(args []string, stdout, stderr io.Writer) error {
 	if !strings.Contains(target, "://") {
 		target = "http://" + target
 	}
-	if !*allowRemote && !cfg.AllowRemoteEndpoints && !security.IsLoopbackEndpoint(target) {
+	remoteAllowed := *allowRemote || cfg.AllowRemoteEndpoints
+	if !remoteAllowed && !security.IsLoopbackEndpoint(target) {
 		return fmt.Errorf("refusing non-loopback stats endpoint %q without --allow-remote", target)
 	}
 
@@ -54,16 +57,19 @@ func runStats(args []string, stdout, stderr io.Writer) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := security.NewLoopbackHTTPClient(5*time.Second, remoteAllowed, false)
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("query sentinel /stats at %s: %w", target, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsResponseBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(body) > maxStatsResponseBytes {
+		return fmt.Errorf("sentinel /stats response exceeded %d-byte limit", maxStatsResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sentinel /stats returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -71,9 +77,13 @@ func runStats(args []string, stdout, stderr io.Writer) error {
 
 	var pretty bytes.Buffer
 	if json.Indent(&pretty, body, "", "  ") == nil {
-		_, _ = fmt.Fprintln(stdout, pretty.String())
+		if _, err := fmt.Fprintln(stdout, pretty.String()); err != nil {
+			return fmt.Errorf("write stats output: %w", err)
+		}
 		return nil
 	}
-	_, _ = fmt.Fprintln(stdout, string(body))
+	if _, err := fmt.Fprintln(stdout, string(body)); err != nil {
+		return fmt.Errorf("write stats output: %w", err)
+	}
 	return nil
 }

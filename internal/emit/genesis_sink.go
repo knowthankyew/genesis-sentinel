@@ -43,13 +43,20 @@ type Sink interface {
 	Close() error
 }
 
+// ReservedAlertService is always ignored on ingest for loop prevention, even if
+// the operator configures an alternate alert_service_name.
+const ReservedAlertService = "sentinel"
+
 // ShouldIgnoreEvent enforces strict loop prevention so Sentinel never ingests
-// and re-evaluates its own alerts written back into Genesis.
+// and re-evaluates its own alerts (either the reserved "sentinel" service or
+// any custom configured alertService).
 func ShouldIgnoreEvent(ev model.LogEvent, alertService string) bool {
-	if strings.TrimSpace(alertService) == "" {
-		alertService = "sentinel"
+	svc := strings.TrimSpace(ev.Service)
+	if strings.EqualFold(svc, ReservedAlertService) {
+		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(ev.Service), strings.TrimSpace(alertService))
+	trimmedAlert := strings.TrimSpace(alertService)
+	return trimmedAlert != "" && strings.EqualFold(svc, trimmedAlert)
 }
 
 // MapSeverityToGenesisLevel maps Sentinel alert severity to Genesis log levels.
@@ -129,7 +136,12 @@ func (s *GenesisTCPSink) Emit(alert Alert) error {
 	}
 	// Reconnect once if the prior TCP connection was closed by Genesis.
 	s.closeLocked()
-	return s.writeLocked(payload)
+	if err := s.writeLocked(payload); err != nil {
+		// Clear the failed socket so a partial write never corrupts the next Emit.
+		s.closeLocked()
+		return err
+	}
+	return nil
 }
 
 func (s *GenesisTCPSink) writeLocked(payload []byte) error {

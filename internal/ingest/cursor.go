@@ -9,11 +9,16 @@ import (
 )
 
 // SegCursor records Sentinel's lossless read position across Genesis .seg files.
+// SegmentFingerprint stores the SHA-256 hex digest of the first FingerprintLen bytes
+// of SegmentID so replacement files created after `genesis burn` are detected even
+// if they grow past Offset before the next poll.
 type SegCursor struct {
-	SegmentID uint64    `json:"segment_id"`
-	Offset    int64     `json:"offset"`
-	NextID    uint64    `json:"next_id"`
-	UpdatedAt time.Time `json:"updated_at"`
+	SegmentID          uint64    `json:"segment_id"`
+	Offset             int64     `json:"offset"`
+	NextID             uint64    `json:"next_id"`
+	SegmentFingerprint string    `json:"segment_fingerprint,omitempty"`
+	FingerprintLen     int       `json:"fingerprint_len,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // LoadCursor reads a previously persisted SegCursor from path.
@@ -36,8 +41,10 @@ func LoadCursor(path string) (SegCursor, error) {
 	return c, nil
 }
 
-// SaveCursor persists c atomically via temp-file write + rename so crashes
-// never leave a truncated cursor file on disk.
+// SaveCursor writes c to a unique temporary file in path's directory, fsyncs the
+// file, and atomically replaces path via os.Rename (with best-effort parent
+// directory fsync on POSIX filesystems). Atomic replacement prevents readers from
+// observing partial files; full power-loss durability depends on OS/filesystem support.
 func SaveCursor(path string, c SegCursor) error {
 	if path == "" {
 		return nil
@@ -51,13 +58,43 @@ func SaveCursor(path string, c SegCursor) error {
 	if err != nil {
 		return fmt.Errorf("marshal cursor: %w", err)
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+
+	tmpFile, err := os.CreateTemp(dir, ".cursor-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp cursor in %q: %w", dir, err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("chmod temp cursor %q: %w", tmpPath, err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("write temp cursor %q: %w", tmpPath, err)
 	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync temp cursor %q: %w", tmpPath, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp cursor %q: %w", tmpPath, err)
+	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
 		return fmt.Errorf("commit cursor %q: %w", path, err)
+	}
+	cleanupTmp = false
+
+	// Best-effort directory sync so the renamed directory entry reaches disk on POSIX systems.
+	if d, openErr := os.Open(dir); openErr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

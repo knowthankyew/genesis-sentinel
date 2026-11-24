@@ -2,12 +2,13 @@ package template
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 )
 
-func TestAggregatorCollapsesRepetitiveNoise(t *testing.T) {
+func TestAggregatorCollapsesRepetitiveNoiseAndKeepsStableClusterID(t *testing.T) {
 	agg := NewAggregator(DefaultMaxClusters)
 
 	for i := 0; i < 1000; i++ {
@@ -19,17 +20,27 @@ func TestAggregatorCollapsesRepetitiveNoise(t *testing.T) {
 			Message:   fmt.Sprintf("GET /api/v1/orders/%d 200 %dms client=10.0.2.%d", 1000+i, 5+(i%40), (i%250)+1),
 		})
 	}
+	// 4 lines for "admin" + 1 line for "root" generalizes the cluster; must remain ONE window with count=5!
+	for i := 0; i < 4; i++ {
+		agg.Add(model.LogEvent{
+			ID:        uint64(2000 + i),
+			Timestamp: 1700002000,
+			Service:   "sshd",
+			Level:     "ERROR",
+			Message:   fmt.Sprintf("Failed password for invalid user admin from 198.51.100.42 port %d ssh2", 50000+i),
+		})
+	}
 	agg.Add(model.LogEvent{
-		ID:        1001,
-		Timestamp: 1700002000,
+		ID:        2005,
+		Timestamp: 1700002001,
 		Service:   "sshd",
 		Level:     "ERROR",
-		Message:   "Failed password for invalid user admin from 198.51.100.42 port 51922 ssh2",
+		Message:   "Failed password for invalid user root from 198.51.100.42 port 50099 ssh2",
 	})
 
 	windows := agg.Flush()
 	if len(windows) != 2 {
-		t.Fatalf("expected 1001 lines to collapse into 2 templates, got %d: %+v", len(windows), windows)
+		t.Fatalf("expected 1005 lines to collapse into 2 templates, got %d: %+v", len(windows), windows)
 	}
 	if windows[0].Service != "web" || windows[0].Count != 1000 {
 		t.Fatalf("expected web template count=1000, got %+v", windows[0])
@@ -37,8 +48,53 @@ func TestAggregatorCollapsesRepetitiveNoise(t *testing.T) {
 	if windows[0].Template != "GET /api/v1/orders/<NUM> <NUM> <NUM> client=<IP>" {
 		t.Fatalf("unexpected web template: %q", windows[0].Template)
 	}
-	if windows[1].Service != "sshd" || windows[1].Count != 1 {
-		t.Fatalf("expected sshd template count=1, got %+v", windows[1])
+	if windows[1].Service != "sshd" || windows[1].Count != 5 {
+		t.Fatalf("expected generalized sshd cluster to merge into count=5, got %+v", windows[1])
+	}
+}
+
+func TestTemplateHashAndRootsAvoidDelimiterCollisions(t *testing.T) {
+	agg := NewAggregator(DefaultMaxClusters)
+	agg.Add(model.LogEvent{ID: 1, Timestamp: 100, Service: "svc|edge", Level: "WARN", Message: "connection reset"})
+	agg.Add(model.LogEvent{ID: 2, Timestamp: 100, Service: "svc", Level: "edge|WARN", Message: "connection reset"})
+
+	windows := agg.Flush()
+	if len(windows) != 2 {
+		t.Fatalf("expected distinct windows for delimiter-colliding service/level, got %d: %+v", len(windows), windows)
+	}
+}
+
+func TestAggregatorPreservesSignatureEvidenceSeparatelyFromHighEntropySample(t *testing.T) {
+	agg := NewAggregator(DefaultMaxClusters)
+	// First: high-entropy path in token position 2 (past Drain depth 2)
+	agg.Add(model.LogEvent{
+		ID:        1,
+		Timestamp: 100,
+		Service:   "nginx",
+		Level:     "WARN",
+		Message:   "GET /proxy target=/static/Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN HTTP/1.1 404",
+	})
+	// Second: path traversal in the same generalized wildcard position with lower entropy
+	agg.Add(model.LogEvent{
+		ID:        2,
+		Timestamp: 101,
+		Service:   "nginx",
+		Level:     "WARN",
+		Message:   "GET /proxy target=/static/../../../../etc/passwd HTTP/1.1 403",
+	})
+
+	windows := agg.Flush()
+	if len(windows) != 1 {
+		t.Fatalf("expected 1 collapsed window, got %d", len(windows))
+	}
+	foundEvidence := strings.Contains(windows[0].SampleLine, "/etc/passwd")
+	for _, s := range windows[0].AdditionalSamples {
+		if strings.Contains(s, "/etc/passwd") {
+			foundEvidence = true
+		}
+	}
+	if !foundEvidence {
+		t.Fatalf("signature evidence /etc/passwd was lost behind high-entropy sample: %+v", windows[0])
 	}
 }
 
@@ -52,14 +108,14 @@ func TestPeakShannonEntropySeparatesBenignFromExfil(t *testing.T) {
 	if benignEnt >= 4.7 {
 		t.Fatalf("expected benign entropy < 4.7, got %.3f", benignEnt)
 	}
-	if exfilEnt < 5.0 {
-		t.Fatalf("expected exfil peak entropy >= 5.0, got %.3f", exfilEnt)
+	if exfilEnt < 5.2 {
+		t.Fatalf("expected exfil peak entropy >= 5.2, got %.3f", exfilEnt)
 	}
 }
 
-func TestDrainRespectsMaxClusterBound(t *testing.T) {
+func TestDrainAndAggregatorRespectClusterAndWindowBounds(t *testing.T) {
 	agg := NewAggregator(16)
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 500; i++ {
 		agg.Add(model.LogEvent{
 			ID:        uint64(i + 1),
 			Timestamp: 1700000000,
@@ -70,5 +126,10 @@ func TestDrainRespectsMaxClusterBound(t *testing.T) {
 	}
 	if agg.ClusterCount() > 16 {
 		t.Fatalf("expected cluster count <= 16, got %d", agg.ClusterCount())
+	}
+	windows := agg.Flush()
+	// Max 16 learned clusters + bounded overflow buckets (well below 500)
+	if len(windows) >= 300 {
+		t.Fatalf("expected bounded window count under random flood, got %d", len(windows))
 	}
 }

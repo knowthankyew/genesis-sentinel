@@ -1,8 +1,10 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,34 +15,51 @@ import (
 	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
+	"github.com/knowthankyew/genesis-sentinel/internal/security"
 )
 
-// QueryPollerStats tracks cursor and eviction-gap telemetry for volatile /query polling.
+const (
+	// DefaultMaxQueryResponseBytes caps a single /query HTTP response body to bound memory.
+	DefaultMaxQueryResponseBytes = 32 * 1024 * 1024 // 32 MiB
+)
+
+// ErrQueryResponseTooLarge is returned when Genesis /query exceeds MaxResponseBytes.
+var ErrQueryResponseTooLarge = errors.New("genesis /query response exceeds max byte bound")
+
+// QueryPollerStats tracks cursor, page-saturation, and observed eviction-gap telemetry
+// for volatile /query polling.
 type QueryPollerStats struct {
-	LastTimestamp int64  `json:"last_timestamp"`
-	LastID        uint64 `json:"last_id"`
-	Polls         uint64 `json:"polls"`
-	EventsRead    uint64 `json:"events_read"`
-	EvictionGaps  uint64 `json:"eviction_gaps"`
-	EstimatedLost uint64 `json:"estimated_lost"`
+	LastTimestamp  int64  `json:"last_timestamp"`
+	LastID         uint64 `json:"last_id"`
+	Polls          uint64 `json:"polls"`
+	EventsRead     uint64 `json:"events_read"`
+	EvictionGaps   uint64 `json:"eviction_gaps"`
+	EstimatedLost  uint64 `json:"estimated_lost"`
+	SaturatedPages uint64 `json:"saturated_pages"`
 }
 
 // QueryPoller is the secondary volatile-mode fallback reader that polls Genesis
-// GET /query windows over loopback HTTP, explicitly tracking ID eviction gaps.
+// GET /query windows over loopback HTTP, explicitly tracking ID eviction gaps
+// and serializing polls so overlapping calls never duplicate events.
 type QueryPoller struct {
-	mu          sync.Mutex
-	baseURL     string
-	authToken   string
-	client      *http.Client
-	limit       int
+	pollMu           sync.Mutex // serializes fetch-and-commit across concurrent Poll callers
+	mu               sync.Mutex // guards cursor & stats for concurrent Reset/Stats calls
+	baseURL          string
+	authToken        string
+	client           *http.Client
+	limit            int
+	maxResponseBytes int64
+
+	resetGen    uint64
 	initialized bool
 	lastTs      int64
 	lastID      uint64
 
-	polls         uint64
-	eventsRead    uint64
-	evictionGaps  uint64
-	estimatedLost uint64
+	polls          uint64
+	eventsRead     uint64
+	evictionGaps   uint64
+	estimatedLost  uint64
+	saturatedPages uint64
 }
 
 type genesisQueryResponse struct {
@@ -50,26 +69,52 @@ type genesisQueryResponse struct {
 }
 
 // NewQueryPoller initializes a cursor-based poller targeting Genesis's HTTP /query API.
-func NewQueryPoller(baseURL, authToken string, limit int) *QueryPoller {
+// Redirects to non-loopback hosts are rejected unless allowRemote is true.
+func NewQueryPoller(baseURL, authToken string, limit int, allowRemote bool) *QueryPoller {
 	if limit <= 0 || limit > 10000 {
 		limit = 10000
 	}
 	return &QueryPoller{
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		authToken: authToken,
-		limit:     limit,
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		baseURL:          strings.TrimRight(baseURL, "/"),
+		authToken:        authToken,
+		limit:            limit,
+		maxResponseBytes: DefaultMaxQueryResponseBytes,
+		client:           security.NewLoopbackHTTPClient(5*time.Second, allowRemote, false),
 	}
 }
 
-// Poll fetches unseen LogEvents from Genesis starting at the previous timestamp cursor.
-func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
+// SetMaxResponseBytes overrides the response byte limit (primarily for testing).
+func (p *QueryPoller) SetMaxResponseBytes(n int64) {
 	p.mu.Lock()
+	if n > 0 {
+		p.maxResponseBytes = n
+	}
+	p.mu.Unlock()
+}
+
+// Reset clears the in-memory query cursor and increments the reset generation so
+// an in-flight Poll started before Reset cannot restore a pre-burn cursor.
+func (p *QueryPoller) Reset() {
+	p.mu.Lock()
+	p.resetGen++
+	p.initialized = false
+	p.lastTs = 0
+	p.lastID = 0
+	p.mu.Unlock()
+}
+
+// Poll fetches unseen LogEvents from Genesis starting at the previous timestamp cursor.
+// Concurrent Poll calls are serialized so each new ID is delivered and counted once.
+func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
+	p.pollMu.Lock()
+	defer p.pollMu.Unlock()
+
+	p.mu.Lock()
+	gen := p.resetGen
 	startTs := p.lastTs
 	lastID := p.lastID
 	initialized := p.initialized
+	maxBytes := p.maxResponseBytes
 	p.mu.Unlock()
 
 	q := url.Values{}
@@ -99,20 +144,35 @@ func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
 		return nil, fmt.Errorf("genesis /query returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	// Enforce response byte ceiling before JSON decoding so an oversized payload cannot OOM the poller.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read genesis /query response: %w", err)
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("%w (%d bytes limit)", ErrQueryResponseTooLarge, maxBytes)
+	}
+
 	var parsed genesisQueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("decode genesis /query response: %w", err)
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// If Reset() occurred while HTTP request was in flight, discard pre-burn results cleanly.
+	if p.resetGen != gen {
+		return nil, nil
+	}
+
 	p.polls++
 
 	if len(parsed.Logs) == 0 {
 		return nil, nil
 	}
 
-	// Detect eviction or drop gaps using Genesis's monotonic LogEntry.ID counter.
+	// Detect observed eviction or drop gaps using Genesis's monotonic LogEntry.ID counter.
 	if initialized && lastID > 0 {
 		minReturnedID := parsed.Logs[0].ID
 		for _, ev := range parsed.Logs[1:] {
@@ -143,8 +203,8 @@ func (p *QueryPoller) Poll(ctx context.Context) ([]model.LogEvent, error) {
 	}
 
 	if len(parsed.Logs) >= p.limit {
-		// Saturated the 10,000-row query ceiling; record a potential gap warning.
-		p.evictionGaps++
+		// Track full query-page saturation separately from observed ID loss.
+		p.saturatedPages++
 	}
 
 	p.initialized = true
@@ -159,11 +219,12 @@ func (p *QueryPoller) Stats() QueryPollerStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return QueryPollerStats{
-		LastTimestamp: p.lastTs,
-		LastID:        p.lastID,
-		Polls:         p.polls,
-		EventsRead:    p.eventsRead,
-		EvictionGaps:  p.evictionGaps,
-		EstimatedLost: p.estimatedLost,
+		LastTimestamp:  p.lastTs,
+		LastID:         p.lastID,
+		Polls:          p.polls,
+		EventsRead:     p.eventsRead,
+		EvictionGaps:   p.evictionGaps,
+		EstimatedLost:  p.estimatedLost,
+		SaturatedPages: p.saturatedPages,
 	}
 }

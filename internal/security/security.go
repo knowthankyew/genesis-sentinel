@@ -2,11 +2,13 @@ package security
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -101,6 +103,30 @@ func IsLoopbackEndpoint(raw string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// NewLoopbackHTTPClient returns an *http.Client whose CheckRedirect policy enforces
+// the loopback-only invariant on every redirect hop unless allowRemote is true.
+// When blockRedirects is true, all HTTP redirects are rejected outright (e.g., for DELETE /burn).
+func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bool) *http.Client {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if blockRedirects {
+				return fmt.Errorf("redirect to %q blocked by security policy", req.URL.String())
+			}
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if !allowRemote && !IsLoopbackEndpoint(req.URL.String()) {
+				return fmt.Errorf("redirect to non-loopback endpoint %q blocked by loopback policy", req.URL.String())
+			}
+			return nil
+		},
+	}
 }
 
 // SanitizeUntrustedLogText neutralizes chat-template delimiters and unsafe control bytes

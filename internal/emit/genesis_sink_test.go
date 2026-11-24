@@ -17,6 +17,12 @@ func TestShouldIgnoreEventLoopPrevention(t *testing.T) {
 	if !ShouldIgnoreEvent(model.LogEvent{Service: "SENTINEL"}, "sentinel") {
 		t.Fatal("expected case-insensitive sentinel service match to be ignored")
 	}
+	if !ShouldIgnoreEvent(model.LogEvent{Service: "sentinel"}, "custom-alerts") {
+		t.Fatal("expected reserved sentinel service to always be ignored even with custom alertService")
+	}
+	if !ShouldIgnoreEvent(model.LogEvent{Service: "custom-alerts"}, "custom-alerts") {
+		t.Fatal("expected custom alertService to be ignored")
+	}
 	if ShouldIgnoreEvent(model.LogEvent{Service: "sshd"}, "sentinel") {
 		t.Fatal("did not expect sshd to be ignored")
 	}
@@ -29,15 +35,20 @@ func TestGenesisTCPSinkEmitsValidGenesisJSONLine(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	received := make(chan string, 1)
+	type readResult struct {
+		line string
+		err  error
+	}
+	received := make(chan readResult, 1)
 	go func() {
 		conn, acceptErr := ln.Accept()
 		if acceptErr != nil {
+			received <- readResult{err: acceptErr}
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		line, _ := bufio.NewReader(conn).ReadString('\n')
-		received <- line
+		line, readErr := bufio.NewReader(conn).ReadString('\n')
+		received <- readResult{line: line, err: readErr}
 	}()
 
 	sink := NewGenesisTCPSink(ln.Addr().String(), 2*time.Second)
@@ -62,10 +73,13 @@ func TestGenesisTCPSinkEmitsValidGenesisJSONLine(t *testing.T) {
 	}
 
 	select {
-	case line := <-received:
+	case res := <-received:
+		if res.err != nil {
+			t.Fatalf("expected newline-terminated JSON line with nil read error, got err=%v line=%q", res.err, res.line)
+		}
 		var decoded Alert
-		if err := json.Unmarshal([]byte(line), &decoded); err != nil {
-			t.Fatalf("received line not valid JSON: %v (raw=%q)", err, line)
+		if err := json.Unmarshal([]byte(res.line), &decoded); err != nil {
+			t.Fatalf("received line not valid JSON: %v (raw=%q)", err, res.line)
 		}
 		if decoded.Service != "sentinel" || decoded.Level != "ERROR" || decoded.AlertID != "alert-1" {
 			t.Fatalf("unexpected decoded alert: %+v", decoded)
