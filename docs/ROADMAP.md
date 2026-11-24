@@ -5,7 +5,7 @@
 > **Active Base Model Tier**: **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default; `SmolLM2-360M-Instruct` step-up)  
 > **Phase 5 Reasoning Tier**: **Gemma 2 2B IT** (`google/gemma-2-2b-it`)  
 > **Explicitly Excluded**: **BitNet b1.58** (experimental; deferred pending upstream development cycle)  
-> **Status**: 🟢 **PHASE 0 COMPLETE** | 🟡 **PHASE 1 NEXT**  
+> **Status**: 🟢 **PHASES 0–1 COMPLETE** | 🟡 **PHASE 2 NEXT**  
 > **Date**: 2026-11-24
 
 ---
@@ -34,7 +34,7 @@ flowchart LR
 | Phase | Milestone | Primary Deliverables | Target Model Tier | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 0** | **Scaffold & Governance** | Local Git repo, pure-Go stdlib scaffold, domain contracts, loopback & prompt-injection guards, ADRs, Architecture Spec, Roadmap | Contract-only (`SmolLM2` default) | 🟢 **Completed** |
-| **Phase 1** | **Genesis Bridge & Tier 0** | Lossless `.seg` CRC32 tailer + `/query` sliding-window reader, Drain-style template collapser, JSON deterministic rule/IOC engine, Genesis alert sink (`service=sentinel`), `sentinel burn` | None (Pure Go) | ⬜ Planned |
+| **Phase 1** | **Genesis Bridge & Tier 0** | Lossless `.seg` CRC32 tailer + `/query` sliding-window reader, Drain-style template collapser, JSON deterministic rule/IOC engine, Genesis alert sink (`service=sentinel`), `watch`/`scan`/`stats`/`burn` | None (Pure Go) | 🟢 **Completed** |
 | **Phase 2** | **Tier 1 Surprisal Engine** | Log-domain feature extractor + Laplace-LK surprisal scorer (in-process Go engine + optional `surprisal-service` HTTP parity mode), rolling baseline manager, anomaly threshold calibration | None (Information-Theoretic Math) | ⬜ Planned |
 | **Phase 3** | **Tier 2 SmolLM2 Triage & FTaaS Loop** | Curated log triage dataset generator (synthetic + redacted local baselines), FTaaS training integration (`max_length` tuning in `ml`), `sentinel feedback` & `sentinel train`, local SmolLM2 inference client (HTTP / ONNX) | **SmolLM2-135M** (or `SmolLM2-135M-Instruct`) | ⬜ Planned |
 | **Phase 4** | **Hardening, Benchmarks & Ops** | Hostile-log prompt-injection test harness, live replay benchmark (`cmd/sentinel-bench`), empirical metrics & claims audit (`scripts/audit-claims.py`), `launchd`/`systemd` units, optional `all-MiniLM-L6-v2` comparison | SmolLM2 | ⬜ Planned |
@@ -54,7 +54,7 @@ flowchart LR
 
 ---
 
-### Phase 1: Genesis Bridge & Tier 0 Deterministic Engine
+### Phase 1: Genesis Bridge & Tier 0 Deterministic Engine (Completed)
 - **Goal**: Ingest Genesis logs losslessly via `.seg` file tailing, surface all local disk paths transparently to the operator, and collapse repetitive noise before statistical or ML scoring.
 - **Starter Log Target Tracks (Locked In)**:
   - **Track A (Synthetic Attack & Noise Replay Corpus):** Deterministic generator emitting normal web/cron/system noise interleaved with realistic SSH brute-force, HTTP SQLi/path-traversal/scanner probes, high-entropy DNS/outbound exfil bursts, and `sudo`/privilege-escalation anomalies—giving reproducible CI tests and Phase 4 benchmarks.
@@ -141,8 +141,8 @@ Based on a scan of the local Hugging Face cache (`~/.cache/huggingface/hub`):
 | Model | Local Cache Status | Approx. Size / RAM | Recommendation for Sentinel |
 | :--- | :--- | :--- | :--- |
 | **`HuggingFaceTB/SmolLM2-135M`** | ✅ Cached locally | ~270 MB / ~310 MB RAM | **Ready immediately (zero download, already registered in `ml`).** Note: this is the *base* (non-instruct) checkpoint—works well once LoRA-tuned on tight structured prompts, though base completions ramble before fine-tuning. |
-| **`HuggingFaceTB/SmolLM2-135M-Instruct`** | ⬜ Not cached | ~270 MB / ~310 MB RAM | **Recommended optional pull for Phase 3.** Same speed & Apache 2.0 license as base 135M, but instruction-tuned with ChatML so zero-shot triage, JSON/tag adherence, and base-vs-tuned comparisons are noticeably cleaner. |
-| **`HuggingFaceTB/SmolLM2-360M-Instruct`** | ⬜ Not cached | ~720 MB / ~800 MB RAM | **Strong middle-ground option** if 135M struggles with multi-line log syntax (HTTP/SQL/shell obfuscation) before jumping to Gemma 2B. |
+| **`HuggingFaceTB/SmolLM2-135M-Instruct`** | ✅ Cached locally (`257 MB`) | ~270 MB / ~310 MB RAM | **Active Phase 3 default.** Instruction-tuned ChatML checkpoint for clean structured triage tags and base-vs-tuned comparisons. |
+| **`HuggingFaceTB/SmolLM2-360M-Instruct`** | ✅ Cached locally (`690 MB`) | ~720 MB / ~800 MB RAM | **Active Smol step-up option** if 135M struggles with complex obfuscated HTTP/SQL/shell payloads before moving to Gemma 2B. |
 | **`google/gemma-2-2b-it`** | ✅ Cached locally | ~5.2 GB / ~5.6 GB CPU RAM | **Ready for Phase 5.** Hold until the full pipeline and datasets are proven on Smol. |
 | **`sentence-transformers/all-MiniLM-L6-v2`** | ✅ Cached locally | ~90 MB RAM | **Optional Phase 4 experiment** for semantic template novelty alongside Laplace-LK surprisal. |
 | **`microsoft/BitNet-*`** | ✅ Cached locally | — | **Excluded** per ADR-5 (experimental). |

@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0-phase1] - 2026-11-24
+
+### Added
+- **Genesis Ingestion Bridge (`internal/ingest`):** Read-only lossless follower for Genesis `--data-dir` CRC32 `.seg` files (`segreader.go`) with atomic cursor persistence (`cursor.json`), rotation handling, partial-write waiting, corrupted-tail recovery, and `genesis burn` rewind detection; secondary `/query` fallback poller (`querypoller.go`) tracking monotonic ID eviction gaps; Genesis-compatible multi-format parser (`parser.go`); and Track A deterministic synthetic attack/noise corpus generator (`synthetic.go`).
+- **Tier 0 Template Collapse & Deterministic Rules (`internal/template`, `internal/rules`):** Bounded pure-Go Drain-style prefix-tree template collapser (`DefaultMaxClusters = 4096`) with linear ASCII token masking and peak Shannon entropy tracking; precompiled RE2 rule engine (`rules.json` or built-in starter pack `SENT-001`..`SENT-008`) with operator allowlist suppressions.
+- **Alert Sink & Phase 1 Pipeline (`internal/emit`, `internal/pipeline`):** Loopback TCP JSONL alert sink emitting alerts back into Genesis under `service=sentinel` (mapping `CRITICAL`/`HIGH` to Genesis `FATAL`/`ERROR` priority lanes) with strict self-alert loop prevention, HTTP `/healthz` + `/stats` + `DELETE /burn`, and local disk state burn.
+- **Phase 1 CLI (`internal/cli`):** Implemented `sentinel watch`, `sentinel scan` (`--seg-dir`, `--file`, `--synthetic`), `sentinel stats`, and `sentinel burn -y`.
+
+---
+
 ## [0.1.0-scaffold] - 2026-11-24
 
 ### Added

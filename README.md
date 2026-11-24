@@ -3,11 +3,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg)](go.mod)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
-[![Stage: Phase 0 Scaffold](https://img.shields.io/badge/Stage-Phase%200%20Scaffold-yellow.svg)](docs/ROADMAP.md)
+[![Stage: Phase 1 Complete](https://img.shields.io/badge/Stage-Phase%201%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
 **Genesis Sentinel** is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
 
-> **Current Status (Phase 0 Scaffold):** The core CLI, configuration loader, domain contracts, fail-closed model allowlist, loopback/auth guards, untrusted-log sanitizer, architecture specification, ADRs, and execution roadmap are implemented and unit-tested. Live ingestion, surprisal scoring, and SmolLM2 triage pipelines begin in Phases 1–3; see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Current Status (Phase 1 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, `service=sentinel` loopback alert sink, and `watch` / `scan` / `stats` / `burn` / `data` / `config` commands are implemented and race-tested. Tier 1 Laplace-LK log surprisal (Phase 2) and Tier 2 SmolLM2-Instruct LoRA triage (Phase 3) are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 
@@ -63,22 +63,28 @@ Commands:
   help      Show help for Genesis Sentinel
 ```
 
-### Phase 0 Commands Available Today
+### Quickstart (Phase 1 Commands)
 
 ```bash
 # Build the pure-Go binary
 make build
 
-# Print version
-./bin/sentinel version
+# Run an offline 100,000-line Track A synthetic .seg replay scan
+./bin/sentinel scan --synthetic 100000
 
-# Validate and inspect resolved configuration (with auth tokens redacted)
-./bin/sentinel config
+# Watch a live Genesis instance in lossless .seg mode and emit alerts back to Genesis
+./bin/sentinel watch --genesis-data-dir /path/to/genesis-segs --genesis-tcp 127.0.0.1:9000
+
+# Inspect live Sentinel stats
+./bin/sentinel stats
 
 # Inspect or open Sentinel's local data directory without hunting for hidden folders
 ./bin/sentinel data path
 ./bin/sentinel data status
 ./bin/sentinel data open
+
+# Purge Sentinel local state (cursors, baselines, unexported feedback queues)
+./bin/sentinel burn -y
 ```
 
 ---

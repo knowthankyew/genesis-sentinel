@@ -15,7 +15,7 @@ import (
 )
 
 // Version identifies the current Genesis Sentinel release stage.
-const Version = "0.1.0-scaffold"
+const Version = "0.2.0-phase1"
 
 // openDirFn launches the OS file manager for `sentinel data open` (overridable in tests).
 var openDirFn = openDirectoryOS
@@ -35,17 +35,17 @@ func ExecuteWithOutput(args []string, stdout, stderr io.Writer) error {
 	cmd := args[0]
 	switch cmd {
 	case "watch":
-		return notImplemented("watch", "Phase 1 (Genesis Bridge & Tier 0 Deterministic Engine)")
+		return runWatch(args[1:], stdout, stderr)
 	case "scan":
-		return notImplemented("scan", "Phase 1/2 (Batch Segment Scan & Laplace-LK Surprisal)")
+		return runScan(args[1:], stdout, stderr)
 	case "feedback":
 		return notImplemented("feedback", "Phase 3 (Redacted Feedback Curation for FTaaS)")
 	case "train":
 		return notImplemented("train", "Phase 3 (Async SmolLM2-Instruct LoRA Job Submission to FTaaS)")
 	case "stats":
-		return notImplemented("stats", "Phase 1 (Sentinel Pipeline Metrics)")
+		return runStats(args[1:], stdout, stderr)
 	case "burn":
-		return notImplemented("burn", "Phase 1 (Amnesiac State & Feedback Purge)")
+		return runBurn(args[1:], stdout, stderr)
 	case "data":
 		return runData(args[1:], stdout, stderr)
 	case "config":
@@ -192,12 +192,12 @@ Usage:
   sentinel [command] [flags]
 
 Commands:
-  watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2 (Phase 1+)
-  scan      Run an offline scan over Genesis .seg files or JSONL exports (Phase 1+)
+  watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2
+  scan      Run an offline scan over Genesis .seg files, raw log files, or synthetic replay
   feedback  Label alerts as true/false positives and export redacted JSONL (Phase 3)
   train     Submit a redacted feedback dataset to local FTaaS (SmolLM2-Instruct) (Phase 3)
-  stats     Display live pipeline throughput, surprisal, and alert metrics (Phase 1+)
-  burn      Purge Sentinel disk state, baselines, and unexported local queues (Phase 1+)
+  stats     Display live pipeline throughput, surprisal, and alert metrics
+  burn      Purge Sentinel disk state, baselines, and unexported local queues
   data      Inspect or open Sentinel's local data directory (path | status | open)
   config    Validate and print the resolved Sentinel configuration
   version   Print the Genesis Sentinel version

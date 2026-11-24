@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,13 +52,84 @@ func TestExecuteConfigRedactsTokens(t *testing.T) {
 	}
 }
 
-func TestExecuteUnknownCommandAndStubs(t *testing.T) {
+func TestExecuteUnknownCommandAndPhase3Stubs(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	if err := ExecuteWithOutput([]string{"bogus"}, &out, &errBuf); err == nil {
 		t.Fatal("expected error for unknown command")
 	}
-	if err := ExecuteWithOutput([]string{"watch"}, &out, &errBuf); err == nil {
-		t.Fatal("expected roadmap phase stub error for watch in Phase 0")
+	if err := ExecuteWithOutput([]string{"train"}, &out, &errBuf); err == nil {
+		t.Fatal("expected Phase 3 roadmap stub error for train")
+	}
+	if err := ExecuteWithOutput([]string{"feedback"}, &out, &errBuf); err == nil {
+		t.Fatal("expected Phase 3 roadmap stub error for feedback")
+	}
+}
+
+func TestExecuteScanSyntheticJSON(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"scan", "--synthetic", "5000", "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("scan --synthetic failed: %v (stderr=%s)", err, errBuf.String())
+	}
+
+	var rep ScanReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode scan JSON: %v", err)
+	}
+	if rep.LinesRead != 5000 {
+		t.Fatalf("LinesRead = %d, want 5000", rep.LinesRead)
+	}
+	if rep.AlertsEmitted < 6 {
+		t.Fatalf("expected >= 6 alerts covering all starter classes, got %d", rep.AlertsEmitted)
+	}
+	if rep.CollapseRatio < 100 {
+		t.Fatalf("expected strong collapse ratio (>100x), got %.2f", rep.CollapseRatio)
+	}
+}
+
+func TestExecuteStatsAndBurn(t *testing.T) {
+	// Test `sentinel stats` against loopback httptest server
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/stats" && r.Header.Get("Authorization") == "Bearer tok-stat" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"lines_read":1234,"alerts_emitted":2}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"stats", "--http", srv.URL, "--auth-token", "tok-stat"}, &out, &errBuf); err != nil {
+		t.Fatalf("stats command failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"lines_read": 1234`) {
+		t.Fatalf("unexpected stats output: %s", out.String())
+	}
+
+	// Test `sentinel burn` requires -y, then purges local state cleanly
+	tmp := filepath.Join(t.TempDir(), ".genesis-sentinel")
+	t.Setenv("SENTINEL_DATA_DIR", tmp)
+	if err := os.MkdirAll(tmp, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "cursor.json"), []byte(`{"segment_id":2}`), 0600); err != nil {
+		t.Fatalf("write cursor: %v", err)
+	}
+
+	out.Reset()
+	if err := ExecuteWithOutput([]string{"burn"}, &out, &errBuf); err == nil {
+		t.Fatal("expected burn without -y to fail")
+	}
+
+	out.Reset()
+	if err := ExecuteWithOutput([]string{"burn", "-y"}, &out, &errBuf); err != nil {
+		t.Fatalf("burn -y failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"status": "burned"`) {
+		t.Fatalf("unexpected burn output: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "cursor.json")); !os.IsNotExist(err) {
+		t.Fatal("cursor.json survived burn -y")
 	}
 }
 
