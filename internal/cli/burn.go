@@ -71,8 +71,9 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 		}
 
 		var daemonRep *pipeline.BurnReport
-		if err := json.Unmarshal(body, &daemonRep); err != nil || daemonRep == nil || strings.TrimSpace(daemonRep.Status) == "" {
-			return fmt.Errorf("DELETE %s/burn returned invalid BurnReport (body: %s)", target, escapeForTerminal(strings.TrimSpace(string(body))))
+		if err := json.Unmarshal(body, &daemonRep); err != nil || daemonRep == nil ||
+			daemonRep.Status != "burned" || strings.TrimSpace(daemonRep.DataDir) == "" || daemonRep.Timestamp.IsZero() {
+			return fmt.Errorf("DELETE %s/burn did not return a valid completed BurnReport (body: %s)", target, escapeForTerminal(strings.TrimSpace(string(body))))
 		}
 
 		// If the daemon purged a different data_dir than our locally configured cfg.DataDir,

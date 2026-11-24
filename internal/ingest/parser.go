@@ -556,21 +556,22 @@ func parseSyslogRFC3164Bounded(id uint64, rest []byte, level, defaultService str
 	}
 
 	now := time.Now()
-	ts := now.Unix()
 	t, tsErr := time.ParseInLocation("Jan _2 15:04:05", s[:15], now.Location())
 	if tsErr != nil {
 		if rawLen > maxLineLen {
 			return model.LogEvent{}, ErrOversizedLine
 		}
-	} else {
-		// RFC 3164 omits year: infer current year, rolling back to now.Year()-1 if the
-		// inferred timestamp falls more than 24h in the future (e.g. Dec 31 log read on Jan 1).
-		inferred := time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
-		if inferred.After(now.Add(24 * time.Hour)) {
-			inferred = time.Date(now.Year()-1, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
-		}
-		ts = inferred.Unix()
+		ev := parsePlainText(id, rest, defaultService)
+		ev.Level = level
+		return ev, nil
 	}
+	// RFC 3164 omits year: infer current year, rolling back to now.Year()-1 if the
+	// inferred timestamp falls more than 24h in the future (e.g. Dec 31 log read on Jan 1).
+	inferred := time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
+	if inferred.After(now.Add(24 * time.Hour)) {
+		inferred = time.Date(now.Year()-1, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
+	}
+	ts := inferred.Unix()
 
 	remainder := strings.TrimSpace(s[15:])
 	service := defaultService

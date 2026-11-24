@@ -496,8 +496,11 @@ func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int
 				remaining = append(remaining, cand)
 				continue
 			}
-			payloadEst := cand.needSize - cand.offset - MagicHeaderLen
-			if budget.recoveryExhausted() || (payloadEst > budget.recoveryChecksumRemaining && budget.recoveryChecksumsRun > 0) {
+			readEst := cand.needSize - cand.offset
+			payloadEst := readEst - MagicHeaderLen
+			if budget.recoveryExhausted() ||
+				(readEst > budget.recoveryReadRemaining && budget.recoveryReadsRun > 0) ||
+				(payloadEst > budget.recoveryChecksumRemaining && budget.recoveryChecksumsRun > 0) {
 				// Budget exhausted: preserve unchecked candidates for the next poll.
 				remaining = append(remaining, r.pendingCandidates[i:]...)
 				r.pendingCandidates = remaining
@@ -743,11 +746,11 @@ func findNextValidFrameBounded(f *os.File, startOff, endOffExclusive, fileSize i
 	if limit < startOff {
 		return 0, startOff, 0, false, false, nil, nil, nil
 	}
-	if budget.recoveryReadRemaining <= 0 && budget.recoveryReadsRun > 0 {
-		return 0, startOff, 0, false, true, nil, nil, nil
-	}
 	scanSpan := (limit - startOff) + 1
 	scanWindowSize := int(min(fileSize-startOff, scanSpan+MaxFrameBytes+MagicHeaderLen))
+	if int64(scanWindowSize) > budget.recoveryReadRemaining && budget.recoveryReadsRun > 0 {
+		return 0, startOff, 0, false, true, nil, nil, nil
+	}
 	buf := make([]byte, scanWindowSize)
 	n, readErr := f.ReadAt(buf, startOff)
 	if readErr != nil && !isEOFError(readErr) {

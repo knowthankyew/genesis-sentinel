@@ -154,6 +154,11 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	if err != nil || ev.Service != "sentinel" || ev.Message != "alert payload" {
 		t.Fatalf("RFC 3164 small maxLineLen=32 lost service=sentinel: ev=%+v err=%v", ev, err)
 	}
+	// Invalid RFC 3164 timestamp on a short record must preserve full message with PRI severity (not drop 15 bytes)
+	ev, err = ParseRawLog(528, []byte(`<34>application says startup failed`), 0, "genesis")
+	if err != nil || ev.Service != "genesis" || ev.Level != "FATAL" || ev.Message != "application says startup failed" {
+		t.Fatalf("invalid RFC 3164 timestamp mangled short message: ev=%+v err=%v", ev, err)
+	}
 	// Whitespace-only input must return ErrEmptyInput instead of plain-text INFO event
 	if _, err := ParseRawLog(523, []byte("    \t   "), 0, "genesis"); !errors.Is(err, ErrEmptyInput) {
 		t.Fatalf("expected ErrEmptyInput for whitespace-only line, got %v", err)
@@ -714,33 +719,40 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	// 6. Burn replacement when cursor is on segment 2 and both segments 1 and 2 are recreated rewinds to segment 1.
 	segDir6 := t.TempDir()
 	cursor6 := filepath.Join(t.TempDir(), "c6.json")
-	f61, _ := os.Create(filepath.Join(segDir6, "00000001.seg"))
-	_ = WriteSegmentFrame(f61, []byte(`{"timestamp":900,"service":"api","level":"INFO","message":"old-seg1"}`))
-	_ = f61.Close()
-	f62, _ := os.Create(filepath.Join(segDir6, "00000002.seg"))
-	_ = WriteSegmentFrame(f62, []byte(`{"timestamp":901,"service":"api","level":"INFO","message":"old-seg2"}`))
-	_ = f62.Close()
+	writeSegmentFixture(t, filepath.Join(segDir6, "00000001.seg"), []byte(`{"timestamp":900,"service":"api","level":"INFO","message":"old-seg1"}`))
+	writeSegmentFixture(t, filepath.Join(segDir6, "00000002.seg"), []byte(`{"timestamp":901,"service":"api","level":"INFO","message":"old-seg2"}`))
 
-	r6, _ := NewSegReader(segDir6, cursor6, 0)
+	r6, err := NewSegReader(segDir6, cursor6, 0)
+	if err != nil {
+		t.Fatalf("NewSegReader seg6: %v", err)
+	}
 	if b, err := r6.ReadBatch(10); err != nil || len(b) != 2 {
 		t.Fatalf("seg6 initial read: len=%d err=%v", len(b), err)
 	}
-	_ = r6.SaveCursor()
+	if err := r6.SaveCursor(); err != nil {
+		t.Fatalf("SaveCursor seg6: %v", err)
+	}
 
 	// Recreate both 00000001.seg and 00000002.seg with brand-new content (simulating `genesis burn` + rapid rotation)
-	_ = os.Remove(filepath.Join(segDir6, "00000001.seg"))
-	_ = os.Remove(filepath.Join(segDir6, "00000002.seg"))
-	f61New, _ := os.Create(filepath.Join(segDir6, "00000001.seg"))
-	_ = WriteSegmentFrame(f61New, []byte(`{"timestamp":950,"service":"api","level":"INFO","message":"new-seg1-after-burn"}`))
-	_ = f61New.Close()
-	f62New, _ := os.Create(filepath.Join(segDir6, "00000002.seg"))
-	_ = WriteSegmentFrame(f62New, []byte(`{"timestamp":951,"service":"api","level":"INFO","message":"new-seg2-after-burn-with-extra-padding-to-exceed-old-offset"}`))
-	_ = f62New.Close()
+	if err := os.Remove(filepath.Join(segDir6, "00000001.seg")); err != nil {
+		t.Fatalf("remove old seg1: %v", err)
+	}
+	if err := os.Remove(filepath.Join(segDir6, "00000002.seg")); err != nil {
+		t.Fatalf("remove old seg2: %v", err)
+	}
+	writeSegmentFixture(t, filepath.Join(segDir6, "00000001.seg"), []byte(`{"timestamp":950,"service":"api","level":"INFO","message":"new-seg1-after-burn"}`))
+	writeSegmentFixture(t, filepath.Join(segDir6, "00000002.seg"), []byte(`{"timestamp":951,"service":"api","level":"INFO","message":"new-seg2-after-burn-with-extra-padding-to-exceed-old-offset"}`))
 
-	r6Resume, _ := NewSegReader(segDir6, cursor6, 0)
+	r6Resume, err := NewSegReader(segDir6, cursor6, 0)
+	if err != nil {
+		t.Fatalf("NewSegReader seg6 resume: %v", err)
+	}
 	bRewind, err := r6Resume.ReadBatch(10)
 	if err != nil || len(bRewind) != 2 || bRewind[0].Message != "new-seg1-after-burn" || !strings.HasPrefix(bRewind[1].Message, "new-seg2-after-burn") {
 		t.Fatalf("burn replacement on seg2 failed to rewind to new seg1: got %+v err=%v", bRewind, err)
+	}
+	if r6Resume.Stats().BurnResets != 1 {
+		t.Fatalf("expected BurnResets=1 after burn rewind from seg2 to seg1, got %d", r6Resume.Stats().BurnResets)
 	}
 
 	// 7. Discarded incomplete candidate checkpoint revisits dropped genuine in-flight frame after growth.

@@ -111,6 +111,7 @@ type TemplateWindow struct {
 	TemplateID                 string    `json:"template_id"`
 	Template                   string    `json:"template"`
 	Service                    string    `json:"service"`
+	ServiceTruncated           bool      `json:"service_truncated,omitempty"`
 	Level                      string    `json:"level"`
 	Count                      uint64    `json:"count"`
 	FirstSeenUnix              int64     `json:"first_seen_unix"`

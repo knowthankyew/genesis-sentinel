@@ -190,8 +190,15 @@ func NewEngine(pack RulePack) (*Engine, error) {
 		if _, dup := seenIDs[id]; dup {
 			return nil, fmt.Errorf("duplicate enabled rule id %q", id)
 		}
+		sev := strings.ToUpper(strings.TrimSpace(r.Severity))
+		switch sev {
+		case "LOW", "MEDIUM", "HIGH", "CRITICAL":
+		default:
+			return nil, fmt.Errorf("rule %q has invalid severity %q (accepted: LOW, MEDIUM, HIGH, CRITICAL)", id, r.Severity)
+		}
 		seenIDs[id] = struct{}{}
 		r.ID = id
+		r.Severity = sev
 		cr := compiledRule{rule: r}
 		if r.Pattern != "" {
 			re, err := regexp.Compile(r.Pattern)
@@ -431,7 +438,7 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 
 	var activeSamples []previewSample
 	for _, cand := range rawCandidates {
-		if !cand.truncated && e.isSamplePatternSuppressed(w.Service, w.Template, cand.text) {
+		if !cand.truncated && e.isSamplePatternSuppressed(w.Service, w.ServiceTruncated, w.Template, cand.text) {
 			continue
 		}
 		activeSamples = append(activeSamples, cand)
@@ -508,7 +515,7 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	svcLower := strings.ToLower(w.Service)
 	lvlUpper := strings.ToUpper(w.Level)
 	noSuppressedSamples := len(activeSamples) == len(rawCandidates)
-	hasPatternSup := e.hasApplicablePatternSuppression(w.Service, w.Template)
+	hasPatternSup := e.hasApplicablePatternSuppression(w.Service, w.ServiceTruncated, w.Template)
 
 	for _, cr := range e.rules {
 		// In preview-only mode, filter by window display Service/Level selectors.
@@ -595,11 +602,15 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 		if !res.InjectionSuspected && matchedSample != "" && matchedSample != primarySample {
 			res.SanitizedSample, _ = security.SanitizeUntrustedLogText(matchedSample, maxPromptBytes)
 		}
+		desc := cr.rule.Description
+		if cr.rule.ID == "SENT-008" && (w.Template == "<OVERFLOW>" || strings.HasPrefix(w.TemplateID, "overflow:")) {
+			desc = "Sustained overflow-wide ERROR volume spike across multiple templates"
+		}
 		res.RuleHits = append(res.RuleHits, model.RuleHit{
 			RuleID:      cr.rule.ID,
 			Category:    cr.rule.Category,
 			Severity:    cr.rule.Severity,
-			Description: cr.rule.Description,
+			Description: desc,
 		})
 	}
 
@@ -621,12 +632,14 @@ func (e *Engine) isGlobalTemplateSuppressed(tmpl string) bool {
 	return false
 }
 
-func (e *Engine) hasApplicablePatternSuppression(service, tmpl string) bool {
+func (e *Engine) hasApplicablePatternSuppression(service string, serviceTruncated bool, tmpl string) bool {
 	for _, cs := range e.suppressions {
 		if cs.re == nil {
 			continue
 		}
-		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
+		// When service display identity is truncated, a service-scoped pattern suppression
+		// might still match the true untruncated service, so conservatively treat it as applicable.
+		if cs.supp.Service != "" && !serviceTruncated && !strings.EqualFold(cs.supp.Service, service) {
 			continue
 		}
 		if cs.supp.Template != "" && cs.supp.Template != tmpl {
@@ -642,8 +655,10 @@ func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {
 		if cs.re != nil {
 			continue // message-pattern suppressions are checked per sample, not blindly across the whole window
 		}
-		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, w.Service) {
-			continue
+		if cs.supp.Service != "" {
+			if w.ServiceTruncated || !strings.EqualFold(cs.supp.Service, w.Service) {
+				continue
+			}
 		}
 		if cs.supp.Template != "" && cs.supp.Template != w.Template {
 			continue
@@ -653,13 +668,15 @@ func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {
 	return false
 }
 
-func (e *Engine) isSamplePatternSuppressed(service, tmpl, sample string) bool {
+func (e *Engine) isSamplePatternSuppressed(service string, serviceTruncated bool, tmpl, sample string) bool {
 	for _, cs := range e.suppressions {
 		if cs.re == nil {
 			continue
 		}
-		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
-			continue
+		if cs.supp.Service != "" {
+			if serviceTruncated || !strings.EqualFold(cs.supp.Service, service) {
+				continue
+			}
 		}
 		if cs.supp.Template != "" && cs.supp.Template != tmpl {
 			continue

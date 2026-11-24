@@ -196,7 +196,9 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 	if err := aggBytes.SetMaxClusterBytes(4096); err != nil {
 		t.Fatalf("SetMaxClusterBytes(4096): %v", err)
 	}
-	aggBytes.SetSampleByteLimits(8192, 2048, 512)
+	if err := aggBytes.SetSampleByteLimits(8192, 2048, 512); err != nil {
+		t.Fatalf("SetSampleByteLimits: %v", err)
+	}
 	bigLine := strings.Repeat("A", 65536)
 	for i := 0; i < 100; i++ {
 		aggBytes.Add(model.LogEvent{
@@ -243,42 +245,49 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 		t.Fatalf("expected SetMaxClusterBytes(4) to fail when ClusterBytes()=%d", nanMiner.ClusterBytes())
 	}
 
-	// 5. Rejected cluster rolls back newly created tree keys & bytes so subsequent small messages still fit.
+	// 5. Rejected cluster rolls back newly created tree keys & bytes so subsequent small messages still fit
+	// (cluster cost includes the 16-byte cluster ID, so "a" needs 1 key + 1 token + 16 ID = 18 bytes).
 	rbMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
-	if err := rbMiner.SetMaxClusterBytes(12); err != nil {
-		t.Fatalf("SetMaxClusterBytes(12): %v", err)
+	if err := rbMiner.SetMaxClusterBytes(24); err != nil {
+		t.Fatalf("SetMaxClusterBytes(24): %v", err)
 	}
 	_, _, rejectedOv := rbMiner.ExtractTemplate("", "", "abcdefgh xyz")
 	if !rejectedOv || rbMiner.ClusterBytes() != 0 {
 		t.Fatalf("expected rejected cluster to roll back tree bytes to 0, got ov=%v bytes=%d", rejectedOv, rbMiner.ClusterBytes())
 	}
 	_, _, smallOv := rbMiner.ExtractTemplate("", "", "a")
-	if smallOv || rbMiner.ClusterCount() != 1 {
-		t.Fatalf("small message failed after rolled-back cluster rejection: ov=%v count=%d", smallOv, rbMiner.ClusterCount())
+	if smallOv || rbMiner.ClusterCount() != 1 || rbMiner.ClusterBytes() != 18 {
+		t.Fatalf("small message failed after rolled-back cluster rejection: ov=%v count=%d bytes=%d", smallOv, rbMiner.ClusterCount(), rbMiner.ClusterBytes())
 	}
 
-	// 6. Generalization checks byte cap BEFORE mutating cluster tokens.
+	// 6. Generalization checks byte cap BEFORE mutating cluster tokens (2 keys + 4 tokens + 16 ID = 22 bytes).
 	genMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
-	if err := genMiner.SetMaxClusterBytes(6); err != nil {
-		t.Fatalf("SetMaxClusterBytes(6): %v", err)
+	if err := genMiner.SetMaxClusterBytes(22); err != nil {
+		t.Fatalf("SetMaxClusterBytes(22): %v", err)
 	}
 	_, _, g1Ov := genMiner.ExtractTemplate("", "", "x y a b")
-	if g1Ov || genMiner.ClusterBytes() != 6 {
-		t.Fatalf("expected initial cluster to fit in 6 bytes, got ov=%v bytes=%d", g1Ov, genMiner.ClusterBytes())
+	if g1Ov || genMiner.ClusterBytes() != 22 {
+		t.Fatalf("expected initial cluster to fit in 22 bytes (incl. 16-byte ID), got ov=%v bytes=%d", g1Ov, genMiner.ClusterBytes())
 	}
 	_, _, g2Ov := genMiner.ExtractTemplate("", "", "x y c d")
-	if !g2Ov || genMiner.ClusterBytes() != 6 {
-		t.Fatalf("expected generalization exceeding 6-byte cap to overflow without mutating cluster, got ov=%v bytes=%d", g2Ov, genMiner.ClusterBytes())
+	if !g2Ov || genMiner.ClusterBytes() != 22 {
+		t.Fatalf("expected generalization exceeding 22-byte cap to overflow without mutating cluster, got ov=%v bytes=%d", g2Ov, genMiner.ClusterBytes())
 	}
 
-	// 7. Promoted preview is removed from AdditionalSamples and service/level window identities are bounded.
+	// 7. Promoted preview preserves complete metadata when an equal clipped preview is promoted,
+	// rejects incompatible SetSampleByteLimits reductions, and bounds window display Service/Level.
 	promoAgg := NewAggregator(8)
-	promoAgg.SetSampleByteLimits(1024, 1024, 6)
+	if err := promoAgg.SetSampleByteLimits(1024, 1024, 6); err != nil {
+		t.Fatalf("SetSampleByteLimits: %v", err)
+	}
 	longSvc := strings.Repeat("S", 1024)
 	longLvl := strings.Repeat("L", 512)
 	promoAgg.Add(model.LogEvent{ID: 1, Timestamp: 1, Service: longSvc, Level: longLvl, Message: "k v x1y2z3w4"}) // mid entropy -> SampleLine="k v x1"
-	promoAgg.Add(model.LogEvent{ID: 2, Timestamp: 2, Service: longSvc, Level: longLvl, Message: "k v ab"})       // lower entropy -> AdditionalSamples=["k v ab"]
+	promoAgg.Add(model.LogEvent{ID: 2, Timestamp: 2, Service: longSvc, Level: longLvl, Message: "k v ab"})       // complete -> AdditionalSamples=["k v ab"]
 	promoAgg.Add(model.LogEvent{ID: 3, Timestamp: 3, Service: longSvc, Level: longLvl, Message: "k v ab0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+	if err := promoAgg.SetSampleByteLimits(2, 2, 2); err == nil {
+		t.Fatal("expected SetSampleByteLimits(2, 2, 2) to fail while active window retains 12 bytes")
+	}
 	if got := promoAgg.RetainedSampleBytes(); got != 12 {
 		t.Fatalf("expected RetainedSampleBytes=12 after promotion dedup (6+6), got %d", got)
 	}
@@ -286,11 +295,11 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 	if len(promoWins) != 1 {
 		t.Fatalf("expected 1 window, got %d", len(promoWins))
 	}
-	if len(promoWins[0].Service) > maxWindowServiceBytes || len(promoWins[0].Level) > maxWindowLevelBytes {
-		t.Fatalf("window display Service/Level exceeded caps: len(svc)=%d len(lvl)=%d", len(promoWins[0].Service), len(promoWins[0].Level))
+	if len(promoWins[0].Service) > maxWindowServiceBytes || len(promoWins[0].Level) > maxWindowLevelBytes || !promoWins[0].ServiceTruncated {
+		t.Fatalf("window display Service/Level caps or ServiceTruncated wrong: len(svc)=%d len(lvl)=%d trunc=%v", len(promoWins[0].Service), len(promoWins[0].Level), promoWins[0].ServiceTruncated)
 	}
-	if promoWins[0].SampleLine != "k v ab" {
-		t.Fatalf("expected promoted SampleLine=%q, got %q", "k v ab", promoWins[0].SampleLine)
+	if promoWins[0].SampleLine != "k v ab" || promoWins[0].SampleTruncated {
+		t.Fatalf("expected promoted complete SampleLine=%q with SampleTruncated=false, got %q trunc=%v", "k v ab", promoWins[0].SampleLine, promoWins[0].SampleTruncated)
 	}
 	for _, extra := range promoWins[0].AdditionalSamples {
 		if extra == "k v ab" {

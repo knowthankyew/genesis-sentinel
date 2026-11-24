@@ -421,7 +421,7 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 		t.Fatal("expected NewEngine to reject reserved rule ID SENT-006")
 	}
 
-	// Exact counts fire SENT-008 even on a <MIXED> global overflow window
+	// Exact counts fire SENT-008 with overflow-wide description on a <MIXED> global overflow window
 	mixedOvExact := defEng.EvaluateWithMatchCounts(model.TemplateWindow{
 		Service:  "<MIXED>",
 		Level:    "<MIXED>",
@@ -432,6 +432,9 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	for _, h := range mixedOvExact.RuleHits {
 		if h.RuleID == "SENT-008" {
 			foundSent008Mixed = true
+			if !strings.Contains(strings.ToLower(h.Description), "overflow-wide") {
+				t.Fatalf("expected SENT-008 overflow alert description to label overflow-wide spike, got %q", h.Description)
+			}
 		}
 	}
 	if !foundSent008Mixed {
@@ -587,5 +590,31 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 		if h.RuleID == "SENT-005" {
 			t.Fatalf("clipped preview falsely confirmed SENT-005 entropy hit: %+v", resClipEnt.RuleHits)
 		}
+	}
+
+	// Reject enabled custom rules with empty or invalid severity values
+	if _, err := NewEngine(RulePack{
+		Version: "1.0",
+		Rules:   []Rule{{ID: "BAD-SEV", Category: "test", Severity: "HGIH", Pattern: "foo", Enabled: true}},
+	}); err == nil {
+		t.Fatal("expected NewEngine to reject invalid rule severity 'HGIH'")
+	}
+	if _, err := NewEngine(RulePack{
+		Version: "1.0",
+		Rules:   []Rule{{ID: "EMPTY-SEV", Category: "test", Severity: "", Pattern: "foo", Enabled: true}},
+	}); err == nil {
+		t.Fatal("expected NewEngine to reject empty rule severity")
+	}
+
+	// Standalone Evaluate must NOT apply service-scoped suppression when ServiceTruncated is true
+	resClipSvcStandalone := svcSupEng.Evaluate(model.TemplateWindow{
+		Service:          svc128,
+		ServiceTruncated: true,
+		Level:            "WARN",
+		Count:            1,
+		SampleLine:       "GET /../../etc/passwd HTTP/1.1 403",
+	}, 1024)
+	if resClipSvcStandalone.Suppressed || len(resClipSvcStandalone.RuleHits) == 0 {
+		t.Fatalf("standalone Evaluate wrongly suppressed truncated service display name: %+v", resClipSvcStandalone)
 	}
 }

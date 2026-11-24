@@ -238,8 +238,8 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 		p.pendingHits[key] = bucket
 	}
 
-	if ev.Timestamp > bucket.lastSeenUnix {
-		bucket.lastSeenUnix = ev.Timestamp
+	if evTS := normalizeAlertTimestamp(ev.Timestamp, 0); evTS > bucket.lastSeenUnix {
+		bucket.lastSeenUnix = evTS
 	}
 	if evEval.InjectionSuspected {
 		bucket.injSuspected = true
@@ -608,7 +608,7 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 			return
 		}
 		sz := fi.Size()
-		if remErr := r.Remove(rel); remErr != nil {
+		if remErr := unlinkFileInRoot(r, rel); remErr != nil {
 			if !os.IsNotExist(remErr) {
 				errs = append(errs, fmt.Errorf("remove %q: %w", rel, remErr))
 			}

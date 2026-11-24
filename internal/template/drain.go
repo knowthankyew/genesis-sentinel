@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -311,7 +312,9 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 		return best.id, strings.Join(best.tokens, " "), false
 	}
 
-	clusterCost := 0
+	// Charge both the retained 16-byte cluster ID and all retained token bytes against maxClusterBytes.
+	const clusterIDBytes = 16
+	clusterCost := clusterIDBytes
 	for _, tok := range tokens {
 		clusterCost += len(tok)
 	}
@@ -326,11 +329,11 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 	}
 	tmpl := strings.Join(copied, " ")
 	m.clusterCount++
-	m.clusterBytes += clusterCost
 	c := &drainCluster{
 		id:     TemplateHash(service, level, fmt.Sprintf("cluster:%d:%s", m.clusterCount, tmpl)),
 		tokens: copied,
 	}
+	m.clusterBytes += len(c.id) + (clusterCost - clusterIDBytes)
 	node.clusters = append(node.clusters, c)
 
 	return c.id, tmpl, false
@@ -388,18 +391,36 @@ func NewAggregator(maxClusters int) *Aggregator {
 }
 
 // SetSampleByteLimits overrides retained preview sample byte budgets (primarily for testing).
-func (a *Aggregator) SetSampleByteLimits(maxTotal, maxPerWindow, maxSingle int) {
+// Rejects non-positive limits or limits below currently retained active-window preview bytes
+// without mutating any limit so active windows never exceed configured bounds.
+func (a *Aggregator) SetSampleByteLimits(maxTotal, maxPerWindow, maxSingle int) error {
 	a.mu.Lock()
-	if maxTotal > 0 {
-		a.maxTotalSampleBytes = maxTotal
+	defer a.mu.Unlock()
+	if maxTotal <= 0 || maxPerWindow <= 0 || maxSingle <= 0 {
+		return fmt.Errorf("sample byte limits must be positive (got total=%d window=%d single=%d)", maxTotal, maxPerWindow, maxSingle)
 	}
-	if maxPerWindow > 0 {
-		a.maxWindowBytes = maxPerWindow
+	if a.totalSampleBytes > maxTotal {
+		return fmt.Errorf("cannot set maxTotalSampleBytes=%d below currently retained %d bytes", maxTotal, a.totalSampleBytes)
 	}
-	if maxSingle > 0 {
-		a.maxSingleSample = maxSingle
+	for id, wb := range a.windowBytes {
+		if wb > maxPerWindow {
+			return fmt.Errorf("cannot set maxWindowBytes=%d below window %q retained %d bytes", maxPerWindow, id, wb)
+		}
 	}
-	a.mu.Unlock()
+	for id, w := range a.windows {
+		if len(w.SampleLine) > maxSingle {
+			return fmt.Errorf("cannot set maxSingleSample=%d below window %q SampleLine length %d", maxSingle, id, len(w.SampleLine))
+		}
+		for _, extra := range w.AdditionalSamples {
+			if len(extra) > maxSingle {
+				return fmt.Errorf("cannot set maxSingleSample=%d below window %q AdditionalSample length %d", maxSingle, id, len(extra))
+			}
+		}
+	}
+	a.maxTotalSampleBytes = maxTotal
+	a.maxWindowBytes = maxPerWindow
+	a.maxSingleSample = maxSingle
+	return nil
 }
 
 // SetMaxClusterBytes overrides the underlying DrainMiner's cluster string-byte cap.
@@ -494,16 +515,17 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 			}
 		}
 		a.windows[tmplID] = &model.TemplateWindow{
-			TemplateID:      tmplID,
-			Template:        tmpl,
-			Service:         svc,
-			Level:           lvl,
-			Count:           1,
-			FirstSeenUnix:   ev.Timestamp,
-			LastSeenUnix:    ev.Timestamp,
-			SampleLine:      retainedSample,
-			SampleTruncated: len(retainedSample) < len(ev.Message),
-			SampleEntropy:   ent,
+			TemplateID:       tmplID,
+			Template:         tmpl,
+			Service:          svc,
+			ServiceTruncated: !isGlobalOverflow && len(svc) < len(ev.Service),
+			Level:            lvl,
+			Count:            1,
+			FirstSeenUnix:    ev.Timestamp,
+			LastSeenUnix:     ev.Timestamp,
+			SampleLine:       retainedSample,
+			SampleTruncated:  len(retainedSample) < len(ev.Message),
+			SampleEntropy:    ent,
 		}
 		a.windowBytes[tmplID] = len(retainedSample)
 		a.totalSampleBytes += len(retainedSample)
@@ -531,10 +553,11 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 	prevTruncated := w.SampleTruncated
 	sampleTruncated := len(sample) < len(ev.Message)
 	if ent > w.SampleEntropy {
-		w.SampleEntropy = ent
 		// If the incoming preview already exists in AdditionalSamples, remove it first so
 		// promotion never duplicates the sample or double-charges the preview byte budget.
-		a.removeEvidenceSampleLocked(tmplID, w, sample)
+		// Track whether the removed equal preview was complete (untruncated) so an equal
+		// clipped preview never overwrites complete evidence for anchored rules.
+		hadCompleteEqual := a.removeEvidenceSampleLocked(tmplID, w, sample)
 		winAvail := a.maxWindowBytes - (a.windowBytes[tmplID] - len(prevSample))
 		totAvail := a.maxTotalSampleBytes - (a.totalSampleBytes - len(prevSample))
 		allowed := min(winAvail, totAvail)
@@ -547,13 +570,21 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 			}
 		}
 		if newPrimary != "" && newPrimary != sample {
-			a.removeEvidenceSampleLocked(tmplID, w, newPrimary)
+			hadCompleteEqual = a.removeEvidenceSampleLocked(tmplID, w, newPrimary)
 		}
 		delta := len(newPrimary) - len(prevSample)
 		a.windowBytes[tmplID] += delta
 		a.totalSampleBytes += delta
 		w.SampleLine = newPrimary
-		w.SampleTruncated = len(newPrimary) < len(ev.Message)
+		if newPrimary != "" && hadCompleteEqual && len(newPrimary) < len(ev.Message) {
+			// Preserve the previously retained complete record's metadata (untruncated + its exact entropy)
+			// when a longer clipped message collapses onto the exact same preview bytes.
+			w.SampleTruncated = false
+			w.SampleEntropy = PeakShannonEntropy(newPrimary)
+		} else {
+			w.SampleTruncated = len(newPrimary) < len(ev.Message)
+			w.SampleEntropy = ent
+		}
 		if prevSample != "" && prevSample != newPrimary {
 			a.addEvidenceSampleLocked(tmplID, w, prevSample, prevTruncated)
 		}
@@ -570,21 +601,26 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 	return tmplID, overflowed, ent
 }
 
-func (a *Aggregator) removeEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, target string) {
+// removeEvidenceSampleLocked removes target from w.AdditionalSamples using slices.Delete
+// (clearing vacated backing slots for GC) and reports whether the removed entry was complete.
+func (a *Aggregator) removeEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, target string) bool {
 	if target == "" || len(w.AdditionalSamples) == 0 {
-		return
+		return false
 	}
 	for i, existing := range w.AdditionalSamples {
 		if existing == target {
-			w.AdditionalSamples = append(w.AdditionalSamples[:i], w.AdditionalSamples[i+1:]...)
+			wasComplete := true
 			if i < len(w.AdditionalSamplesTruncated) {
-				w.AdditionalSamplesTruncated = append(w.AdditionalSamplesTruncated[:i], w.AdditionalSamplesTruncated[i+1:]...)
+				wasComplete = !w.AdditionalSamplesTruncated[i]
+				w.AdditionalSamplesTruncated = slices.Delete(w.AdditionalSamplesTruncated, i, i+1)
 			}
+			w.AdditionalSamples = slices.Delete(w.AdditionalSamples, i, i+1)
 			a.windowBytes[tmplID] -= len(existing)
 			a.totalSampleBytes -= len(existing)
-			return
+			return wasComplete
 		}
 	}
+	return false
 }
 
 func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, sample string, truncated bool) {

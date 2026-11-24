@@ -217,6 +217,15 @@ func TestPipelineEndToEnd100kSyntheticSegmentReplay(t *testing.T) {
 		t.Fatalf("expected ambiguous 999999999999 to fall back to 1763996400, got %d", got)
 	}
 
+	// Mixed ms and sec timestamps in one bucket select the newest normalized Unix-second timestamp
+	mixPipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+	mixPipe.IngestEvent(model.LogEvent{ID: 1, Timestamp: 1763996400000, Service: "nginx", Level: "WARN", Message: "GET /../../etc/passwd 403"})
+	mixPipe.IngestEvent(model.LogEvent{ID: 2, Timestamp: 1763996401, Service: "nginx", Level: "WARN", Message: "GET /../../etc/passwd 403"})
+	mixAlerts, _ := mixPipe.FlushWindow()
+	if len(mixAlerts) != 1 || mixAlerts[0].Timestamp != 1763996401 {
+		t.Fatalf("expected newest normalized timestamp 1763996401 over 1763996400000ms, got %+v", mixAlerts)
+	}
+
 	// Verify Burn wipes Sentinel-owned cursor.json & sentinel-feedback.jsonl while preserving unrelated user files!
 	rep, err := pipe.Burn()
 	if err != nil {
@@ -313,36 +322,39 @@ func TestPipelineCountsOnlySuccessfulSinkEmissions(t *testing.T) {
 }
 
 func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
-	dataDir := t.TempDir()
-	outsideDir := t.TempDir()
-	// Use an owned feedback filename so survival genuinely establishes non-traversal.
-	outsideFile := filepath.Join(outsideDir, "sentinel-feedback.jsonl")
-	if err := os.WriteFile(outsideFile, []byte(`{"keep":true}`), 0600); err != nil {
-		t.Fatalf("write outside file: %v", err)
-	}
-	if err := os.Symlink(outsideDir, filepath.Join(dataDir, "feedback")); err != nil {
-		t.Skipf("symlink creation unsupported: %v", err)
-	}
+	t.Run("symlink_escape", func(t *testing.T) {
+		dataDir := t.TempDir()
+		outsideDir := t.TempDir()
+		// Use an owned feedback filename so survival genuinely establishes non-traversal.
+		outsideFile := filepath.Join(outsideDir, "sentinel-feedback.jsonl")
+		if err := os.WriteFile(outsideFile, []byte(`{"keep":true}`), 0600); err != nil {
+			t.Fatalf("write outside file: %v", err)
+		}
+		if err := os.Symlink(outsideDir, filepath.Join(dataDir, "feedback")); err != nil {
+			t.Skipf("symlink creation unsupported: %v", err)
+		}
 
-	if _, err := BurnLocalState(dataDir); err == nil {
-		t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
-	}
-	if _, err := os.Stat(outsideFile); err != nil {
-		t.Fatalf("outside sentinel-feedback.jsonl was deleted through feedback symlink: %v", err)
-	}
+		if _, err := BurnLocalState(dataDir); err == nil {
+			t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
+		}
+		if _, err := os.Stat(outsideFile); err != nil {
+			t.Fatalf("outside sentinel-feedback.jsonl was deleted through feedback symlink: %v", err)
+		}
+	})
 
-	// Verify BurnLocalState leaves an unrelated empty feedback directory in place
-	emptyFeedbackRoot := t.TempDir()
-	emptyFeedbackDir := filepath.Join(emptyFeedbackRoot, "feedback")
-	if err := os.MkdirAll(emptyFeedbackDir, 0700); err != nil {
-		t.Fatalf("mkdir empty feedback: %v", err)
-	}
-	if _, err := BurnLocalState(emptyFeedbackRoot); err != nil {
-		t.Fatalf("BurnLocalState on empty feedback dir failed: %v", err)
-	}
-	if _, err := os.Stat(emptyFeedbackDir); err != nil {
-		t.Fatalf("BurnLocalState deleted unrelated empty feedback directory: %v", err)
-	}
+	t.Run("preserves_empty_feedback_dir", func(t *testing.T) {
+		emptyFeedbackRoot := t.TempDir()
+		emptyFeedbackDir := filepath.Join(emptyFeedbackRoot, "feedback")
+		if err := os.MkdirAll(emptyFeedbackDir, 0700); err != nil {
+			t.Fatalf("mkdir empty feedback: %v", err)
+		}
+		if _, err := BurnLocalState(emptyFeedbackRoot); err != nil {
+			t.Fatalf("BurnLocalState on empty feedback dir failed: %v", err)
+		}
+		if _, err := os.Stat(emptyFeedbackDir); err != nil {
+			t.Fatalf("BurnLocalState deleted unrelated empty feedback directory: %v", err)
+		}
+	})
 }
 
 func TestPipelineDistinctLongServicesDoNotMergeInRuleBuckets(t *testing.T) {
