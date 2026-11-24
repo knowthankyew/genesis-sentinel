@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0-phase3] - 2026-11-24
+
+### Added
+- **Tier 2 Local LoRA Triage Engine (`internal/triage`):** Added the 8-class starter security triage taxonomy (`[BENIGN-NOISE]`, `[RECON-SCAN]`, `[AUTH-BRUTEFORCE]`, `[INJECTION-ATTEMPT]`, `[EXFIL-SUSPECT]`, `[PRIV-ESC]`, `[POLICY-ANOMALY]`, `[NEEDS-REVIEW]`), prompt-injection-resistant data framing (`BEGIN_UNTRUSTED_LOG_TELEMETRY` / `END_UNTRUSTED_LOG_TELEMETRY`), fail-closed completion parsing with automatic override of `[BENIGN-NOISE]` back to `[NEEDS-REVIEW]` (`HIGH`) on injection-flagged payloads, and a loopback HTTP client targeting `ml/src/FtaaSService.Inference` (`/api/v1/inference/generate`, `/healthz`) with generation-tracked circuit breaking and dynamic adapter hot-swapping.
+- **Mandatory PII/Secret Redaction, Synthetic Seed Generator & Curated Feedback Store (`internal/feedback`):** Added pure-Go stdlib scrubbing and fail-closed scanning for PEM private keys, JWTs, Bearer tokens, cloud/VCS API keys, credential key-value pairs, emails, SSA-valid SSNs, and Luhn-valid payment cards (matching FTaaS `DatasetService.cs`), balanced deterministic synthetic seed + validation split generation (`GenerateSeedSplit`), FTaaS-compliant JSONL export enforcing `50,000`-record / `25 MB` ceilings, and a bounded local `alerts.jsonl` journal (`MaxAlertJournalRecords = 2000`) wiped cleanly by `sentinel burn`.
+- **FTaaS Training Client & Active Adapter Persistence (`internal/train`):** Added loopback multipart HTTP client targeting `ml/src/FtaaSService.Api` (`POST /api/v1/jobs`, `POST /api/v1/jobs/audit`, `GET /api/v1/jobs/{id}`, `GET /api/v1/jobs`) with BitNet exclusion, hyperparameter validation, pre-upload PII verification, job polling, `active-adapter.json` persistence, and `POST /adapter` daemon hot-reload notifications.
+- **Pipeline, Alert & Phase 3 CLI Wiring (`internal/pipeline`, `internal/emit`, `internal/config`, `internal/cli`):** Implemented `sentinel feedback` (`add`, `seed`, `export`, `stats`, `alerts`) and `sentinel train` (`submit`, `status`, `list`, `activate`), added `--triage-mode`, `--inference-http`, `--base-model`, and `--adapter-path` to `watch` and `scan`, added Tier 2 enrichment fields on `emit.Alert`, exposed `POST /adapter` on the sidecar HTTP server, extended `sentinel burn` to remove `alerts.jsonl` and `active-adapter.json`, and redacted `ftaas_api_key` in `sentinel config`.
+
+---
+
 ## [0.3.0-phase2] - 2026-11-24
 
 ### Added

@@ -35,6 +35,7 @@ func TestExecuteVersionAndHelp(t *testing.T) {
 func TestExecuteConfigRedactsTokens(t *testing.T) {
 	t.Setenv("SENTINEL_AUTH_TOKEN", "super-secret-sentinel-token")
 	t.Setenv("SENTINEL_GENESIS_AUTH_TOKEN", "super-secret-genesis-token")
+	t.Setenv("SENTINEL_FTAAS_API_KEY", "super-secret-ftaas-key")
 
 	var out, errBuf bytes.Buffer
 	if err := ExecuteWithOutput([]string{"config"}, &out, &errBuf); err != nil {
@@ -49,22 +50,24 @@ func TestExecuteConfigRedactsTokens(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
 		t.Fatalf("config output is not valid JSON: %v", err)
 	}
-	if decoded["auth_token"] != "[REDACTED]" || decoded["genesis_auth_token"] != "[REDACTED]" {
-		t.Fatalf("expected tokens to be redacted, got auth_token=%v genesis_auth_token=%v",
-			decoded["auth_token"], decoded["genesis_auth_token"])
+	if decoded["auth_token"] != "[REDACTED]" || decoded["genesis_auth_token"] != "[REDACTED]" || decoded["ftaas_api_key"] != "[REDACTED]" {
+		t.Fatalf("expected tokens to be redacted, got auth_token=%v genesis_auth_token=%v ftaas_api_key=%v",
+			decoded["auth_token"], decoded["genesis_auth_token"], decoded["ftaas_api_key"])
 	}
 }
 
-func TestExecuteUnknownCommandAndPhase3Stubs(t *testing.T) {
+func TestExecuteUnknownCommandAndRequiredFlags(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	if err := ExecuteWithOutput([]string{"bogus"}, &out, &errBuf); err == nil {
 		t.Fatal("expected error for unknown command")
 	}
-	if err := ExecuteWithOutput([]string{"train"}, &out, &errBuf); err == nil {
-		t.Fatal("expected Phase 3 roadmap stub error for train")
-	}
+	// Bare `feedback` without --label fails validation cleanly.
 	if err := ExecuteWithOutput([]string{"feedback"}, &out, &errBuf); err == nil {
-		t.Fatal("expected Phase 3 roadmap stub error for feedback")
+		t.Fatal("expected validation error for feedback without --label")
+	}
+	// Bare `train` with empty data dir fails cleanly when no dataset/feedback exists.
+	if err := ExecuteWithOutput([]string{"train", "--data-dir", t.TempDir()}, &out, &errBuf); err == nil {
+		t.Fatal("expected validation error for train without dataset or curated feedback")
 	}
 }
 
@@ -349,5 +352,155 @@ func TestExecuteScanWithPreloadedBaselineSurfacesTier1Anomaly(t *testing.T) {
 	missingPath := filepath.Join(dir, "does-not-exist.json")
 	if err := ExecuteWithOutput([]string{"scan", "--file", logPath, "--baseline", missingPath}, &out, &errBuf); err == nil {
 		t.Fatal("expected scan --baseline <missing> to return an error")
+	}
+}
+
+func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
+	dataDir := t.TempDir()
+	var out, errBuf bytes.Buffer
+
+	// 1. Seed starter dataset + companion validation split.
+	if err := ExecuteWithOutput([]string{
+		"feedback", "seed",
+		"--data-dir", dataDir,
+		"--name", "starter",
+		"--per-class", "2",
+		"--val-per-class", "1",
+		"--json",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("feedback seed failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	seedPath := filepath.Join(dataDir, "feedback", "sentinel-feedback-starter.jsonl")
+	valPath := filepath.Join(dataDir, "feedback", "sentinel-feedback-starter-val.jsonl")
+	if _, err := os.Stat(seedPath); err != nil {
+		t.Fatalf("expected seed dataset at %s: %v", seedPath, err)
+	}
+	if _, err := os.Stat(valPath); err != nil {
+		t.Fatalf("expected validation split at %s: %v", valPath, err)
+	}
+
+	// 2. Add operator feedback containing PII (SSN) -> automatically scrubbed before persistence.
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"feedback", "add",
+		"--data-dir", dataDir,
+		"--service", "nginx",
+		"--level", "WARN",
+		"--sample", "GET /healthz user=alice@example.com ssn=123-45-6789 200",
+		"--label", "fp",
+		"--json",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("feedback add failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	rawQueue, err := os.ReadFile(filepath.Join(dataDir, "feedback", "sentinel-feedback.jsonl"))
+	if err != nil {
+		t.Fatalf("read sentinel-feedback.jsonl: %v", err)
+	}
+	if strings.Contains(string(rawQueue), "123-45-6789") || strings.Contains(string(rawQueue), "alice@example.com") {
+		t.Fatalf("PII leaked into sentinel-feedback.jsonl: %s", string(rawQueue))
+	}
+
+	// 3. Mock local FTaaS API server for --audit-only and submit --wait --activate.
+	ftaasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs/audit":
+			_, _ = w.Write([]byte(`{"isValid":true,"cleanedRecordCount":16,"summary":{"original_count":17,"cleaned_count":16,"ablated_count":1,"anomalous_count":0}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"jobId":"job-smol-01","jobName":"sentinel-e2e","status":"Queued","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","datasetPath":"datasets/job-smol-01.jsonl","datasetHash":"abcd1234","surprisalPreflightStatus":"Completed"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-smol-01":
+			_, _ = w.Write([]byte(`{"jobId":"job-smol-01","jobName":"sentinel-e2e","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","datasetHash":"abcd1234","progressPercent":100,"currentStep":10,"totalSteps":10,"adapterPath":"artifacts/job-smol-01/model_adapters"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ftaasSrv.Close()
+
+	// 3a. Dry-run preflight audit.
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--ftaas-http", ftaasSrv.URL,
+		"--seed-per-class", "2",
+		"--audit-only",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("train --audit-only failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	if !strings.Contains(out.String(), `"cleanedRecordCount": 16`) {
+		t.Fatalf("unexpected audit-only output: %s", out.String())
+	}
+
+	// 3b. Submit + wait + activate -> writes active-adapter.json.
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--ftaas-http", ftaasSrv.URL,
+		"--dataset", seedPath,
+		"--job-name", "sentinel-e2e",
+		"--wait",
+		"--poll-interval", "5ms",
+		"--activate",
+		"--json",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("train submit --wait --activate failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "active-adapter.json")); err != nil {
+		t.Fatalf("expected active-adapter.json after --activate: %v", err)
+	}
+
+	// 4. Mock local Inference server + run `sentinel scan --triage-mode http`.
+	inferSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job-smol-01/model_adapters","completion":"[INJECTION-ATTEMPT] severity=CRITICAL mitre=TA0001 explanation=Path traversal attack detected.","latencyMs":21.0}`))
+	}))
+	defer inferSrv.Close()
+
+	logPath := filepath.Join(dataDir, "attack.log")
+	if err := os.WriteFile(logPath, []byte(`{"timestamp":1763997100,"service":"nginx","level":"WARN","message":"GET /../../../../etc/passwd HTTP/1.1 403"}`+"\n"), 0600); err != nil {
+		t.Fatalf("write attack.log: %v", err)
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"scan",
+		"--file", logPath,
+		"--triage-mode", "http",
+		"--inference-http", inferSrv.URL,
+		"--adapter-path", "artifacts/job-smol-01/model_adapters",
+		"--json",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("scan --triage-mode http failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	var rep ScanReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode scan JSON: %v", err)
+	}
+	if rep.TriageEvaluated != 1 || len(rep.Alerts) != 1 || rep.Alerts[0].TriageClass != "INJECTION-ATTEMPT" || rep.Alerts[0].Tier != "tier0+tier2" {
+		t.Fatalf("unexpected Tier 2 scan report: %+v", rep)
+	}
+
+	// 5. `sentinel burn -y` cleans feedback files AND active-adapter.json cleanly!
+	out.Reset()
+	errBuf.Reset()
+	t.Setenv("SENTINEL_DATA_DIR", dataDir)
+	if err := ExecuteWithOutput([]string{"burn", "-y"}, &out, &errBuf); err != nil {
+		t.Fatalf("burn -y failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	for _, gone := range []string{
+		filepath.Join(dataDir, "active-adapter.json"),
+		seedPath,
+		valPath,
+		filepath.Join(dataDir, "feedback", "sentinel-feedback.jsonl"),
+	} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be wiped by sentinel burn -y", gone)
+		}
 	}
 }

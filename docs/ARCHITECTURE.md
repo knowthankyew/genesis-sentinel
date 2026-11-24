@@ -21,14 +21,14 @@ flowchart TD
 
     subgraph SentinelCore["Genesis Sentinel Sidecar (Pure Go Stdlib)"]
         Entry["CLI Entrypoint<br/><code>cmd/sentinel/main.go</code>"]
-        CLI["Subcommand Router<br/><code>internal/cli/cli.go</code> &bull; <code>internal/cli/watch.go</code> &bull; <code>internal/cli/scan.go</code>"]
+        CLI["Subcommand Router<br/><code>internal/cli/cli.go</code> &bull; <code>internal/cli/watch.go</code> &bull; <code>internal/cli/scan.go</code> &bull; <code>internal/cli/feedback.go</code> &bull; <code>internal/cli/train.go</code>"]
         Cfg["Config & Invariant Guard<br/><code>internal/config/config.go</code>"]
         Sec["Loopback, Auth & Prompt Sanitizer<br/><code>internal/security/security.go</code>"]
         Types["Tier Contracts & Model Allowlist<br/><code>internal/model/types.go</code>"]
         T0["Tier 0: Ingest, Drain Templates & Rules<br/><code>internal/ingest/segreader.go</code> &bull; <code>internal/template/drain.go</code> &bull; <code>internal/rules/engine.go</code>"]
         Pipe["Orchestrator & Alert Sink<br/><code>internal/pipeline/pipeline.go</code> &bull; <code>internal/emit/genesis_sink.go</code>"]
         T1["Tier 1: Laplace-LK Log Surprisal<br/><code>internal/surprisal/math.go</code> &bull; <code>internal/surprisal/features.go</code> &bull; <code>internal/surprisal/engine.go</code> &bull; <code>internal/surprisal/baseline.go</code> &bull; <code>internal/surprisal/http_client.go</code>"]
-        T2["Tier 2: Triage Client & Feedback Queue<br/>(Planned: Phase 3)"]
+        T2["Tier 2: LoRA Triage, Redacted Feedback & FTaaS Client<br/><code>internal/triage/taxonomy.go</code> &bull; <code>internal/triage/client.go</code> &bull; <code>internal/feedback/redact.go</code> &bull; <code>internal/feedback/store.go</code> &bull; <code>internal/train/ftaas_client.go</code>"]
     end
 
     subgraph MLHost["Event-Driven FTaaS / ml (127.0.0.1)"]
@@ -55,9 +55,9 @@ flowchart TD
 
 ---
 
-## 2. Implemented Subsystems (Phases 0–2)
+## 2. Implemented Subsystems (Phases 0–3)
 
-1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
+1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/feedback.go`, `internal/cli/train.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
    - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
    - Merges compiled safe defaults (`DefaultMaxMemMB = <!-- claim:default_max_mem_mb -->256 MB<!-- /claim -->`, `DefaultWindowSec = <!-- claim:default_window_sec -->10s<!-- /claim -->`) -> `sentinel.json` -> `SENTINEL_*` environment variables -> CLI flags.
    - Surfaces Sentinel's local data directory (`~/.genesis-sentinel/` by default) transparently via startup banners and `sentinel data path | status | open` without requiring hidden-folder configuration, and redacts sensitive auth tokens automatically in `sentinel config`.
@@ -80,10 +80,14 @@ flowchart TD
    - Pure-Go implementation of Hazard et al. (`arXiv:2510.22809`) Equations 4, 6, 7, and 8 with MAD substitutability floor (`MinDeviationFloor = <!-- claim:surprisal_min_deviation_floor -->0.25<!-- /claim -->`), nominal mismatch penalty (`NominalMismatchNats = <!-- claim:surprisal_nominal_mismatch_nats -->2.5 nats<!-- /claim -->`), cold-start warmup guard (`DefaultWarmupMinCases = <!-- claim:surprisal_default_warmup_cases -->20<!-- /claim -->`), and bounded strided $k$-NN scoring (`DefaultMaxCandidateCases = <!-- claim:surprisal_default_max_candidates -->120<!-- /claim -->`) matching `ml/src/surprisal-service/service.py` within `1e-6` nats.
    - Extracts 8 log-domain continuous features (log token count, log byte length, peak Shannon entropy, scaled symbol/digit/uppercase ratios, log burst count, log inter-arrival ms) and 4 structural nominal features (`service`, `level`, `template_class`, HTTP status family / syslog `<PRI>` facility).
    - Enforces baseline poisoning protection (never absorbs Tier 0 rule hits, prompt-injection events, overflow buckets, or post-warmup anomalies into the rolling baseline), persists atomic `baseline.json` snapshots cleanly wiped by `sentinel burn`, and supports optional loopback `:5200` HTTP/hybrid parity checks.
+7. **Tier 2 Local LoRA Triage, Redacted Feedback & FTaaS Training Loop (`internal/triage/taxonomy.go`, `internal/triage/client.go`, `internal/feedback/redact.go`, `internal/feedback/seed.go`, `internal/feedback/store.go`, `internal/feedback/alerts_journal.go`, `internal/train/ftaas_client.go`, `internal/train/adapter_state.go`):**
+   - Frames sanitized Tier 0/1 alerts inside explicit `BEGIN_UNTRUSTED_LOG_TELEMETRY` / `END_UNTRUSTED_LOG_TELEMETRY` boundaries and queries local `ml/src/FtaaSService.Inference` (`POST /api/v1/inference/generate`, `DefaultTriageMaxTokens = <!-- claim:triage_default_max_tokens -->96 tokens<!-- /claim -->`) over dial-time loopback HTTP with a generation-tracked circuit breaker and zero-downtime `POST /adapter` hot-swapping.
+   - Parses structured bracketed verdicts across the 8 starter security classes (`[BENIGN-NOISE]`, `[RECON-SCAN]`, `[AUTH-BRUTEFORCE]`, `[INJECTION-ATTEMPT]`, `[EXFIL-SUSPECT]`, `[PRIV-ESC]`, `[POLICY-ANOMALY]`, `[NEEDS-REVIEW]`), failing closed to `[NEEDS-REVIEW]` on unstructured outputs and overriding `[BENIGN-NOISE]` back to `[NEEDS-REVIEW]` (`HIGH`) whenever prompt-injection signals were detected on the input log.
+   - Records up to `MaxAlertJournalRecords = <!-- claim:feedback_max_alert_journal_records -->2,000<!-- /claim -->` recent alerts in `~/.genesis-sentinel/alerts.jsonl` so `sentinel feedback --alert-id` can curate operator labels (`tp`/`fp`/custom class), scrub PII/secrets (PEM keys, JWTs, Bearer tokens, API keys, credentials, emails, SSA-valid SSNs, Luhn-valid payment cards), generate deterministic synthetic seed splits (`sentinel feedback seed`), and submit audited JSONL jobs to local FTaaS (`POST /api/v1/jobs`, `POST /api/v1/jobs/audit`) via `sentinel train`.
 
 ---
 
-## 3. Feedback & Adapter Refresh Sequence (Phase 3 Target)
+## 3. Feedback & Adapter Refresh Sequence (Phase 3 Implemented)
 
 ```mermaid
 sequenceDiagram

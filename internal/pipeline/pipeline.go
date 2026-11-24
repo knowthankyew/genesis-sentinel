@@ -19,12 +19,15 @@ import (
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/emit"
+	"github.com/knowthankyew/genesis-sentinel/internal/feedback"
 	"github.com/knowthankyew/genesis-sentinel/internal/ingest"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
 	"github.com/knowthankyew/genesis-sentinel/internal/surprisal"
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
+	"github.com/knowthankyew/genesis-sentinel/internal/train"
+	"github.com/knowthankyew/genesis-sentinel/internal/triage"
 )
 
 const (
@@ -56,6 +59,12 @@ type Stats struct {
 	SurprisalHTTPChecks        uint64  `json:"surprisal_http_checks"`
 	SurprisalHTTPFallbacks     uint64  `json:"surprisal_http_fallbacks"`
 	SurprisalHTTPDisagreements uint64  `json:"surprisal_http_disagreements"`
+	TriageMode                 string  `json:"triage_mode"`
+	TriageModel                string  `json:"triage_model,omitempty"`
+	TriageAdapter              string  `json:"triage_adapter,omitempty"`
+	TriageEvaluated            uint64  `json:"triage_evaluated"`
+	TriageFallbacks            uint64  `json:"triage_fallbacks"`
+	TriageInjectionOverrides   uint64  `json:"triage_injection_overrides"`
 	CorruptedFrames            uint64  `json:"corrupted_frames"`
 	RecoveryStalls             uint64  `json:"recovery_stalls"`
 	BurnResets                 uint64  `json:"burn_resets"`
@@ -123,6 +132,8 @@ type Pipeline struct {
 	agg          *template.Aggregator
 	ruleEng      *rules.Engine
 	surprisalEng *surprisal.Engine
+	triageClient *triage.Client
+	alertJournal *feedback.AlertJournal
 	sink         emit.Sink
 	activeSource string
 	startTime    time.Time
@@ -176,17 +187,56 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		HTTPClient:         httpClient,
 	})
 
+	var triageClient *triage.Client
+	if strings.EqualFold(cfg.TriageMode, "http") && cfg.InferenceAddr != "" {
+		if tc, err := triage.NewClient(triage.ClientOptions{
+			BaseURL:        cfg.InferenceAddr,
+			BaseModel:      cfg.BaseModel,
+			AdapterPath:    cfg.AdapterPath,
+			APIKey:         cfg.FTaaSAPIKey,
+			MaxTokens:      cfg.TriageMaxTokens,
+			Temperature:    cfg.TriageTemperature,
+			MaxPromptBytes: cfg.MaxPromptByte,
+			AllowRemote:    cfg.AllowRemoteEndpoints,
+		}); err == nil {
+			triageClient = tc
+		}
+	}
+
 	return &Pipeline{
 		cfg:                   cfg,
 		agg:                   template.NewAggregator(template.DefaultMaxClusters),
 		ruleEng:               ruleEng,
 		surprisalEng:          surpEng,
+		triageClient:          triageClient,
 		sink:                  sink,
 		activeSource:          activeSource,
 		startTime:             time.Now(),
 		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
 		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
+}
+
+// TriageClient returns the active Tier 2 local inference client (nil when triage_mode=off).
+func (p *Pipeline) TriageClient() *triage.Client {
+	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+	return p.triageClient
+}
+
+// AttachTriageClient sets or replaces the Tier 2 local inference client cleanly.
+func (p *Pipeline) AttachTriageClient(c *triage.Client) {
+	p.burnMu.Lock()
+	p.triageClient = c
+	p.burnMu.Unlock()
+}
+
+// AttachAlertJournal attaches a bounded local alerts.jsonl journal so operators can
+// curate feedback by alert ID (`sentinel feedback --alert-id <ID>`).
+func (p *Pipeline) AttachAlertJournal(j *feedback.AlertJournal) {
+	p.burnMu.Lock()
+	p.alertJournal = j
+	p.burnMu.Unlock()
 }
 
 // SurprisalEngine returns the active Tier 1 Laplace-LK surprisal engine.
@@ -481,6 +531,16 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	)
 	nowUnix := time.Now().Unix()
 
+	triageClient := p.triageClient
+	var (
+		triageCtx    context.Context
+		cancelTriage context.CancelFunc
+	)
+	if triageClient != nil {
+		triageCtx, cancelTriage = context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancelTriage()
+	}
+
 	for _, k := range keys {
 		bucket := drainedHits[k]
 		w, hasWin := winByID[k.templateID]
@@ -622,6 +682,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      bestSample,
 		}
 
+		if triageClient != nil {
+			p.enrichWithTier2(triageCtx, triageClient, &alert)
+		}
+
 		emittedWinKeys[k] = true
 		if err := p.sink.Emit(alert); err != nil {
 			p.sinkErrors.Add(1)
@@ -702,6 +766,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      cleanSample,
 		}
 
+		if triageClient != nil {
+			p.enrichWithTier2(triageCtx, triageClient, &alert)
+		}
+
 		if sw.hasKey {
 			emittedWinKeys[sw.bucketKey] = true
 		}
@@ -714,7 +782,50 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		emitted = append(emitted, alert)
 	}
 
+	if p.alertJournal != nil && len(emitted) > 0 {
+		_ = p.alertJournal.Record(emitted...)
+	}
+
 	return emitted, failed
+}
+
+func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, alert *emit.Alert) {
+	if client == nil || alert == nil {
+		return
+	}
+	verdict, overridden, err := client.TriageWindow(ctx, triage.PromptInput{
+		Service:              alert.SourceService,
+		Level:                alert.SourceLevel,
+		TemplateID:           alert.TemplateID,
+		Template:             alert.Template,
+		SampleLine:           alert.SanitizedSample,
+		Count:                alert.Count,
+		SampleEntropy:        alert.SampleEntropy,
+		RuleIDs:              alert.RuleIDs,
+		Categories:           alert.Categories,
+		SurprisalNats:        alert.SurprisalNats,
+		SurprisalThreshold:   alert.SurprisalThreshold,
+		TopSurprisalFeatures: alert.TopSurprisalFeatures,
+		InjectionSuspected:   alert.InjectionSuspected,
+		InjectionSignals:     alert.InjectionSignals,
+	})
+	if err != nil {
+		return
+	}
+	alert.Tier = alert.Tier + "+tier2"
+	alert.TriageClass = verdict.Label
+	alert.TriageConfidence = verdict.Confidence
+	alert.TriageMitreTactic = verdict.MitreTactic
+	alert.TriageExplanation = verdict.Explanation
+	alert.TriageModel = verdict.ModelID
+	alert.TriageAdapter = verdict.AdapterID
+	alert.TriageOverridden = overridden
+
+	// Fail closed: preserve the higher severity across Tier 0/1 and Tier 2 so a model
+	// hallucination cannot silently downgrade a deterministic CRITICAL/HIGH rule alert.
+	alert.Severity = emit.HigherSeverity(alert.Severity, verdict.Severity)
+	alert.Level = emit.MapSeverityToGenesisLevel(alert.Severity)
+	alert.Message = fmt.Sprintf("%s triage=[%s] %s", alert.Message, verdict.Label, truncateSummary(verdict.Explanation, 160))
 }
 
 func mapSurprisalSeverity(totalNats, thresholdNats float64, level string) string {
@@ -744,6 +855,7 @@ func (p *Pipeline) Stats() Stats {
 	segReader := p.segReader
 	queryPoller := p.queryPoller
 	surpEng := p.surprisalEng
+	triageClient := p.triageClient
 	p.burnMu.RUnlock()
 
 	st := Stats{
@@ -758,11 +870,22 @@ func (p *Pipeline) Stats() Stats {
 		RuleBucketsDropped:       p.ruleBucketsDropped.Load(),
 		OverflowThresholdSkipped: p.overflowThresholdSkipped.Load(),
 		SinkErrors:               p.sinkErrors.Load(),
+		TriageMode:               p.cfg.TriageMode,
 		ActiveSource:             p.activeSource,
 		DataDir:                  p.cfg.DataDir,
 		GenesisDataDir:           p.cfg.GenesisDataDir,
 		HeapBytes:                m.HeapAlloc,
 		UptimeSeconds:            int64(time.Since(p.startTime).Seconds()),
+	}
+
+	if triageClient != nil {
+		ts := triageClient.Stats()
+		st.TriageMode = "http"
+		st.TriageModel = ts.BaseModel
+		st.TriageAdapter = ts.AdapterPath
+		st.TriageEvaluated = ts.EvaluatedTotal
+		st.TriageFallbacks = ts.FallbacksTotal
+		st.TriageInjectionOverrides = ts.InjectionOverrides
 	}
 
 	if surpEng != nil {
@@ -811,6 +934,9 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	if p.surprisalEng != nil {
 		p.surprisalEng.Reset()
 	}
+	if p.triageClient != nil {
+		p.triageClient.ResetCircuit()
+	}
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
 	}
@@ -818,6 +944,80 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 		p.queryPoller.Reset()
 	}
 	return BurnLocalState(p.cfg.DataDir)
+}
+
+// HandleAdapter serves POST /adapter to hot-swap the active Tier 2 LoRA adapter on a running
+// Sentinel sidecar and persist active-adapter.json cleanly under burnMu.
+func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed; use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	var req struct {
+		BaseModel   string `json:"base_model"`
+		AdapterPath string `json:"adapter_path"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024))
+	if err := dec.Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload"})
+		return
+	}
+	baseModel := strings.TrimSpace(req.BaseModel)
+	if baseModel == "" {
+		baseModel = p.cfg.BaseModel
+	}
+	if _, err := model.ValidateBaseModel(baseModel); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	cleanAdapter, err := triage.ValidateAdapterPath(req.AdapterPath)
+	if err != nil || cleanAdapter == "" {
+		msg := "adapter_path is required"
+		if err != nil {
+			msg = err.Error()
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+		return
+	}
+
+	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+
+	if p.triageClient != nil {
+		if err := p.triageClient.SetBaseModel(baseModel); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if err := p.triageClient.SetAdapterPath(cleanAdapter); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	state := train.ActiveAdapter{
+		BaseModel:   baseModel,
+		AdapterPath: cleanAdapter,
+		ActivatedAt: time.Now().UTC(),
+	}
+	if p.cfg.DataDir != "" {
+		if err := train.SaveActiveAdapter(p.cfg.DataDir, state); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":         "activated",
+		"base_model":     state.BaseModel,
+		"adapter_path":   state.AdapterPath,
+		"triage_enabled": p.triageClient != nil,
+	})
 }
 
 // HandleHealthz serves GET /healthz for loopback liveness checks.
@@ -992,11 +1192,16 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 
 func isOwnedTopLevelFile(name string) bool {
 	switch name {
-	case "cursor.json", "cursor.json.tmp", "baseline.json", "baseline.json.tmp":
+	case "cursor.json", "cursor.json.tmp",
+		"baseline.json", "baseline.json.tmp",
+		"alerts.jsonl", "alerts.jsonl.tmp",
+		"active-adapter.json", "active-adapter.json.tmp":
 		return true
 	}
 	return (strings.HasPrefix(name, ".cursor-") && strings.HasSuffix(name, ".tmp")) ||
-		(strings.HasPrefix(name, ".baseline-") && strings.HasSuffix(name, ".tmp"))
+		(strings.HasPrefix(name, ".baseline-") && strings.HasSuffix(name, ".tmp")) ||
+		(strings.HasPrefix(name, ".alerts-") && strings.HasSuffix(name, ".tmp")) ||
+		(strings.HasPrefix(name, ".active-adapter-") && strings.HasSuffix(name, ".tmp"))
 }
 
 // isOwnedFeedbackFile enforces an explicit Sentinel filename contract inside dataDir/feedback/

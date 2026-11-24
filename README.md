@@ -4,11 +4,11 @@
 [![CI](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg)](go.mod)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
-[![Stage: Phase 2 Complete](https://img.shields.io/badge/Stage-Phase%202%20Complete-brightgreen.svg)](docs/ROADMAP.md)
+[![Stage: Phase 3 Complete](https://img.shields.io/badge/Stage-Phase%203%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
-**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.3.0-phase2<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
+**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.4.0-phase3<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
 
-> **Current Status (Phase 2 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, **Tier 1 clean-room pure-Go Laplace-LK log surprisal engine** (matching `ml/src/surprisal-service/service.py` within `1e-6` nats with rolling baseline persistence, poisoning defense, and optional loopback `:5200` parity mode), `service=sentinel` loopback alert sink, `watch` / `scan` / `stats` / `burn` / `data` / `config` commands, automated claims linter (`scripts/audit-claims.py`), and CycloneDX 1.5 SBOM (`bom.json`) are implemented and race-tested. Tier 2 SmolLM2-Instruct LoRA triage & FTaaS feedback loop (Phase 3) is up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Current Status (Phase 3 Complete — Sentinel Core):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, Tier 1 clean-room pure-Go Laplace-LK log surprisal engine, and **Tier 2 local SmolLM2-Instruct LoRA triage & FTaaS feedback loop** (`internal/triage`, `internal/feedback`, `internal/train`, `sentinel feedback`, `sentinel train`, `POST /adapter` live hot-swap, mandatory PII/secret redaction, and prompt-injection fail-closed override) are implemented and race-tested. Phase 4 adversarial hardening & empirical replay benchmarks are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 
@@ -52,19 +52,19 @@ Usage:
   sentinel [command] [flags]
 
 Commands:
-  watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2 (Phase 1+)
-  scan      Run an offline scan over Genesis .seg files or JSONL exports (Phase 1+)
-  feedback  Label alerts as true/false positives and export redacted JSONL (Phase 3)
-  train     Submit a redacted feedback dataset to local FTaaS (SmolLM2-Instruct) (Phase 3)
-  stats     Display live pipeline throughput, surprisal, and alert metrics (Phase 1+)
-  burn      Purge Sentinel disk state, baselines, and unexported local queues (Phase 1+)
+  watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2
+  scan      Run an offline scan over Genesis .seg files, raw log files, or synthetic replay
+  feedback  Label alerts as true/false positives, seed starter data, and export redacted JSONL
+  train     Audit/submit redacted feedback datasets to local FTaaS and activate LoRA adapters
+  stats     Display live pipeline throughput, surprisal, triage, and alert metrics
+  burn      Purge Sentinel disk state, baselines, alert journals, and unexported feedback queues
   data      Inspect or open Sentinel's local data directory (path | status | open)
   config    Validate and print the resolved Sentinel configuration
   version   Print the Genesis Sentinel version
   help      Show help for Genesis Sentinel
 ```
 
-### Quickstart (Phase 1 Commands)
+### Quickstart
 
 ```bash
 # Build the pure-Go binary
@@ -76,15 +76,26 @@ make build
 # Watch a live Genesis instance in lossless .seg mode and emit alerts back to Genesis
 ./bin/sentinel watch --genesis-data-dir /path/to/genesis-segs --genesis-tcp 127.0.0.1:9000
 
-# Inspect live Sentinel stats
-./bin/sentinel stats
+# Generate a balanced, PII-free starter triage dataset (+ holdout validation split)
+./bin/sentinel feedback seed --per-class 10 --val-per-class 2
 
-# Inspect or open Sentinel's local data directory without hunting for hidden folders
-./bin/sentinel data path
+# Label a captured alert as false positive or true positive (PII/secrets scrubbed automatically)
+./bin/sentinel feedback alerts --limit 10
+./bin/sentinel feedback add --alert-id sentinel-1763997000-1 --label fp
+
+# Dry-run FTaaS surprisal preflight audit, then train & activate a SmolLM2-135M-Instruct LoRA adapter
+./bin/sentinel train submit --seed-per-class 10 --audit-only
+./bin/sentinel train submit --seed-per-class 10 --wait --activate --sentinel-http http://127.0.0.1:8090
+
+# Run Tier 2 local LoRA triage during watch or offline scan
+./bin/sentinel watch --genesis-data-dir /path/to/genesis-segs --triage-mode http
+
+# Inspect live Sentinel stats or open Sentinel's local data directory
+./bin/sentinel stats
 ./bin/sentinel data status
 ./bin/sentinel data open
 
-# Purge Sentinel local state (cursors, baselines, unexported feedback queues)
+# Purge Sentinel local state (cursors, baselines, alert journals, unexported feedback queues)
 ./bin/sentinel burn -y
 ```
 

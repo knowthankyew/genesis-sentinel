@@ -23,6 +23,8 @@ const (
 	DefaultMaxTrainingRecords   = 50000
 	DefaultMaxTrainingFileBytes = 25 * 1024 * 1024
 	MaxBaselineWindowSize       = 10000
+	DefaultTriageMaxTokens      = 96
+	DefaultTriageTemperature    = 0.1
 )
 
 // Config represents all operational configuration options for Genesis Sentinel.
@@ -52,11 +54,15 @@ type Config struct {
 	BaselineWindowSize int     `json:"baseline_window_size"`
 
 	// Tier 2: FTaaS Training & Local LoRA Inference (Smol-first; Gemma Phase 5; BitNet excluded)
-	BaseModel     string `json:"base_model"`
-	AdapterPath   string `json:"adapter_path"`
-	FTaaSAPIAddr  string `json:"ftaas_api_http"`
-	InferenceAddr string `json:"inference_http"`
-	MaxPromptByte int    `json:"max_prompt_bytes"`
+	TriageMode        string  `json:"triage_mode"` // "off" (default) | "http"
+	TriageMaxTokens   int     `json:"triage_max_tokens"`
+	TriageTemperature float64 `json:"triage_temperature"`
+	BaseModel         string  `json:"base_model"`
+	AdapterPath       string  `json:"adapter_path"`
+	FTaaSAPIAddr      string  `json:"ftaas_api_http"`
+	FTaaSAPIKey       string  `json:"ftaas_api_key"`
+	InferenceAddr     string  `json:"inference_http"`
+	MaxPromptByte     int     `json:"max_prompt_bytes"`
 
 	// Local Disk State & Privacy Guardrails (intentional Pillar 1 variance; see ADR-4)
 	DataDir              string `json:"data_dir"`
@@ -96,9 +102,13 @@ func DefaultConfig() *Config {
 		SurprisalHTTPAddr:    "http://127.0.0.1:5200",
 		SurprisalThreshold:   DefaultSurprisalThreshold,
 		BaselineWindowSize:   2000,
+		TriageMode:           "off",
+		TriageMaxTokens:      DefaultTriageMaxTokens,
+		TriageTemperature:    DefaultTriageTemperature,
 		BaseModel:            model.ModelSmolLM2135MInstruct,
 		AdapterPath:          "",
 		FTaaSAPIAddr:         "http://127.0.0.1:5100",
+		FTaaSAPIKey:          "",
 		InferenceAddr:        "http://127.0.0.1:8000",
 		MaxPromptByte:        DefaultMaxPromptBytes,
 		DataDir:              dataDir,
@@ -164,6 +174,33 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxMemMB <= 0 {
 		return fmt.Errorf("max_mem_mb must be positive, got %d", c.MaxMemMB)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(c.TriageMode)) {
+	case "", "off":
+		c.TriageMode = "off"
+	case "http":
+		c.TriageMode = "http"
+	default:
+		return fmt.Errorf("invalid triage_mode %q: must be off or http", c.TriageMode)
+	}
+	if c.TriageMaxTokens < 16 || c.TriageMaxTokens > 256 {
+		return fmt.Errorf("triage_max_tokens must be between 16 and 256, got %d", c.TriageMaxTokens)
+	}
+	if math.IsNaN(c.TriageTemperature) || math.IsInf(c.TriageTemperature, 0) || c.TriageTemperature < 0 || c.TriageTemperature > 1.0 {
+		return fmt.Errorf("triage_temperature must be finite and in [0.0, 1.0], got %v", c.TriageTemperature)
+	}
+	if trimmedAdapter := strings.TrimSpace(c.AdapterPath); trimmedAdapter != "" {
+		if strings.HasPrefix(trimmedAdapter, "/") || strings.ContainsRune(trimmedAdapter, '\\') ||
+			strings.ContainsRune(trimmedAdapter, '\x00') || strings.ContainsAny(trimmedAdapter, "\r\n") ||
+			(len(trimmedAdapter) >= 2 && trimmedAdapter[1] == ':') {
+			return fmt.Errorf("adapter_path %q must be a relative forward-slash path under artifacts/", c.AdapterPath)
+		}
+		for _, seg := range strings.Split(trimmedAdapter, "/") {
+			if seg == ".." {
+				return fmt.Errorf("adapter_path %q must not contain path traversal segments", c.AdapterPath)
+			}
+		}
 	}
 
 	if !c.AllowAllInterfaces && security.IsBindingAllInterfaces(c.HTTPAddr) {
@@ -243,6 +280,19 @@ func loadFromEnv(cfg *Config) {
 			cfg.BaselineWindowSize = n
 		}
 	}
+	if v := os.Getenv("SENTINEL_TRIAGE_MODE"); v != "" {
+		cfg.TriageMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("SENTINEL_TRIAGE_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TriageMaxTokens = n
+		}
+	}
+	if v := os.Getenv("SENTINEL_TRIAGE_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.TriageTemperature = f
+		}
+	}
 	if v := os.Getenv("SENTINEL_BASE_MODEL"); v != "" {
 		cfg.BaseModel = v
 	}
@@ -251,6 +301,9 @@ func loadFromEnv(cfg *Config) {
 	}
 	if v := os.Getenv("SENTINEL_FTAAS_API_HTTP"); v != "" {
 		cfg.FTaaSAPIAddr = v
+	}
+	if v := os.Getenv("SENTINEL_FTAAS_API_KEY"); v != "" {
+		cfg.FTaaSAPIKey = v
 	}
 	if v := os.Getenv("SENTINEL_INFERENCE_HTTP"); v != "" {
 		cfg.InferenceAddr = v

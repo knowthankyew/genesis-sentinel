@@ -15,7 +15,7 @@ import (
 )
 
 // Version identifies the current Genesis Sentinel release stage.
-const Version = "0.3.0-phase2"
+const Version = "0.4.0-phase3"
 
 // openDirFn launches the OS file manager for `sentinel data open` (overridable in tests).
 var openDirFn = openDirectoryOS
@@ -39,9 +39,9 @@ func ExecuteWithOutput(args []string, stdout, stderr io.Writer) error {
 	case "scan":
 		return runScan(args[1:], stdout, stderr)
 	case "feedback":
-		return notImplemented("feedback", "Phase 3 (Redacted Feedback Curation for FTaaS)")
+		return runFeedback(args[1:], stdout, stderr)
 	case "train":
-		return notImplemented("train", "Phase 3 (Async SmolLM2-Instruct LoRA Job Submission to FTaaS)")
+		return runTrain(args[1:], stdout, stderr)
 	case "stats":
 		return runStats(args[1:], stdout, stderr)
 	case "burn":
@@ -86,6 +86,9 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	}
 	if safeCopy.GenesisAuthToken != "" {
 		safeCopy.GenesisAuthToken = "[REDACTED]"
+	}
+	if safeCopy.FTaaSAPIKey != "" {
+		safeCopy.FTaaSAPIKey = "[REDACTED]"
 	}
 
 	enc := json.NewEncoder(stdout)
@@ -180,10 +183,6 @@ func openDirectoryOS(dir string) error {
 	}
 }
 
-func notImplemented(cmd, roadmapPhase string) error {
-	return fmt.Errorf("%q is scheduled for %s — see docs/ROADMAP.md", cmd, roadmapPhase)
-}
-
 // PrintUsage writes the Genesis Sentinel CLI usage help text.
 func PrintUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, `Genesis Sentinel - Local-First Tiered Log Triage & Anomaly Sidecar
@@ -194,10 +193,10 @@ Usage:
 Commands:
   watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2
   scan      Run an offline scan over Genesis .seg files, raw log files, or synthetic replay
-  feedback  Label alerts as true/false positives and export redacted JSONL (Phase 3)
-  train     Submit a redacted feedback dataset to local FTaaS (SmolLM2-Instruct) (Phase 3)
-  stats     Display live pipeline throughput, surprisal, and alert metrics
-  burn      Purge Sentinel disk state, baselines, and unexported local queues
+  feedback  Label alerts as true/false positives, seed starter data, and export redacted JSONL
+  train     Audit/submit redacted feedback datasets to local FTaaS and activate LoRA adapters
+  stats     Display live pipeline throughput, surprisal, triage, and alert metrics
+  burn      Purge Sentinel disk state, baselines, alert journals, and unexported feedback queues
   data      Inspect or open Sentinel's local data directory (path | status | open)
   config    Validate and print the resolved Sentinel configuration
   version   Print the Genesis Sentinel version

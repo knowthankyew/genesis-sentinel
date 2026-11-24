@@ -5,7 +5,7 @@
 > **Active Base Model Tier**: **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default; `SmolLM2-360M-Instruct` step-up)  
 > **Phase 5 Reasoning Tier**: **Gemma 2 2B IT** (`google/gemma-2-2b-it`)  
 > **Explicitly Excluded**: **BitNet b1.58** (experimental; deferred pending upstream development cycle)  
-> **Status**: 🟢 **PHASES 0–2 COMPLETE** | 🟡 **PHASE 3 NEXT**  
+> **Status**: 🟢 **PHASES 0–3 COMPLETE (Sentinel Core)** | 🟡 **PHASE 4 NEXT**  
 > **Date**: 2026-11-24
 
 ---
@@ -36,7 +36,7 @@ flowchart LR
 | **Phase 0** | **Scaffold & Governance** | Local Git repo, pure-Go stdlib scaffold, domain contracts, loopback & prompt-injection guards, ADRs, Architecture Spec, Roadmap | Contract-only (`SmolLM2` default) | 🟢 **Completed** |
 | **Phase 1** | **Genesis Bridge & Tier 0** | Lossless `.seg` CRC32 tailer + `/query` sliding-window reader, Drain-style template collapser, JSON deterministic rule/IOC engine, Genesis alert sink (`service=sentinel`), `watch`/`scan`/`stats`/`burn` | None (Pure Go) | 🟢 **Completed** |
 | **Phase 2** | **Tier 1 Surprisal Engine** | Log-domain feature extractor + Laplace-LK surprisal scorer (in-process Go engine + optional `surprisal-service` HTTP parity mode), rolling baseline manager, anomaly threshold calibration | None (Information-Theoretic Math) | 🟢 **Completed** |
-| **Phase 3** | **Tier 2 SmolLM2 Triage & FTaaS Loop** | Curated log triage dataset generator (synthetic + redacted local baselines), FTaaS training integration (`max_length` tuning in `ml`), `sentinel feedback` & `sentinel train`, local SmolLM2 inference client (HTTP / ONNX) | **SmolLM2-135M** (or `SmolLM2-135M-Instruct`) | ⬜ Planned |
+| **Phase 3** | **Tier 2 SmolLM2 Triage & FTaaS Loop** | Curated log triage dataset generator (synthetic + redacted local baselines), `internal/triage` loopback LoRA client & fail-closed parser, `sentinel feedback` & `sentinel train`, `POST /adapter` live hot-swap (plus optional companion updates in `ml`) | **SmolLM2-135M-Instruct** (`360M-Instruct` step-up) | 🟢 **Completed (Sentinel Core)** |
 | **Phase 4** | **Hardening, Benchmarks & Ops** | Hostile-log prompt-injection test harness, live replay benchmark (`cmd/sentinel-bench`), empirical metrics & claims audit (`scripts/audit-claims.py`), `launchd`/`systemd` units, optional `all-MiniLM-L6-v2` comparison | SmolLM2 | ⬜ Planned |
 | **Phase 5** | **Gemma 2 2B IT Upgrade** | High-capacity reasoning adapter training on `google/gemma-2-2b-it`, tiered Smol-to-Gemma escalation for high-severity incidents, side-by-side quality vs. latency benchmark report | **Gemma 2 2B IT** | ⬜ Deferred to End |
 
@@ -88,7 +88,7 @@ flowchart LR
 
 ---
 
-### Phase 3: Tier 2 SmolLM2 LoRA Triage & FTaaS Feedback Loop
+### Phase 3: Tier 2 SmolLM2 LoRA Triage & FTaaS Feedback Loop (Completed — Sentinel Core)
 - **Goal**: Prove the entire "train an adapter on curated host logs → run lightweight local triage → refine with operator feedback" loop quickly on **SmolLM2** before investing compute in larger models.
 - **Deliverables**:
   - **Starter Security Triage Taxonomy & Synthetic Seed Dataset**: Structured `prompt -> completion` JSONL schema covering common classes (`[BENIGN-NOISE]`, `[RECON-SCAN]`, `[AUTH-BRUTEFORCE]`, `[INJECTION-ATTEMPT]`, `[EXFIL-SUSPECT]`, `[PRIV-ESC]`, `[POLICY-ANOMALY]`, `[NEEDS-REVIEW]`).

@@ -20,24 +20,28 @@ import (
 
 // ScanReport is the machine-readable summary produced by `sentinel scan`.
 type ScanReport struct {
-	Source                 string       `json:"source"`
-	ElapsedMs              float64      `json:"elapsed_ms"`
-	ThroughputLPS          float64      `json:"throughput_lps"`
-	LinesRead              uint64       `json:"lines_read"`
-	OversizedLines         uint64       `json:"oversized_lines"`
-	TemplatesEmitted       uint64       `json:"templates_emitted"`
-	CollapseRatio          float64      `json:"collapse_ratio"`
-	AlertsEmitted          uint64       `json:"alerts_emitted"`
-	SinkErrors             uint64       `json:"sink_errors"`
-	InjectionSignals       uint64       `json:"injection_signals"`
-	SurprisalMode          string       `json:"surprisal_mode"`
-	SurprisalScored        uint64       `json:"surprisal_scored"`
-	SurprisalAnomalies     uint64       `json:"surprisal_anomalies"`
-	SurprisalBaselineCases int          `json:"surprisal_baseline_cases"`
-	SurprisalMaxNats       float64      `json:"surprisal_max_nats"`
-	CorruptedFrames        uint64       `json:"corrupted_frames"`
-	HeapBytes              uint64       `json:"heap_bytes"`
-	Alerts                 []emit.Alert `json:"alerts"`
+	Source                   string       `json:"source"`
+	ElapsedMs                float64      `json:"elapsed_ms"`
+	ThroughputLPS            float64      `json:"throughput_lps"`
+	LinesRead                uint64       `json:"lines_read"`
+	OversizedLines           uint64       `json:"oversized_lines"`
+	TemplatesEmitted         uint64       `json:"templates_emitted"`
+	CollapseRatio            float64      `json:"collapse_ratio"`
+	AlertsEmitted            uint64       `json:"alerts_emitted"`
+	SinkErrors               uint64       `json:"sink_errors"`
+	InjectionSignals         uint64       `json:"injection_signals"`
+	SurprisalMode            string       `json:"surprisal_mode"`
+	SurprisalScored          uint64       `json:"surprisal_scored"`
+	SurprisalAnomalies       uint64       `json:"surprisal_anomalies"`
+	SurprisalBaselineCases   int          `json:"surprisal_baseline_cases"`
+	SurprisalMaxNats         float64      `json:"surprisal_max_nats"`
+	TriageMode               string       `json:"triage_mode"`
+	TriageEvaluated          uint64       `json:"triage_evaluated"`
+	TriageFallbacks          uint64       `json:"triage_fallbacks"`
+	TriageInjectionOverrides uint64       `json:"triage_injection_overrides"`
+	CorruptedFrames          uint64       `json:"corrupted_frames"`
+	HeapBytes                uint64       `json:"heap_bytes"`
+	Alerts                   []emit.Alert `json:"alerts"`
 }
 
 func runScan(args []string, stdout, stderr io.Writer) error {
@@ -52,6 +56,10 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	baselinePath := fs.String("baseline", "", "Optional path to a saved baseline.json snapshot for Tier 1 surprisal scoring")
 	surprisalMode := fs.String("surprisal-mode", "", "Tier 1 surprisal mode: inprocess | http | hybrid")
 	surprisalThreshold := fs.Float64("surprisal-threshold", 0, "Tier 1 surprisal anomaly threshold in nats")
+	triageMode := fs.String("triage-mode", "", "Tier 2 local LoRA triage mode: off | http")
+	inferenceHTTP := fs.String("inference-http", "", "Loopback URL for ml/src/FtaaSService.Inference (:8000)")
+	baseModel := fs.String("base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
+	adapterPath := fs.String("adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
 	windowEvents := fs.Int("window-events", 0, "Optional event batch size per window flush during offline replay (0 = single flush)")
 	asJSON := fs.Bool("json", false, "Emit full ScanReport as JSON")
 	emitGenesis := fs.Bool("emit-genesis", false, "Also emit detected alerts to Genesis TCP ingest")
@@ -75,6 +83,14 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 			cfg.SurprisalMode = *surprisalMode
 		case "surprisal-threshold":
 			cfg.SurprisalThreshold = *surprisalThreshold
+		case "triage-mode":
+			cfg.TriageMode = *triageMode
+		case "inference-http":
+			cfg.InferenceAddr = *inferenceHTTP
+		case "base-model":
+			cfg.BaseModel = *baseModel
+		case "adapter-path":
+			cfg.AdapterPath = *adapterPath
 		}
 	})
 	if err := cfg.Validate(); err != nil {
@@ -167,24 +183,28 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	}
 
 	report := ScanReport{
-		Source:                 sourceLabel,
-		ElapsedMs:              float64(elapsed.Microseconds()) / 1000.0,
-		ThroughputLPS:          lps,
-		LinesRead:              st.LinesRead,
-		OversizedLines:         oversizedLines,
-		TemplatesEmitted:       st.TemplatesEmitted,
-		CollapseRatio:          st.CollapseRatio,
-		AlertsEmitted:          st.AlertsEmitted,
-		SinkErrors:             st.SinkErrors,
-		InjectionSignals:       st.InjectionSignals,
-		SurprisalMode:          st.SurprisalMode,
-		SurprisalScored:        st.SurprisalScored,
-		SurprisalAnomalies:     st.SurprisalAnomalies,
-		SurprisalBaselineCases: st.SurprisalBaselineCases,
-		SurprisalMaxNats:       st.SurprisalMaxNats,
-		CorruptedFrames:        st.CorruptedFrames,
-		HeapBytes:              st.HeapBytes,
-		Alerts:                 alerts,
+		Source:                   sourceLabel,
+		ElapsedMs:                float64(elapsed.Microseconds()) / 1000.0,
+		ThroughputLPS:            lps,
+		LinesRead:                st.LinesRead,
+		OversizedLines:           oversizedLines,
+		TemplatesEmitted:         st.TemplatesEmitted,
+		CollapseRatio:            st.CollapseRatio,
+		AlertsEmitted:            st.AlertsEmitted,
+		SinkErrors:               st.SinkErrors,
+		InjectionSignals:         st.InjectionSignals,
+		SurprisalMode:            st.SurprisalMode,
+		SurprisalScored:          st.SurprisalScored,
+		SurprisalAnomalies:       st.SurprisalAnomalies,
+		SurprisalBaselineCases:   st.SurprisalBaselineCases,
+		SurprisalMaxNats:         st.SurprisalMaxNats,
+		TriageMode:               st.TriageMode,
+		TriageEvaluated:          st.TriageEvaluated,
+		TriageFallbacks:          st.TriageFallbacks,
+		TriageInjectionOverrides: st.TriageInjectionOverrides,
+		CorruptedFrames:          st.CorruptedFrames,
+		HeapBytes:                st.HeapBytes,
+		Alerts:                   alerts,
 	}
 
 	if *asJSON {
@@ -209,6 +229,10 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		func() error {
 			return writef("  Tier 1 Surprisal: mode=%s scored=%d anomalies=%d max=%.2fnats baseline=%d\n",
 				report.SurprisalMode, report.SurprisalScored, report.SurprisalAnomalies, report.SurprisalMaxNats, report.SurprisalBaselineCases)
+		},
+		func() error {
+			return writef("  Tier 2 Triage   : mode=%s evaluated=%d fallbacks=%d injection_overrides=%d\n",
+				report.TriageMode, report.TriageEvaluated, report.TriageFallbacks, report.TriageInjectionOverrides)
 		},
 		func() error {
 			return writef("  Elapsed         : %.2f ms (%.0f lines/sec)\n", report.ElapsedMs, report.ThroughputLPS)

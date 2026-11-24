@@ -22,7 +22,7 @@ class TestClaimsLinter(unittest.TestCase):
     def test_go_constants_and_safe_bounds(self):
         """Verify Go core constants match expected architectural bounds."""
         version = sync_docs.extract_go_constant(REPO_ROOT / "internal" / "cli" / "cli.go", "Version")
-        self.assertEqual(version, "0.3.0-phase2")
+        self.assertEqual(version, "0.4.0-phase3")
 
         max_clusters = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "template" / "drain.go", "DefaultMaxClusters"
@@ -118,6 +118,21 @@ class TestClaimsLinter(unittest.TestCase):
             REPO_ROOT / "internal" / "model" / "types.go", "ModelGemma22BIT"
         )
         self.assertEqual(gemma_model, "google/gemma-2-2b-it")
+
+        triage_tokens = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "config" / "config.go", "DefaultTriageMaxTokens"
+        )
+        self.assertEqual(triage_tokens, 96)
+
+        max_exp = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "triage" / "taxonomy.go", "MaxExplanationBytes"
+        )
+        self.assertEqual(max_exp, 512)
+
+        max_journal = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "feedback" / "alerts_journal.go", "MaxAlertJournalRecords"
+        )
+        self.assertEqual(max_journal, 2000)
 
     def test_all_registered_claims_resolve_and_sync(self):
         """Verify every claim in docs/claims_registry.json resolves and matches its target docs."""

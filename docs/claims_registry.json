@@ -160,6 +160,27 @@
       "format_rule": "{value}",
       "used_in": ["NOTICE.md", "docs/ARCHITECTURE.md"],
       "description": "Phase 5 reasoning-tier base model identifier"
+    },
+    "triage_default_max_tokens": {
+      "source_artifact": "internal/config/config.go",
+      "go_const": "DefaultTriageMaxTokens",
+      "format_rule": "{value} tokens",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Default maximum generated tokens for Tier 2 local LoRA triage verdicts"
+    },
+    "triage_max_explanation_bytes": {
+      "source_artifact": "internal/triage/taxonomy.go",
+      "go_const": "MaxExplanationBytes",
+      "format_rule": "{value} bytes",
+      "used_in": ["SECURITY.md"],
+      "description": "Maximum sanitized explanation byte length retained from untrusted Tier 2 model output"
+    },
+    "feedback_max_alert_journal_records": {
+      "source_artifact": "internal/feedback/alerts_journal.go",
+      "go_const": "MaxAlertJournalRecords",
+      "format_rule": "{value:,}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Maximum recent alerts retained in local alerts.jsonl for operator feedback lookup"
     }
   }
 }

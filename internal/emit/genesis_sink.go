@@ -38,6 +38,13 @@ type Alert struct {
 	InjectionSuspected   bool               `json:"injection_suspected"`
 	InjectionSignals     []string           `json:"injection_signals,omitempty"`
 	SanitizedSample      string             `json:"sanitized_sample"`
+	TriageClass          string             `json:"triage_class,omitempty"`
+	TriageConfidence     float64            `json:"triage_confidence,omitempty"`
+	TriageMitreTactic    string             `json:"triage_mitre_tactic,omitempty"`
+	TriageExplanation    string             `json:"triage_explanation,omitempty"`
+	TriageModel          string             `json:"triage_model,omitempty"`
+	TriageAdapter        string             `json:"triage_adapter,omitempty"`
+	TriageOverridden     bool               `json:"triage_overridden,omitempty"`
 }
 
 // Sink receives structured Sentinel alerts.

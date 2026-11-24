@@ -64,6 +64,27 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 			t.Fatalf("expected SurprisalThreshold=%v to fail validation", badThresh)
 		}
 	}
+
+	cfg = DefaultConfig()
+	cfg.TriageMode = "invalid"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid triage_mode to fail validation")
+	}
+	cfg = DefaultConfig()
+	cfg.AdapterPath = "../escape"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected traversal adapter_path to fail validation")
+	}
+	cfg = DefaultConfig()
+	cfg.TriageMaxTokens = 999
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected out-of-range triage_max_tokens to fail validation")
+	}
+	cfg = DefaultConfig()
+	cfg.TriageTemperature = math.NaN()
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected NaN triage_temperature to fail validation")
+	}
 }
 
 func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {

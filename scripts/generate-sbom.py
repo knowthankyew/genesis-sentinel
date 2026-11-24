@@ -54,16 +54,19 @@ def generate_sbom(
     app_ref = f"pkg:golang/github.com/knowthankyew/genesis-sentinel@{version}?arch={arch}"
 
     internal_packages = [
-        ("cli", "Unified CLI subcommand router (watch, scan, stats, burn, data, config, version, help) and Phase 3 stubs"),
+        ("cli", "Unified CLI subcommand router (watch, scan, feedback, train, stats, burn, data, config, version, help)"),
         ("config", "Layered configuration loader (defaults -> sentinel.json -> SENTINEL_* env -> flags) with fail-closed validation and token redaction"),
-        ("emit", "Loopback TCP JSONL alert sink emitting structured alerts into Project Genesis (service=sentinel) with QoS severity mapping"),
+        ("emit", "Loopback TCP JSONL alert sink emitting structured Tier 0/1/2 alerts into Project Genesis (service=sentinel) with QoS severity mapping"),
+        ("feedback", "Mandatory PII/secret redactor, SSA SSN/Luhn compliance scanner, synthetic starter seed generator, curated FTaaS JSONL store, and bounded alert journal"),
         ("ingest", "Read-only lossless Genesis .seg CRC32 segment tailer with atomic cursor persistence, HTTP /query fallback poller, multi-format parser, and Track A synthetic corpus generator"),
-        ("model", "Tier wire contracts (LogEvent, TemplateWindow, RuleHit, SurprisalScore, TriageVerdict, FeedbackRecord) and fail-closed base model allowlist"),
-        ("pipeline", "Tier 0 orchestrator, self-alert loop-prevention guard, HTTP status/burn server, and safe local disk state purge"),
+        ("model", "Tier wire contracts (LogEvent, TemplateWindow, RuleHit, SurprisalScore, TriageVerdict, FeedbackRecord), Unicode fold canonicalizer, and fail-closed base model allowlist"),
+        ("pipeline", "Tier 0/1/2 orchestrator, self-alert loop-prevention guard, HTTP status/adapter/burn server, and safe local disk state purge"),
         ("rules", "Precompiled Go RE2 deterministic rule engine (rules.json and built-in SENT-001..SENT-008 starter pack) with burst, entropy, and suppression support"),
         ("security", "Constant-time Bearer auth middleware, dial-time loopback IP enforcement, and hostile-log prompt-injection sanitizer"),
         ("surprisal", "Clean-room pure-Go Laplace-LK log surprisal engine (arXiv:2510.22809 Equations 4, 6, 7, 8), rolling baseline persistence, and loopback-by-default HTTP parity client"),
         ("template", "Bounded pure-Go Drain-style prefix-tree template collapser with linear ASCII masking and peak Shannon entropy tracking"),
+        ("train", "Loopback FTaaS API client for dataset preflight audits, async SmolLM2-Instruct LoRA job submission/polling, and active adapter persistence/hot-reload"),
+        ("triage", "Tier 2 security triage taxonomy, prompt-injection-resistant data framing, fail-closed completion parser, and loopback local LoRA inference client"),
     ]
 
     components = []

@@ -18,10 +18,12 @@ import (
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/emit"
+	"github.com/knowthankyew/genesis-sentinel/internal/feedback"
 	"github.com/knowthankyew/genesis-sentinel/internal/ingest"
 	"github.com/knowthankyew/genesis-sentinel/internal/pipeline"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
+	"github.com/knowthankyew/genesis-sentinel/internal/train"
 )
 
 func runWatch(args []string, stdout, stderr io.Writer) error {
@@ -44,6 +46,10 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		surprisalHTTP      string
 		surprisalThreshold float64
 		baselineSize       int
+		triageMode         string
+		inferenceHTTP      string
+		baseModel          string
+		adapterPath        string
 		pollInterval       time.Duration
 		dryRun             bool
 		stdoutAlerts       bool
@@ -61,6 +67,10 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&surprisalHTTP, "surprisal-http", "", "Loopback URL for ml/src/surprisal-service (:5200)")
 	fs.Float64Var(&surprisalThreshold, "surprisal-threshold", 0, "Tier 1 surprisal anomaly threshold in nats (default 5.0)")
 	fs.IntVar(&baselineSize, "baseline-size", 0, "Tier 1 rolling baseline capacity (default 2000)")
+	fs.StringVar(&triageMode, "triage-mode", "", "Tier 2 local LoRA triage mode: off | http")
+	fs.StringVar(&inferenceHTTP, "inference-http", "", "Loopback URL for ml/src/FtaaSService.Inference (:8000)")
+	fs.StringVar(&baseModel, "base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
+	fs.StringVar(&adapterPath, "adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
 	fs.DurationVar(&pollInterval, "poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
 	fs.BoolVar(&dryRun, "dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
 	fs.BoolVar(&stdoutAlerts, "stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
@@ -101,8 +111,26 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			cfg.SurprisalThreshold = surprisalThreshold
 		case "baseline-size":
 			cfg.BaselineWindowSize = baselineSize
+		case "triage-mode":
+			cfg.TriageMode = triageMode
+		case "inference-http":
+			cfg.InferenceAddr = inferenceHTTP
+		case "base-model":
+			cfg.BaseModel = baseModel
+		case "adapter-path":
+			cfg.AdapterPath = adapterPath
 		}
 	})
+
+	// Auto-load persisted active LoRA adapter manifest if no explicit adapter_path was configured.
+	if cfg.AdapterPath == "" && cfg.DataDir != "" {
+		if active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir); loadErr == nil && exists {
+			cfg.AdapterPath = active.AdapterPath
+			if baseModel == "" && active.BaseModel != "" {
+				cfg.BaseModel = active.BaseModel
+			}
+		}
+	}
 
 	if d, parseErr := time.ParseDuration(cfg.WindowStr); parseErr != nil || d <= 0 {
 		return fmt.Errorf("invalid -window duration %q", cfg.WindowStr)
@@ -167,6 +195,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
 	pipe.AttachSegReader(segReader)
 	pipe.AttachQueryPoller(queryPoller)
+	if cfg.DataDir != "" {
+		pipe.AttachAlertJournal(feedback.NewAlertJournal(cfg.DataDir))
+	}
 
 	// Hydrate persisted Tier 1 rolling baseline snapshot if present.
 	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
@@ -183,11 +214,17 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 
 	// Surface active disk paths prominently on startup (ADR-4 transparency).
 	logger.Println("==========================================================")
-	logger.Printf("  GENESIS SENTINEL %s (Tier 0 Rules + Tier 1 Laplace-LK)", Version)
+	logger.Printf("  GENESIS SENTINEL %s (Tier 0 Rules + Tier 1 Surprisal + Tier 2 LoRA)", Version)
 	logger.Println("==========================================================")
 	logger.Printf("[Disk]   Sentinel Data Dir : %s (open via `sentinel data open`)", cfg.DataDir)
 	logger.Printf("[Tier1]  Laplace-LK Mode   : %s | Threshold: %.2f nats | Baseline: %d/%d (%s)",
 		cfg.SurprisalMode, cfg.SurprisalThreshold, loadedBaseline, cfg.BaselineWindowSize, baselinePath)
+	if cfg.TriageMode == "http" {
+		logger.Printf("[Tier2]  LoRA Triage Mode  : http (%s) | Model: %s | Adapter: %q",
+			cfg.InferenceAddr, cfg.BaseModel, cfg.AdapterPath)
+	} else {
+		logger.Printf("[Tier2]  LoRA Triage Mode  : off (enable via --triage-mode http; default model %s)", cfg.BaseModel)
+	}
 	if activeSource == "segdir" {
 		logger.Printf("[Source] Lossless .seg Dir : %s (cursor: %s)", cfg.GenesisDataDir, cursorPath)
 	} else {
@@ -204,6 +241,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	mux.HandleFunc("/healthz", pipe.HandleHealthz)
 	mux.HandleFunc("/stats", pipe.HandleStats)
 	mux.HandleFunc("/burn", pipe.HandleBurn)
+	mux.HandleFunc("/adapter", pipe.HandleAdapter)
 
 	httpSrv := &http.Server{
 		Handler:           security.AuthMiddleware(cfg.AuthToken, mux),
@@ -214,7 +252,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 
 	go func() {
-		logger.Printf("[HTTP]   Stats & Health    : http://%s (/healthz, /stats, DELETE /burn)", ln.Addr().String())
+		logger.Printf("[HTTP]   Stats & Health    : http://%s (/healthz, /stats, POST /adapter, DELETE /burn)", ln.Addr().String())
 		if serveErr := httpSrv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			logger.Printf("[HTTP]   Server error: %v", serveErr)
 		}

@@ -299,7 +299,7 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
     if gosum_path.is_file() and gosum_path.read_text(encoding="utf-8").strip():
         errors.append("go.sum is non-empty (violates stdlib-only invariant)")
 
-    # 2. Security, Model Governance (BitNet excluded), Config Redaction & Burn Invariant Go Tests
+    # 2. Security, Model Governance (BitNet excluded), Config Redaction, Tier 2/Feedback & Burn Invariant Go Tests
     run_check(
         [
             "go",
@@ -309,16 +309,21 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/config",
             "./internal/cli",
             "./internal/pipeline",
+            "./internal/triage",
+            "./internal/feedback",
+            "./internal/train",
             "-run",
             (
                 "^(TestIsLoopbackEndpoint|TestIsBindingAllInterfaces|TestAuthMiddleware|"
                 "TestSanitizeUntrustedLogText|TestNewLoopbackHTTPClientRedirectPolicies|"
                 "TestValidateBaseModel|TestDefaultConfigValidates|TestConfigRejectsBitNetAndNonLoopback|"
                 "TestExecuteConfigRedactsTokens|TestExecuteDataSubcommands|"
-                "TestBurnLocalStateRejectsFeedbackSymlinkEscape|TestPipelineCountsOnlySuccessfulSinkEmissions)$"
+                "TestBurnLocalStateRejectsFeedbackSymlinkEscape|TestPipelineCountsOnlySuccessfulSinkEmissions|"
+                "TestClientValidationRejectsBitNetOffLoopbackAndTraversal|TestParseCompletionFailClosedAndInjectionOverride|"
+                "TestRedactTextAndScanForPII|TestFTaaSClientRejectsBitNetNonLoopbackAndUnredactedPII)$"
             ),
         ],
-        "Go Security, Model Governance & Burn Invariant Tests",
+        "Go Security, Model Governance, Redaction & Burn Invariant Tests",
         errors,
     )
 
