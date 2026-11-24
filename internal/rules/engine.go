@@ -175,13 +175,20 @@ func NewEngine(pack RulePack) (*Engine, error) {
 		suppressions: make([]compiledSuppression, 0, len(pack.Suppressions)),
 	}
 
+	seenIDs := make(map[string]struct{}, len(pack.Rules))
 	for _, r := range pack.Rules {
 		if !r.Enabled {
 			continue
 		}
-		if strings.TrimSpace(r.ID) == "" {
+		id := strings.TrimSpace(r.ID)
+		if id == "" {
 			return nil, fmt.Errorf("rule missing required id")
 		}
+		if _, dup := seenIDs[id]; dup {
+			return nil, fmt.Errorf("duplicate enabled rule id %q", id)
+		}
+		seenIDs[id] = struct{}{}
+		r.ID = id
 		cr := compiledRule{rule: r}
 		if r.Pattern != "" {
 			re, err := regexp.Compile(r.Pattern)
@@ -331,6 +338,23 @@ func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes
 	return res
 }
 
+// SuppressedTemplatesForService returns the exact template strings suppressed by
+// template-scoped (non-pattern) suppressions applicable to service. Returned strings
+// reference the immutable compiled RulePack without copying untrusted event bytes.
+func (e *Engine) SuppressedTemplatesForService(service string) []string {
+	var out []string
+	for _, cs := range e.suppressions {
+		if cs.supp.Template == "" || cs.re != nil {
+			continue
+		}
+		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
+			continue
+		}
+		out = append(out, cs.supp.Template)
+	}
+	return out
+}
+
 // IsTemplateSuppressed evaluates template-scoped suppressions at window flush time.
 func (e *Engine) IsTemplateSuppressed(service, tmpl string) bool {
 	for _, cs := range e.suppressions {
@@ -355,16 +379,17 @@ func (e *Engine) IsTemplateSuppressed(service, tmpl string) bool {
 // prompt-injection heuristics, and compiled deterministic rules.
 // Enforces message-pattern suppressions per candidate sample, tests MinLength and
 // MinEntropy on the same candidate sample, evaluates message-pattern rules strictly
-// against unsuppressed sample messages (never falling back to w.Template), and avoids
-// applying total window Count to burst rules when mixed or suppressed samples are present.
-// Callers with exact per-rule event match counts should prefer EvaluateWithMatchCounts.
+// against unsuppressed sample messages (never falling back to w.Template), and counts
+// only confirmed matching samples for message-predicate rules when exact match counts
+// are unavailable. Callers with exact per-rule event match counts should use
+// EvaluateWithMatchCounts.
 func (e *Engine) Evaluate(w model.TemplateWindow, maxPromptBytes int) EvaluationResult {
 	return e.EvaluateWithMatchCounts(w, nil, maxPromptBytes)
 }
 
 // EvaluateWithMatchCounts inspects a TemplateWindow using optional per-rule matching-event
-// counts (keyed by rule ID). When matchCounts is non-nil, burst thresholds (MinCount) are
-// evaluated strictly against matchCounts[ruleID].
+// counts (keyed by rule ID). When matchCounts is non-nil, firing decisions use matchCounts[ruleID]
+// directly and treat retained preview samples as optional evidence.
 func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map[string]uint64, maxPromptBytes int) EvaluationResult {
 	// Service-only or template-only suppressions suppress the entire window.
 	if e.isWindowSuppressed(w) {
@@ -455,12 +480,11 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 		}
 		hasMsgPredicate := cr.re != nil || cr.rule.MinLength > 0 || cr.rule.MinEntropy > 0
 		matchedSample, matchedCount := matchRuleCandidates(cr, w, activeSamples, primarySample)
-		if hasMsgPredicate && matchedCount == 0 {
-			continue
-		}
 
 		var effectiveCount uint64
 		if matchCounts != nil {
+			// Exact event-level match counts drive firing even when preview cache is empty;
+			// retained sample matching is used only as optional evidence.
 			effectiveCount = matchCounts[cr.rule.ID]
 		} else if !hasMsgPredicate {
 			if w.Template != "<OVERFLOW>" && noSuppressedSamples {
@@ -468,17 +492,10 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 			} else {
 				effectiveCount = uint64(len(activeSamples))
 			}
-		} else if minReq <= 1 {
-			effectiveCount = uint64(matchedCount)
 		} else {
-			// Burst rule with a message predicate (e.g. SENT-001) and no explicit matchCounts:
-			// only treat w.Count as matching count when the window is non-overflow and every
-			// observed sample is unsuppressed and matched; otherwise count only matched samples.
-			if w.Template != "<OVERFLOW>" && noSuppressedSamples && len(rawCandidates) > 0 && matchedCount == len(rawCandidates) {
-				effectiveCount = w.Count
-			} else {
-				effectiveCount = uint64(matchedCount)
-			}
+			// Without exact event match counts, never extrapolate w.Count across unsampled
+			// events for message-predicate rules (count strictly confirmed matching previews).
+			effectiveCount = uint64(matchedCount)
 		}
 		if effectiveCount < minReq {
 			continue

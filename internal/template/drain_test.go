@@ -2,6 +2,7 @@ package template
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -223,5 +224,64 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 	}
 	if totalFlushedBytes > 8192 {
 		t.Fatalf("flushed retained sample bytes %d exceeds budget 8192", totalFlushedBytes)
+	}
+
+	// 4. NaN similarity threshold falls back to DefaultSimilarityThreshold (identical messages merge).
+	nanMiner := NewDrainMiner(2, math.NaN())
+	id1, _, ov1 := nanMiner.ExtractTemplate("api", "INFO", "ready")
+	id2, _, ov2 := nanMiner.ExtractTemplate("api", "INFO", "ready")
+	if ov1 || ov2 || id1 != id2 || nanMiner.ClusterCount() != 1 {
+		t.Fatalf("NaN threshold failed to merge identical messages: id1=%s id2=%s count=%d", id1, id2, nanMiner.ClusterCount())
+	}
+
+	// 5. Rejected cluster rolls back newly created tree keys & bytes so subsequent small messages still fit.
+	rbMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
+	rbMiner.SetMaxClusterBytes(12)
+	_, _, rejectedOv := rbMiner.ExtractTemplate("", "", "abcdefgh xyz")
+	if !rejectedOv || rbMiner.ClusterBytes() != 0 {
+		t.Fatalf("expected rejected cluster to roll back tree bytes to 0, got ov=%v bytes=%d", rejectedOv, rbMiner.ClusterBytes())
+	}
+	_, _, smallOv := rbMiner.ExtractTemplate("", "", "a")
+	if smallOv || rbMiner.ClusterCount() != 1 {
+		t.Fatalf("small message failed after rolled-back cluster rejection: ov=%v count=%d", smallOv, rbMiner.ClusterCount())
+	}
+
+	// 6. Generalization checks byte cap BEFORE mutating cluster tokens.
+	genMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
+	genMiner.SetMaxClusterBytes(6)
+	_, _, g1Ov := genMiner.ExtractTemplate("", "", "x y a b")
+	if g1Ov || genMiner.ClusterBytes() != 6 {
+		t.Fatalf("expected initial cluster to fit in 6 bytes, got ov=%v bytes=%d", g1Ov, genMiner.ClusterBytes())
+	}
+	_, _, g2Ov := genMiner.ExtractTemplate("", "", "x y c d")
+	if !g2Ov || genMiner.ClusterBytes() != 6 {
+		t.Fatalf("expected generalization exceeding 6-byte cap to overflow without mutating cluster, got ov=%v bytes=%d", g2Ov, genMiner.ClusterBytes())
+	}
+
+	// 7. Promoted preview is removed from AdditionalSamples and service/level window identities are bounded.
+	promoAgg := NewAggregator(8)
+	promoAgg.SetSampleByteLimits(1024, 1024, 6)
+	longSvc := strings.Repeat("S", 1024)
+	longLvl := strings.Repeat("L", 512)
+	promoAgg.Add(model.LogEvent{ID: 1, Timestamp: 1, Service: longSvc, Level: longLvl, Message: "k v x1y2z3w4"}) // mid entropy -> SampleLine="k v x1"
+	promoAgg.Add(model.LogEvent{ID: 2, Timestamp: 2, Service: longSvc, Level: longLvl, Message: "k v ab"})       // lower entropy -> AdditionalSamples=["k v ab"]
+	promoAgg.Add(model.LogEvent{ID: 3, Timestamp: 3, Service: longSvc, Level: longLvl, Message: "k v ab0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+	if got := promoAgg.RetainedSampleBytes(); got != 12 {
+		t.Fatalf("expected RetainedSampleBytes=12 after promotion dedup (6+6), got %d", got)
+	}
+	promoWins := promoAgg.Flush()
+	if len(promoWins) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(promoWins))
+	}
+	if len(promoWins[0].Service) > maxWindowServiceBytes || len(promoWins[0].Level) > maxWindowLevelBytes {
+		t.Fatalf("window display Service/Level exceeded caps: len(svc)=%d len(lvl)=%d", len(promoWins[0].Service), len(promoWins[0].Level))
+	}
+	if promoWins[0].SampleLine != "k v ab" {
+		t.Fatalf("expected promoted SampleLine=%q, got %q", "k v ab", promoWins[0].SampleLine)
+	}
+	for _, extra := range promoWins[0].AdditionalSamples {
+		if extra == "k v ab" {
+			t.Fatalf("promoted preview %q duplicated in AdditionalSamples: %+v", "k v ab", promoWins[0].AdditionalSamples)
+		}
 	}
 }

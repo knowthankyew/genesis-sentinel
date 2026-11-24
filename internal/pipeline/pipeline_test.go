@@ -263,8 +263,45 @@ func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
 	if _, err := BurnLocalState(dataDir); err == nil {
 		t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
 	}
-	if _, err := os.Stat(outsideFile); err != nil {
-		t.Fatalf("outside sentinel-feedback.jsonl was deleted through feedback symlink: %v", err)
+	// Verify BurnLocalState leaves an unrelated empty feedback directory in place
+	emptyFeedbackRoot := t.TempDir()
+	emptyFeedbackDir := filepath.Join(emptyFeedbackRoot, "feedback")
+	if err := os.MkdirAll(emptyFeedbackDir, 0700); err != nil {
+		t.Fatalf("mkdir empty feedback: %v", err)
+	}
+	if _, err := BurnLocalState(emptyFeedbackRoot); err != nil {
+		t.Fatalf("BurnLocalState on empty feedback dir failed: %v", err)
+	}
+	if _, err := os.Stat(emptyFeedbackDir); err != nil {
+		t.Fatalf("BurnLocalState deleted unrelated empty feedback directory: %v", err)
+	}
+}
+
+func TestPipelineDistinctLongServicesDoNotMergeInRuleBuckets(t *testing.T) {
+	cfg := config.DefaultConfig()
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	sharedPrefix := strings.Repeat("svc-long-prefix-", 12) // > 128 bytes display cap
+	svcA := sharedPrefix + "alpha"
+	svcB := sharedPrefix + "beta"
+
+	// 3 failures on svcA + 2 failures on svcB must remain distinct buckets and NOT combine to fire SENT-001!
+	for i := 0; i < 3; i++ {
+		pipe.IngestEvent(model.LogEvent{ID: uint64(i + 1), Timestamp: 100, Service: svcA, Level: "INFO", Message: "Failed password for invalid user alice"})
+	}
+	for i := 0; i < 2; i++ {
+		pipe.IngestEvent(model.LogEvent{ID: uint64(i + 10), Timestamp: 101, Service: svcB, Level: "INFO", Message: "Failed password for invalid user bob"})
+	}
+	if len(pipe.pendingHits) != 2 {
+		t.Fatalf("expected 2 distinct hashed buckets for long services sharing display prefix, got %d", len(pipe.pendingHits))
+	}
+	alerts, _ := pipe.FlushWindow()
+	if len(alerts) != 0 {
+		t.Fatalf("expected 0 SENT-001 alerts across distinct long services (3 + 2 < 5), got %+v", alerts)
 	}
 }
 
@@ -375,9 +412,18 @@ func TestPipelineAtomicWindowBoundaryUnderConcurrency(t *testing.T) {
 	if len(allAlerts) == 0 {
 		t.Fatal("expected at least one alert under concurrent ingest/flush")
 	}
+	var totalSENT003 uint64
 	for _, a := range allAlerts {
 		if a.Template == "<OVERFLOW>" {
 			t.Fatalf("concurrent FlushWindow split template and rule hit across windows (got <OVERFLOW>): %+v", a)
 		}
+		for _, rid := range a.RuleIDs {
+			if rid == "SENT-003" {
+				totalSENT003 += a.Count
+			}
+		}
+	}
+	if totalSENT003 != 200 {
+		t.Fatalf("expected total SENT-003 alert count across concurrent flushes = 200, got %d (alerts=%d)", totalSENT003, len(allAlerts))
 	}
 }

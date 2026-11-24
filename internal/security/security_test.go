@@ -2,6 +2,7 @@ package security
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -137,14 +138,21 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 		t.Fatalf("expected restricted client to use a Transport with Proxy == nil and loopback DialContext, got %#v", defaultClient.Transport)
 	}
 
-	// Verify DialLoopbackContext rejects non-loopback IPs and hostnames directly at dial time
-	if conn, err := DialLoopbackContext(context.Background(), "tcp", "192.0.2.1:80"); err == nil {
-		_ = conn.Close()
-		t.Fatal("expected DialLoopbackContext to reject non-loopback IP literal")
+	// Verify DialLoopbackContext rejects non-loopback IPs and hostnames with policy-specific errors.
+	// Use a pre-canceled context so any policy regression cannot initiate a network dial.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if conn, err := DialLoopbackContext(canceledCtx, "tcp", "192.0.2.1:80"); err == nil || !strings.Contains(err.Error(), "refusing non-loopback dial target") {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("expected policy rejection for non-loopback IP literal, got err=%v", err)
 	}
-	if conn, err := DialLoopbackContext(context.Background(), "tcp", "example.com:80"); err == nil {
-		_ = conn.Close()
-		t.Fatal("expected DialLoopbackContext to reject non-loopback hostname")
+	if conn, err := DialLoopbackContext(canceledCtx, "tcp", "example.com:80"); err == nil || !strings.Contains(err.Error(), "refusing non-loopback dial target") {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("expected policy rejection for non-loopback hostname, got err=%v", err)
 	}
 
 	// Verify restricted client reaches IPv4 localhost server via direct loopback dialing
@@ -161,28 +169,53 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 		t.Fatalf("expected 200 OK from localhost IPv4 server, got %d", localResp.StatusCode)
 	}
 
-	// Verify IPv6 loopback localhost fallback when IPv6 loopback is supported on the host
-	if ln6, err6 := net.Listen("tcp6", "[::1]:0"); err6 == nil {
+	// Verify IPv6 loopback localhost fallback when IPv6 loopback is supported on the host.
+	// Confirm IPv4 on the chosen port is unbound and assert a distinct IPv6-only body.
+	var ln6 net.Listener
+	var port6 string
+	for attempt := 0; attempt < 5; attempt++ {
+		cand, err6 := net.Listen("tcp6", "[::1]:0")
+		if err6 != nil {
+			break
+		}
+		_, p6, splitErr := net.SplitHostPort(cand.Addr().String())
+		if splitErr != nil {
+			_ = cand.Close()
+			t.Fatalf("split ipv6 addr: %v", splitErr)
+		}
+		// Ensure no IPv4 listener occupies the same numeric port on 127.0.0.1.
+		if probe, probeErr := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", p6), 50*time.Millisecond); probeErr == nil {
+			_ = probe.Close()
+			_ = cand.Close()
+			continue
+		}
+		ln6 = cand
+		port6 = p6
+		break
+	}
+	if ln6 != nil {
+		const ipv6Body = "ipv6-loopback-verified"
 		srv6 := &httptest.Server{
 			Listener: ln6,
 			Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(ipv6Body))
 			})},
 		}
 		srv6.Start()
 		defer srv6.Close()
 
-		_, port6, splitErr := net.SplitHostPort(ln6.Addr().String())
-		if splitErr != nil {
-			t.Fatalf("split ipv6 addr: %v", splitErr)
-		}
 		resp6, reqErr6 := defaultClient.Get("http://localhost:" + port6 + "/ok")
 		if reqErr6 != nil {
 			t.Fatalf("expected localhost dial to reach IPv6 loopback server: %v", reqErr6)
 		}
+		body6, readErr6 := io.ReadAll(resp6.Body)
 		_ = resp6.Body.Close()
-		if resp6.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200 OK from localhost IPv6 server, got %d", resp6.StatusCode)
+		if readErr6 != nil {
+			t.Fatalf("read ipv6 response body: %v", readErr6)
+		}
+		if resp6.StatusCode != http.StatusOK || string(body6) != ipv6Body {
+			t.Fatalf("expected IPv6 listener body %q with 200 OK, got status=%d body=%q", ipv6Body, resp6.StatusCode, string(body6))
 		}
 	}
 

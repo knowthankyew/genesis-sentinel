@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,10 +72,13 @@ type BurnReport struct {
 	Note         string    `json:"note"`
 }
 
+// ruleBucketKey uses fixed-size SHA-256 hashes of service and level alongside templateID
+// so arbitrarily long adversarial service/level strings never retain megabytes in pendingHits
+// while distinct services with matching display prefixes are never merged.
 type ruleBucketKey struct {
-	templateID string
-	service    string
-	level      string
+	templateID  string
+	serviceHash [sha256.Size]byte
+	levelHash   [sha256.Size]byte
 }
 
 type ruleAccumulator struct {
@@ -85,13 +90,16 @@ type ruleAccumulator struct {
 }
 
 type bucketAccumulator struct {
-	key             ruleBucketKey
-	lastSeenUnix    int64
-	rules           map[string]*ruleAccumulator
-	injSuspected    bool
-	injSignals      []string
-	injSample       string
-	injSignalLookup map[string]struct{}
+	key                 ruleBucketKey
+	displayService      string
+	displayLevel        string
+	suppressedTemplates []string
+	lastSeenUnix        int64
+	rules               map[string]*ruleAccumulator
+	injSuspected        bool
+	injSignals          []string
+	injSample           string
+	injSignalLookup     map[string]struct{}
 }
 
 // Pipeline coordinates Tier 0 ingestion, loop prevention, template collapsing,
@@ -207,9 +215,9 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	}
 
 	key := ruleBucketKey{
-		templateID: tmplID,
-		service:    ev.Service,
-		level:      ev.Level,
+		templateID:  tmplID,
+		serviceHash: sha256.Sum256([]byte(ev.Service)),
+		levelHash:   sha256.Sum256([]byte(ev.Level)),
 	}
 
 	bucket, exists := p.pendingHits[key]
@@ -218,11 +226,14 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 			p.ruleBucketsDropped.Add(1)
 			return
 		}
-		key.service = strings.Clone(ev.Service)
-		key.level = strings.Clone(ev.Level)
+		cleanSvc, _ := security.SanitizeUntrustedLogText(ev.Service, 128)
+		cleanLvl, _ := security.SanitizeUntrustedLogText(ev.Level, 64)
 		bucket = &bucketAccumulator{
-			key:   key,
-			rules: make(map[string]*ruleAccumulator, 4),
+			key:                 key,
+			displayService:      cleanSvc,
+			displayLevel:        cleanLvl,
+			suppressedTemplates: p.ruleEng.SuppressedTemplatesForService(ev.Service),
+			rules:               make(map[string]*ruleAccumulator, 4),
 		}
 		p.pendingHits[key] = bucket
 	}
@@ -289,7 +300,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		winByID[w.TemplateID] = w
 	}
 
-	// Deterministic alert ordering by (templateID, service, level)
+	// Deterministic alert ordering by (templateID, displayService, displayLevel, hashes)
 	keys := make([]ruleBucketKey, 0, len(drainedHits))
 	for k := range drainedHits {
 		keys = append(keys, k)
@@ -298,10 +309,17 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		if keys[i].templateID != keys[j].templateID {
 			return keys[i].templateID < keys[j].templateID
 		}
-		if keys[i].service != keys[j].service {
-			return keys[i].service < keys[j].service
+		bi, bj := drainedHits[keys[i]], drainedHits[keys[j]]
+		if bi.displayService != bj.displayService {
+			return bi.displayService < bj.displayService
 		}
-		return keys[i].level < keys[j].level
+		if bi.displayLevel != bj.displayLevel {
+			return bi.displayLevel < bj.displayLevel
+		}
+		if c := bytes.Compare(keys[i].serviceHash[:], keys[j].serviceHash[:]); c != 0 {
+			return c < 0
+		}
+		return bytes.Compare(keys[i].levelHash[:], keys[j].levelHash[:]) < 0
 	})
 
 	var (
@@ -318,7 +336,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			tmplStr = w.Template
 		}
 
-		if p.ruleEng.IsTemplateSuppressed(k.service, tmplStr) {
+		if isTemplateInList(bucket.suppressedTemplates, tmplStr) {
 			continue
 		}
 
@@ -364,8 +382,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 
-		cleanService, _ := security.SanitizeUntrustedLogText(k.service, 128)
-		cleanLevel, _ := security.SanitizeUntrustedLogText(k.level, 64)
+		cleanService := bucket.displayService
+		cleanLevel := bucket.displayLevel
 		cleanTemplate, _ := security.SanitizeUntrustedLogText(tmplStr, p.cfg.MaxPromptByte)
 
 		p.ruleHitsTotal.Add(uint64(len(qualifyingHits)))
@@ -661,17 +679,6 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 						}
 					}
 					_ = fbRoot.Close()
-
-					// Remove feedback/ only if empty (preserves any unrelated user files inside feedback/).
-					if remErr := root.Remove("feedback"); remErr != nil && !os.IsNotExist(remErr) {
-						if checkDir, openCheckErr := root.Open("feedback"); openCheckErr == nil {
-							remaining, _ := checkDir.ReadDir(1)
-							_ = checkDir.Close()
-							if len(remaining) == 0 {
-								errs = append(errs, fmt.Errorf("remove empty feedback dir: %w", remErr))
-							}
-						}
-					}
 				}
 			}
 		}
@@ -706,6 +713,15 @@ func isOwnedFeedbackFile(name string) bool {
 		return true
 	}
 	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
+}
+
+func isTemplateInList(list []string, tmpl string) bool {
+	for _, t := range list {
+		if t == tmpl {
+			return true
+		}
+	}
+	return false
 }
 
 func truncateSummary(s string, maxChars int) string {

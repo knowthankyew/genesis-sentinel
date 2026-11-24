@@ -49,7 +49,7 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		maxLineLen = DefaultMaxLineLength
 	}
 	raw = bytes.TrimRight(raw, "\r\n")
-	if len(raw) == 0 {
+	if len(bytes.TrimSpace(raw)) == 0 {
 		return model.LogEvent{}, ErrEmptyInput
 	}
 	if len(raw) > MaxFrameBytes {
@@ -90,7 +90,7 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 	// Bound remaining non-JSON/non-pipe lines safely before format parsing.
 	if len(raw) > maxLineLen {
 		raw = truncateUTF8Bytes(raw, maxLineLen)
-		if len(raw) == 0 {
+		if len(bytes.TrimSpace(raw)) == 0 {
 			return model.LogEvent{}, ErrEmptyInput
 		}
 	}
@@ -381,12 +381,13 @@ func parseSyslog(id uint64, raw []byte, idxClose int, defaultService string) mod
 		return parsePlainText(id, raw, defaultService)
 	}
 	level := syslogSeverityMap[pri&7]
-	rest := bytes.TrimSpace(raw[idxClose+1:])
+	// Trim only leading spaces/tabs after PRI so trailing message bytes are preserved for RFC 5424.
+	rest := bytes.TrimLeft(raw[idxClose+1:], " \t")
 
 	if bytes.HasPrefix(rest, []byte("1 ")) {
 		return parseSyslogRFC5424(id, rest[2:], level, defaultService, len(raw))
 	}
-	return parseSyslogRFC3164(id, rest, level, defaultService, len(raw))
+	return parseSyslogRFC3164(id, bytes.TrimSpace(rest), level, defaultService, len(raw))
 }
 
 func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
@@ -430,13 +431,14 @@ func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, ra
 
 // stripRFC5424StructuredData consumes either NILVALUE ("-") or all adjacent
 // [sd-id param="val"] structured-data elements, honoring RFC 5424 backslash
-// escapes inside quoted parameter values (`\"`, `\\`, `\]`).
+// escapes inside quoted parameter values (`\"`, `\\`, `\]`) and removing only
+// the single protocol SP separator before MSG so message whitespace is preserved.
 func stripRFC5424StructuredData(s string) string {
 	if s == "-" {
 		return ""
 	}
 	if strings.HasPrefix(s, "- ") {
-		return strings.TrimSpace(s[2:])
+		return s[2:]
 	}
 	if !strings.HasPrefix(s, "[") {
 		return s
@@ -474,7 +476,13 @@ func stripRFC5424StructuredData(s string) string {
 			return s
 		}
 	}
-	return strings.TrimSpace(s[i:])
+	if i == len(s) {
+		return ""
+	}
+	if s[i] == ' ' {
+		return s[i+1:]
+	}
+	return s[i:]
 }
 
 func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
@@ -501,14 +509,15 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	service := defaultService
 	msg := remainder
 
-	// RFC 3164 layout after timestamp: HOSTNAME MSG (where MSG begins with TAG[: ]CONTENT).
+	// RFC 3164 layout after timestamp: HOSTNAME MSG (where MSG begins with TAG + non-tag delimiter + CONTENT).
 	// Recognize IPv6 literals (including ones ending in "::" like 2001:db8::) and hostname-free
-	// TAGs (colon-terminated or PID-bracketed like "sentinel[42]") before stripping an optional hostname.
+	// TAGs (colon-terminated, PID-bracketed like "sentinel[42]", or non-alphanumeric delimited
+	// like "sentinel(alert)") before stripping an optional hostname.
 	if spIdx := strings.IndexByte(remainder, ' '); spIdx != -1 {
 		firstWord := remainder[:spIdx]
 		afterHost := strings.TrimSpace(remainder[spIdx+1:])
 		isIPv6Host := net.ParseIP(strings.Trim(firstWord, "[]")) != nil
-		isTagWord := strings.HasSuffix(firstWord, ":") || isPIDTaggedSyslogWord(firstWord)
+		isTagWord := strings.HasSuffix(firstWord, ":") || isPIDTaggedSyslogWord(firstWord) || hasRFC3164ContentDelimiter(firstWord)
 		if (isIPv6Host || !isTagWord) && afterHost != "" {
 			remainder = afterHost
 		}
@@ -529,13 +538,14 @@ func parseSyslogRFC3164(id uint64, rest []byte, level, defaultService string, ra
 	}
 }
 
-// splitRFC3164Tag extracts the leading program TAG (up to 32 ASCII alphanumeric/symbol chars,
-// stripping optional [PID]) from an RFC 3164 MSG field when delimited by ':' or space.
+// splitRFC3164Tag extracts the leading program TAG (up to 32 ASCII tag chars, stripping
+// optional [PID]) from an RFC 3164 MSG field delimited by ':', space, or any other
+// non-tag CONTENT starter (such as '(' in "sentinel(alert)").
 func splitRFC3164Tag(remainder string) (string, string, bool) {
 	if remainder == "" {
 		return "", "", false
 	}
-	// Prefer colon delimiter if it appears before the first space (e.g. "sudo[991]: msg" or "sshd: msg").
+	// 1. Prefer colon delimiter if it appears before the first space (e.g. "sudo[991]: msg" or "sshd: msg").
 	firstSpace := strings.IndexByte(remainder, ' ')
 	firstColon := strings.IndexByte(remainder, ':')
 	if firstColon > 0 && (firstSpace == -1 || firstColon < firstSpace) {
@@ -545,7 +555,7 @@ func splitRFC3164Tag(remainder string) (string, string, bool) {
 			return tag, strings.TrimSpace(remainder[firstColon+1:]), true
 		}
 	}
-	// Space-delimited tag without colon (RFC 3164 §4.1.3 allows any non-alphanumeric delimiter including space).
+	// 2. Space-delimited tag without colon (e.g. "sentinel[42] alert emitted" or "cronjob completed ok").
 	if firstSpace > 0 {
 		rawTag := remainder[:firstSpace]
 		tag := stripPIDBracket(rawTag)
@@ -553,7 +563,40 @@ func splitRFC3164Tag(remainder string) (string, string, bool) {
 			return tag, strings.TrimSpace(remainder[firstSpace+1:]), true
 		}
 	}
+	// 3. Any other RFC 3164 §4.1.3 non-tag delimiter starting CONTENT (e.g. "sentinel(alert)" or "sentinel[42](alert)").
+	delimIdx := firstNonTagByte(remainder)
+	if delimIdx > 0 && delimIdx < len(remainder) {
+		tag := remainder[:delimIdx]
+		if isValidSyslogTag(tag) {
+			rest := remainder[delimIdx:]
+			if rest[0] == '[' {
+				if closeIdx := strings.IndexByte(rest, ']'); closeIdx > 1 && isAllDigits([]byte(rest[1:closeIdx])) {
+					rest = rest[closeIdx+1:]
+					if strings.HasPrefix(rest, ":") {
+						rest = strings.TrimSpace(rest[1:])
+					} else if strings.HasPrefix(rest, " ") {
+						rest = strings.TrimSpace(rest[1:])
+					}
+				}
+			}
+			return tag, rest, true
+		}
+	}
 	return "", "", false
+}
+
+func firstNonTagByte(s string) int {
+	for i := 0; i < len(s); i++ {
+		if !isSyslogTagByte(s[i]) {
+			return i
+		}
+	}
+	return len(s)
+}
+
+func hasRFC3164ContentDelimiter(word string) bool {
+	delimIdx := firstNonTagByte(word)
+	return delimIdx > 0 && delimIdx < len(word) && isValidSyslogTag(word[:delimIdx])
 }
 
 func stripPIDBracket(rawTag string) string {
@@ -584,13 +627,16 @@ func isPIDTaggedSyslogWord(word string) bool {
 	return true
 }
 
+func isSyslogTagByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/'
+}
+
 func isValidSyslogTag(tag string) bool {
 	if len(tag) == 0 || len(tag) > 32 {
 		return false
 	}
 	for i := 0; i < len(tag); i++ {
-		c := tag[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/') {
+		if !isSyslogTagByte(tag[i]) {
 			return false
 		}
 	}

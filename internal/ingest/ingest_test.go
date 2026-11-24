@@ -48,7 +48,7 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 		t.Fatalf("expected ErrOversizedLine for malformed oversized JSON, got %v", err)
 	}
 
-	// 4. Syslog RFC 5424 with multiple SD elements and escaped ']' in quotes
+	// 4. Syslog RFC 5424 with multiple SD elements, escaped ']' in quotes, and preserved MSG whitespace
 	ev, err = ParseRawLog(4, []byte(`<35>1 2026-11-24T10:00:00Z host1 sshd 1234 msg42 [a@32473 x="1\]still"][b@32473 y="2"] failed login`), 0, "genesis")
 	if err != nil {
 		t.Fatalf("RFC 5424 multi-SD parse failed: %v", err)
@@ -56,8 +56,16 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	if ev.Service != "sshd" || ev.Level != "ERROR" || ev.TraceID != "msg42" || ev.Message != "failed login" {
 		t.Fatalf("unexpected RFC 5424 LogEvent: %+v", ev)
 	}
+	ev, err = ParseRawLog(41, []byte(`<35>1 2026-11-24T10:00:00Z host1 api 1 - [a@1 x="1"]  leading and trailing `), 0, "genesis")
+	if err != nil || ev.Message != " leading and trailing " {
+		t.Fatalf("RFC 5424 bracketed SD failed to preserve MSG whitespace: got %q err=%v", ev.Message, err)
+	}
+	ev, err = ParseRawLog(42, []byte(`<35>1 2026-11-24T10:00:00Z host1 api 1 - -  nilvalue msg `), 0, "genesis")
+	if err != nil || ev.Message != " nilvalue msg " {
+		t.Fatalf("RFC 5424 NILVALUE SD failed to preserve MSG whitespace: got %q err=%v", ev.Message, err)
+	}
 
-	// 5. Syslog RFC 3164 (including IPv6 hostname with colons and space-delimited tag)
+	// 5. Syslog RFC 3164 (including IPv6 hostname with colons, space-delimited tag, PID tag, and '(' delimiter)
 	ev, err = ParseRawLog(5, []byte(`<36>Nov 24 10:00:00 macbook sudo[991]: user dev : command not allowed`), 0, "genesis")
 	if err != nil {
 		t.Fatalf("RFC 3164 parse failed: %v", err)
@@ -81,6 +89,15 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	ev, err = ParseRawLog(521, []byte(`<36>Nov 24 10:00:00 sentinel[42] alert emitted`), 0, "genesis")
 	if err != nil || ev.Service != "sentinel" || ev.Message != "alert emitted" {
 		t.Fatalf("RFC 3164 hostname-free PID tag lost service=sentinel: ev=%+v err=%v", ev, err)
+	}
+	// RFC 3164 non-colon/non-space CONTENT delimiter (e.g. '(') must still extract service=sentinel
+	ev, err = ParseRawLog(522, []byte(`<36>Nov 24 10:00:00 host1 sentinel(alert)`), 0, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != "(alert)" {
+		t.Fatalf("RFC 3164 '(' content delimiter lost service=sentinel: ev=%+v err=%v", ev, err)
+	}
+	// Whitespace-only input must return ErrEmptyInput instead of plain-text INFO event
+	if _, err := ParseRawLog(523, []byte("    \t   "), 0, "genesis"); !errors.Is(err, ErrEmptyInput) {
+		t.Fatalf("expected ErrEmptyInput for whitespace-only line, got %v", err)
 	}
 
 	// 5a. Extreme float timestamp 1e20 falls back cleanly without int64 overflow UB
@@ -530,16 +547,25 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	if evs, err := r2.ReadBatch(10); err != nil || len(evs) != 0 {
 		t.Fatalf("expected 0 events before growth, got len=%d err=%v", len(evs), err)
 	}
-	// Complete the in-flight frame write
+	// Complete the in-flight frame write AND rotate to segment 2 (sealing segment 1!) before next poll
 	if err := os.WriteFile(seg2, fullBytes, 0600); err != nil {
 		t.Fatalf("complete seg2: %v", err)
 	}
+	seg2Next := filepath.Join(segDir2, "00000002.seg")
+	fNext, err := os.Create(seg2Next)
+	if err != nil {
+		t.Fatalf("create rotated seg2Next: %v", err)
+	}
+	_ = WriteSegmentFrame(fNext, []byte(`{"timestamp":601,"service":"sshd","level":"INFO","message":"rotated-seg2-msg"}`))
+	_ = fNext.Close()
+
 	evs, err := r2.ReadBatch(10)
-	if err != nil || len(evs) != 1 || evs[0].Message != "inflight-frame-completed" {
-		t.Fatalf("expected pending incomplete candidate to recover after file growth, got %+v err=%v", evs, err)
+	if err != nil || len(evs) != 2 || evs[0].Message != "inflight-frame-completed" || evs[1].Message != "rotated-seg2-msg" {
+		t.Fatalf("expected completed pending candidate on newly sealed seg1 + seg2 event, got %+v err=%v", evs, err)
 	}
 
-	// 3. Budget must stop after one processed frame even when CRC-valid frames fail ParseRawLog.
+	// 3. Budget must stop after one processed frame even when CRC-valid frames fail ParseRawLog,
+	// and whitespace-only frames must produce 0 events (confirming ParseRawLog actually rejected them).
 	segDir3 := t.TempDir()
 	seg3 := filepath.Join(segDir3, "00000001.seg")
 	f3, err := os.Create(seg3)
@@ -554,10 +580,57 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 
 	r3, _ := NewSegReader(segDir3, filepath.Join(t.TempDir(), "c3.json"), 0)
 	r3.SetMaxBatchBytes(10) // smaller than one 72-byte frame; only 1 over-budget frame allowed per call
-	if _, err := r3.ReadBatch(100); err != nil {
+	evs3, err := r3.ReadBatch(100)
+	if err != nil {
 		t.Fatalf("ReadBatch seg3: %v", err)
+	}
+	if len(evs3) != 0 {
+		t.Fatalf("expected 0 parsed events from whitespace-only frames, got %+v", evs3)
 	}
 	if st := r3.Stats(); st.FramesRead != 1 {
 		t.Fatalf("expected over-budget exception limited to 1 parse-failing frame per ReadBatch, got FramesRead=%d", st.FramesRead)
+	}
+
+	// 4. Recovery checksum budget pauses before hashing overlapping fake headers past maxRecoveryChecksumBytes
+	// and still resumes cleanly on subsequent polls to recover the trailing valid frame.
+	segDir4 := t.TempDir()
+	seg4 := filepath.Join(segDir4, "00000001.seg")
+	// Build a damaged region containing 40 overlapping fake 64 KiB headers (40 * 64 KiB = 2.5 MiB > 1 MiB budget)
+	// followed by a valid frame.
+	const fakePayloadLen = 64 * 1024
+	const fakeCount = 40
+	damaged := make([]byte, fakeCount*8+fakePayloadLen+16)
+	for i := 0; i < fakeCount; i++ {
+		off := i * 8
+		binary.BigEndian.PutUint32(damaged[off:off+4], fakePayloadLen)
+		binary.BigEndian.PutUint32(damaged[off+4:off+8], 0x12345678)
+	}
+	var tailFrame bytes.Buffer
+	_ = WriteSegmentFrame(&tailFrame, []byte(`{"timestamp":700,"service":"api","level":"INFO","message":"recovered-after-checksum-budget"}`))
+	damaged = append(damaged, tailFrame.Bytes()...)
+	if err := os.WriteFile(seg4, damaged, 0600); err != nil {
+		t.Fatalf("write checksum-budget seg4: %v", err)
+	}
+
+	r4, _ := NewSegReader(segDir4, filepath.Join(t.TempDir(), "c4.json"), 0)
+	// First poll should pause on checksum budget before reaching tailFrame
+	firstEvs, err := r4.ReadBatch(10)
+	if err != nil {
+		t.Fatalf("seg4 poll 1: %v", err)
+	}
+	if len(firstEvs) != 0 {
+		t.Fatalf("expected poll 1 to pause on recovery checksum budget before tail frame, got %d events", len(firstEvs))
+	}
+	// Subsequent bounded polls must resume at exact unchecked offset and recover tailFrame
+	var recovered []model.LogEvent
+	for attempt := 0; attempt < 10 && len(recovered) == 0; attempt++ {
+		batch, readErr := r4.ReadBatch(10)
+		if readErr != nil {
+			t.Fatalf("seg4 poll %d: %v", attempt+2, readErr)
+		}
+		recovered = append(recovered, batch...)
+	}
+	if len(recovered) != 1 || recovered[0].Message != "recovered-after-checksum-budget" {
+		t.Fatalf("expected recovery after checksum-budget pause, got %+v", recovered)
 	}
 }

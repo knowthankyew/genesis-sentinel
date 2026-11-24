@@ -25,8 +25,14 @@ func TestDefaultRulesDetectAllStarterThreatClasses(t *testing.T) {
 			window: model.TemplateWindow{
 				Service:    "sshd",
 				Level:      "ERROR",
-				Count:      10,
+				Count:      5,
 				SampleLine: "Failed password for invalid user admin from 198.51.100.42 port 51922 ssh2",
+				AdditionalSamples: []string{
+					"Failed password for invalid user root from 198.51.100.42 port 51923 ssh2",
+					"Failed password for invalid user test from 198.51.100.42 port 51924 ssh2",
+					"Failed password for invalid user guest from 198.51.100.42 port 51925 ssh2",
+					"Failed password for invalid user deploy from 198.51.100.42 port 51926 ssh2",
+				},
 			},
 			wantRuleID: "SENT-001",
 		},
@@ -358,5 +364,48 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	}, 1024)
 	if len(resUnsupMatch.RuleHits) != 1 || resUnsupMatch.RuleHits[0].RuleID != "JOB-1" {
 		t.Fatalf("expected JOB-1 hit on unsuppressed matching sample, got %+v", resUnsupMatch.RuleHits)
+	}
+
+	// Reject duplicate enabled rule IDs in NewEngine
+	_, dupErr := NewEngine(RulePack{
+		Version: "1.0",
+		Rules: []Rule{
+			{ID: "DUP-1", Category: "a", Severity: "LOW", Pattern: "foo", Enabled: true},
+			{ID: "DUP-1", Category: "b", Severity: "HIGH", Pattern: "bar", Enabled: true},
+		},
+	})
+	if dupErr == nil {
+		t.Fatal("expected NewEngine to reject duplicate enabled rule IDs")
+	}
+
+	// Standalone Evaluate must NOT extrapolate w.Count from a single preview sample for burst rules
+	singlePreviewBurst := defEng.Evaluate(model.TemplateWindow{
+		Service:    "sshd",
+		Level:      "INFO",
+		Count:      5,
+		Template:   "login <*>",
+		SampleLine: "login failed",
+	}, 1024)
+	for _, h := range singlePreviewBurst.RuleHits {
+		if h.RuleID == "SENT-001" {
+			t.Fatalf("SENT-001 extrapolated w.Count from single preview sample: %+v", singlePreviewBurst.RuleHits)
+		}
+	}
+
+	// EvaluateWithMatchCounts fires from exact matchCounts even when preview cache is empty
+	noPreviewExact := defEng.EvaluateWithMatchCounts(model.TemplateWindow{
+		Service:  "sshd",
+		Level:    "ERROR",
+		Count:    5,
+		Template: "login failed for <*>",
+	}, map[string]uint64{"SENT-001": 5}, 1024)
+	foundExactNoPreview := false
+	for _, h := range noPreviewExact.RuleHits {
+		if h.RuleID == "SENT-001" {
+			foundExactNoPreview = true
+		}
+	}
+	if !foundExactNoPreview {
+		t.Fatalf("expected EvaluateWithMatchCounts to fire SENT-001 from exact count even without preview, got %+v", noPreviewExact.RuleHits)
 	}
 }
