@@ -16,25 +16,28 @@ import (
 // (under service=sentinel) or local stdout/JSONL output. Top-level fields match
 // Genesis's JSON Lines parser so alerts index cleanly and appear live in the Web UI.
 type Alert struct {
-	Timestamp          int64    `json:"timestamp"`
-	Service            string   `json:"service"`
-	Level              string   `json:"level"`
-	TraceID            string   `json:"trace_id"`
-	Message            string   `json:"message"`
-	AlertID            string   `json:"alert_id"`
-	Tier               string   `json:"tier"`
-	SourceService      string   `json:"source_service"`
-	SourceLevel        string   `json:"source_level"`
-	TemplateID         string   `json:"template_id"`
-	Template           string   `json:"template"`
-	Count              uint64   `json:"count"`
-	SampleEntropy      float64  `json:"sample_entropy"`
-	RuleIDs            []string `json:"rule_ids"`
-	Categories         []string `json:"categories"`
-	Severity           string   `json:"severity"`
-	InjectionSuspected bool     `json:"injection_suspected"`
-	InjectionSignals   []string `json:"injection_signals,omitempty"`
-	SanitizedSample    string   `json:"sanitized_sample"`
+	Timestamp            int64              `json:"timestamp"`
+	Service              string             `json:"service"`
+	Level                string             `json:"level"`
+	TraceID              string             `json:"trace_id"`
+	Message              string             `json:"message"`
+	AlertID              string             `json:"alert_id"`
+	Tier                 string             `json:"tier"`
+	SourceService        string             `json:"source_service"`
+	SourceLevel          string             `json:"source_level"`
+	TemplateID           string             `json:"template_id"`
+	Template             string             `json:"template"`
+	Count                uint64             `json:"count"`
+	SampleEntropy        float64            `json:"sample_entropy"`
+	SurprisalNats        float64            `json:"surprisal_nats,omitempty"`
+	SurprisalThreshold   float64            `json:"surprisal_threshold,omitempty"`
+	TopSurprisalFeatures map[string]float64 `json:"top_surprisal_features,omitempty"`
+	RuleIDs              []string           `json:"rule_ids"`
+	Categories           []string           `json:"categories"`
+	Severity             string             `json:"severity"`
+	InjectionSuspected   bool               `json:"injection_suspected"`
+	InjectionSignals     []string           `json:"injection_signals,omitempty"`
+	SanitizedSample      string             `json:"sanitized_sample"`
 }
 
 // Sink receives structured Sentinel alerts.

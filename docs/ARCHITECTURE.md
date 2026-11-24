@@ -27,7 +27,7 @@ flowchart TD
         Types["Tier Contracts & Model Allowlist<br/><code>internal/model/types.go</code>"]
         T0["Tier 0: Ingest, Drain Templates & Rules<br/><code>internal/ingest/segreader.go</code> &bull; <code>internal/template/drain.go</code> &bull; <code>internal/rules/engine.go</code>"]
         Pipe["Orchestrator & Alert Sink<br/><code>internal/pipeline/pipeline.go</code> &bull; <code>internal/emit/genesis_sink.go</code>"]
-        T1["Tier 1: Laplace-LK Log Surprisal<br/>(Planned: Phase 2)"]
+        T1["Tier 1: Laplace-LK Log Surprisal<br/><code>internal/surprisal/math.go</code> &bull; <code>internal/surprisal/features.go</code> &bull; <code>internal/surprisal/engine.go</code> &bull; <code>internal/surprisal/baseline.go</code> &bull; <code>internal/surprisal/http_client.go</code>"]
         T2["Tier 2: Triage Client & Feedback Queue<br/>(Planned: Phase 3)"]
     end
 
@@ -41,9 +41,9 @@ flowchart TD
     Cfg --> Types
     Segs -->|"Lossless .seg / /query"| T0
     T0 -->|"TemplateWindow + RuleHits"| Pipe
-    Pipe -->|"Phase 1 Alert-Only Sink"| GenSink
-    Pipe -.->|"Phase 2 Surprisal Scoring"| T1
-    T1 <-->|"Optional Parity"| SurpSvc
+    Pipe -->|"Tier 0 + Tier 1 Alert-Only Sink"| GenSink
+    Pipe -->|"Phase 2 In-Process Laplace-LK"| T1
+    T1 <-->|"Optional Loopback Parity"| SurpSvc
     T1 -->|"Anomalous / Flagged Windows"| Sec
     Sec -->|"Sanitized Framed Prompt"| T2
     T2 <-->|"Local Loopback Triage"| Infer
@@ -55,7 +55,7 @@ flowchart TD
 
 ---
 
-## 2. Implemented Subsystems (Phases 0–1)
+## 2. Implemented Subsystems (Phases 0–2)
 
 1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
    - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
@@ -74,8 +74,12 @@ flowchart TD
    - Precompiled Go RE2 deterministic rule engine (`rules.json` or built-in starter pack `SENT-001`..`SENT-008`) supporting regex/IOC signatures, burst thresholds, entropy thresholds, and operator allowlist suppressions.
 5. **Orchestrator, Alert Sink & Security Layer (`internal/pipeline/pipeline.go`, `internal/emit/genesis_sink.go`, `internal/security/security.go`):**
    - Strict loop-prevention guard dropping incoming `service=sentinel` events before Tier 0 processing.
-   - Loopback TCP JSONL alert sink mapping `CRITICAL`/`HIGH` alerts to Genesis `FATAL`/`ERROR` priority lanes.
-   - Constant-time Bearer auth middleware (`crypto/subtle.ConstantTimeCompare`), loopback-only endpoint validation, and untrusted-log sanitizer neutralizing `<|...|>` / `<start_of_turn>` delimiters and flagging prompt-injection cues.
+   - Loopback TCP JSONL alert sink mapping `CRITICAL`/`HIGH` alerts to Genesis `FATAL`/`ERROR` priority lanes, supporting `tier0`, unified `tier0+tier1`, and `tier1` alerts.
+   - Constant-time Bearer auth middleware (`crypto/subtle.ConstantTimeCompare`), loopback-only endpoint validation with dial-time IP checks, and untrusted-log sanitizer neutralizing `<|...|>` / `<start_of_turn>` delimiters and flagging prompt-injection cues.
+6. **Tier 1 Clean-Room Laplace-LK Log Surprisal Engine (`internal/surprisal/math.go`, `internal/surprisal/features.go`, `internal/surprisal/engine.go`, `internal/surprisal/baseline.go`, `internal/surprisal/http_client.go`):**
+   - Pure-Go implementation of Hazard et al. (`arXiv:2510.22809`) Equations 4, 6, 7, and 8 with MAD substitutability floor (`MinDeviationFloor = <!-- claim:surprisal_min_deviation_floor -->0.25<!-- /claim -->`), nominal mismatch penalty (`NominalMismatchNats = <!-- claim:surprisal_nominal_mismatch_nats -->2.5 nats<!-- /claim -->`), cold-start warmup guard (`DefaultWarmupMinCases = <!-- claim:surprisal_default_warmup_cases -->20<!-- /claim -->`), and bounded strided $k$-NN scoring (`DefaultMaxCandidateCases = <!-- claim:surprisal_default_max_candidates -->120<!-- /claim -->`) matching `ml/src/surprisal-service/service.py` within `1e-6` nats.
+   - Extracts 8 log-domain continuous features (log token count, log byte length, peak Shannon entropy, scaled symbol/digit/uppercase ratios, log burst count, log inter-arrival ms) and 4 structural nominal features (`service`, `level`, `template_class`, HTTP status family / syslog `<PRI>` facility).
+   - Enforces baseline poisoning protection (never absorbs Tier 0 rule hits, prompt-injection events, overflow buckets, or post-warmup anomalies into the rolling baseline), persists atomic `baseline.json` snapshots cleanly wiped by `sentinel burn`, and supports optional loopback `:5200` HTTP/hybrid parity checks.
 
 ---
 

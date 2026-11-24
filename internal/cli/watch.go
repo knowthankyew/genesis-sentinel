@@ -32,17 +32,21 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 
 	var (
-		configPath     string
-		genesisDataDir string
-		genesisHTTP    string
-		genesisTCP     string
-		httpAddr       string
-		dataDir        string
-		windowStr      string
-		rulesPath      string
-		pollInterval   time.Duration
-		dryRun         bool
-		stdoutAlerts   bool
+		configPath         string
+		genesisDataDir     string
+		genesisHTTP        string
+		genesisTCP         string
+		httpAddr           string
+		dataDir            string
+		windowStr          string
+		rulesPath          string
+		surprisalMode      string
+		surprisalHTTP      string
+		surprisalThreshold float64
+		baselineSize       int
+		pollInterval       time.Duration
+		dryRun             bool
+		stdoutAlerts       bool
 	)
 
 	fs.StringVar(&configPath, "config", "", "Path to sentinel.json config file")
@@ -53,6 +57,10 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&dataDir, "data-dir", "", "Sentinel local state directory (cursors, baselines, feedback)")
 	fs.StringVar(&windowStr, "window", "", "Tier 0 template collapse flush window (e.g. 10s)")
 	fs.StringVar(&rulesPath, "rules", "", "Optional path to custom JSON rules.json pack")
+	fs.StringVar(&surprisalMode, "surprisal-mode", "", "Tier 1 surprisal mode: inprocess | http | hybrid")
+	fs.StringVar(&surprisalHTTP, "surprisal-http", "", "Loopback URL for ml/src/surprisal-service (:5200)")
+	fs.Float64Var(&surprisalThreshold, "surprisal-threshold", 0, "Tier 1 surprisal anomaly threshold in nats (default 5.0)")
+	fs.IntVar(&baselineSize, "baseline-size", 0, "Tier 1 rolling baseline capacity (default 2000)")
 	fs.DurationVar(&pollInterval, "poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
 	fs.BoolVar(&dryRun, "dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
 	fs.BoolVar(&stdoutAlerts, "stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
@@ -85,6 +93,14 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			cfg.WindowStr = windowStr
 		case "rules":
 			cfg.RulesPath = rulesPath
+		case "surprisal-mode":
+			cfg.SurprisalMode = surprisalMode
+		case "surprisal-http":
+			cfg.SurprisalHTTPAddr = surprisalHTTP
+		case "surprisal-threshold":
+			cfg.SurprisalThreshold = surprisalThreshold
+		case "baseline-size":
+			cfg.BaselineWindowSize = baselineSize
 		}
 	})
 
@@ -152,12 +168,26 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	pipe.AttachSegReader(segReader)
 	pipe.AttachQueryPoller(queryPoller)
 
-	// Surface active disk paths prominently on startup (ADR-4 transparency).
+	// Hydrate persisted Tier 1 rolling baseline snapshot if present.
+	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
+	loadedBaseline := 0
 	logger := log.New(stderr, "", log.LstdFlags)
+	if surpEng := pipe.SurprisalEngine(); surpEng != nil {
+		n, loadErr := surpEng.LoadFromFile(baselinePath)
+		if loadErr != nil {
+			logger.Printf("[Tier1] Warning: ignoring unreadable baseline snapshot %s: %v", baselinePath, loadErr)
+		} else {
+			loadedBaseline = n
+		}
+	}
+
+	// Surface active disk paths prominently on startup (ADR-4 transparency).
 	logger.Println("==========================================================")
-	logger.Printf("  GENESIS SENTINEL %s (Tier 0 Deterministic Engine)", Version)
+	logger.Printf("  GENESIS SENTINEL %s (Tier 0 Rules + Tier 1 Laplace-LK)", Version)
 	logger.Println("==========================================================")
 	logger.Printf("[Disk]   Sentinel Data Dir : %s (open via `sentinel data open`)", cfg.DataDir)
+	logger.Printf("[Tier1]  Laplace-LK Mode   : %s | Threshold: %.2f nats | Baseline: %d/%d (%s)",
+		cfg.SurprisalMode, cfg.SurprisalThreshold, loadedBaseline, cfg.BaselineWindowSize, baselinePath)
 	if activeSource == "segdir" {
 		logger.Printf("[Source] Lossless .seg Dir : %s (cursor: %s)", cfg.GenesisDataDir, cursorPath)
 	} else {
@@ -205,7 +235,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Println("[Shutdown] Flushing final Tier 0 window and saving cursor...")
+			logger.Println("[Shutdown] Flushing final Tier 0+1 window and saving state...")
 			emitted, failed := pipe.FlushWindow()
 			if len(emitted) > 0 || len(failed) > 0 {
 				logger.Printf("[Shutdown] Emitted %d final alert(s) (%d sink failure(s)).", len(emitted), len(failed))
@@ -216,6 +246,12 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 				if saveErr := segReader.SaveCursor(); saveErr != nil {
 					logger.Printf("[Shutdown] Final cursor save failed: %v", saveErr)
 					finalSaveErr = fmt.Errorf("final cursor save failed: %w", saveErr)
+				}
+			}
+			if surpEng := pipe.SurprisalEngine(); surpEng != nil && surpEng.Dirty() {
+				if saveErr := surpEng.SaveToFile(baselinePath, false); saveErr != nil {
+					logger.Printf("[Shutdown] Final baseline save failed: %v", saveErr)
+					finalSaveErr = errors.Join(finalSaveErr, fmt.Errorf("final baseline save failed: %w", saveErr))
 				}
 			}
 
@@ -266,7 +302,14 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		case <-flushTicker.C:
 			emitted, failed := pipe.FlushWindow()
 			if len(emitted) > 0 || len(failed) > 0 {
-				logger.Printf("[Tier0] Emitted %d alert(s), %d sink failure(s) (total_lines=%d)", len(emitted), len(failed), pipe.Stats().LinesRead)
+				st := pipe.Stats()
+				logger.Printf("[Tier0+1] Emitted %d alert(s), %d sink failure(s) (total_lines=%d, surprisal_anomalies=%d, baseline=%d)",
+					len(emitted), len(failed), st.LinesRead, st.SurprisalAnomalies, st.SurprisalBaselineCases)
+			}
+			if surpEng := pipe.SurprisalEngine(); surpEng != nil && surpEng.Dirty() {
+				if saveErr := surpEng.SaveToFile(baselinePath, false); saveErr != nil {
+					logger.Printf("[Tier1] baseline save error (will retry on next flush): %v", saveErr)
+				}
 			}
 		}
 	}

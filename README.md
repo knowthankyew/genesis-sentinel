@@ -4,11 +4,11 @@
 [![CI](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg)](go.mod)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
-[![Stage: Phase 1 Complete](https://img.shields.io/badge/Stage-Phase%201%20Complete-brightgreen.svg)](docs/ROADMAP.md)
+[![Stage: Phase 2 Complete](https://img.shields.io/badge/Stage-Phase%202%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
-**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.2.0-phase1<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
+**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.3.0-phase2<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with zero external network egress.
 
-> **Current Status (Phase 1 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, `service=sentinel` loopback alert sink, `watch` / `scan` / `stats` / `burn` / `data` / `config` commands, automated claims linter (`scripts/audit-claims.py`), and CycloneDX 1.5 SBOM (`bom.json`) are implemented and race-tested. Tier 1 Laplace-LK log surprisal (Phase 2) and Tier 2 SmolLM2-Instruct LoRA triage (Phase 3) are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Current Status (Phase 2 Complete):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, **Tier 1 clean-room pure-Go Laplace-LK log surprisal engine** (matching `ml/src/surprisal-service/service.py` within `1e-6` nats with rolling baseline persistence, poisoning defense, and optional loopback `:5200` parity mode), `service=sentinel` loopback alert sink, `watch` / `scan` / `stats` / `burn` / `data` / `config` commands, automated claims linter (`scripts/audit-claims.py`), and CycloneDX 1.5 SBOM (`bom.json`) are implemented and race-tested. Tier 2 SmolLM2-Instruct LoRA triage & FTaaS feedback loop (Phase 3) is up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 

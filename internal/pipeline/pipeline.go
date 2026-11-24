@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
+	"github.com/knowthankyew/genesis-sentinel/internal/surprisal"
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
 )
 
@@ -30,7 +32,7 @@ const (
 	defaultMaxPendingRuleBuckets = 4096
 )
 
-// Stats exposes live Sentinel Tier 0 pipeline telemetry over HTTP /stats and CLI output.
+// Stats exposes live Sentinel Tier 0 + Tier 1 pipeline telemetry over HTTP /stats and CLI output.
 type Stats struct {
 	LinesRead                uint64  `json:"lines_read"`
 	LinesIgnoredSelf         uint64  `json:"lines_ignored_self"`
@@ -43,6 +45,16 @@ type Stats struct {
 	RuleBucketsDropped       uint64  `json:"rule_buckets_dropped"`
 	OverflowThresholdSkipped uint64  `json:"overflow_threshold_skipped"`
 	SinkErrors               uint64  `json:"sink_errors"`
+	SurprisalMode            string  `json:"surprisal_mode"`
+	SurprisalThresholdNats   float64 `json:"surprisal_threshold_nats"`
+	SurprisalScored          uint64  `json:"surprisal_scored"`
+	SurprisalAnomalies       uint64  `json:"surprisal_anomalies"`
+	SurprisalBaselineCases   int     `json:"surprisal_baseline_cases"`
+	SurprisalBaselineCap     int     `json:"surprisal_baseline_capacity"`
+	SurprisalWarmupComplete  bool    `json:"surprisal_warmup_complete"`
+	SurprisalMaxNats         float64 `json:"surprisal_max_nats"`
+	SurprisalHTTPChecks      uint64  `json:"surprisal_http_checks"`
+	SurprisalHTTPFallbacks   uint64  `json:"surprisal_http_fallbacks"`
 	CorruptedFrames          uint64  `json:"corrupted_frames"`
 	RecoveryStalls           uint64  `json:"recovery_stalls"`
 	BurnResets               uint64  `json:"burn_resets"`
@@ -103,11 +115,13 @@ type bucketAccumulator struct {
 }
 
 // Pipeline coordinates Tier 0 ingestion, loop prevention, template collapsing,
-// per-event deterministic rule accumulation, and Genesis alert emission.
+// per-event deterministic rule accumulation, Tier 1 Laplace-LK surprisal scoring,
+// and Genesis alert emission.
 type Pipeline struct {
 	cfg          *config.Config
 	agg          *template.Aggregator
 	ruleEng      *rules.Engine
+	surprisalEng *surprisal.Engine
 	sink         emit.Sink
 	activeSource string
 	startTime    time.Time
@@ -136,7 +150,8 @@ type Pipeline struct {
 	alertSeq                 atomic.Uint64
 }
 
-// New builds a Pipeline wired with Tier 0 template collapsing and deterministic rules.
+// New builds a Pipeline wired with Tier 0 template collapsing, deterministic rules,
+// and the Tier 1 Laplace-LK log surprisal engine.
 func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource string) *Pipeline {
 	if cfg == nil {
 		cfg = config.DefaultConfig()
@@ -144,16 +159,50 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 	if sink == nil {
 		sink = emit.NopSink{}
 	}
+
+	var httpClient *surprisal.HTTPClient
+	if (cfg.SurprisalMode == "http" || cfg.SurprisalMode == "hybrid") && cfg.SurprisalHTTPAddr != "" {
+		if c, err := surprisal.NewHTTPClient(cfg.SurprisalHTTPAddr, 2*time.Second, cfg.AllowRemoteEndpoints); err == nil {
+			httpClient = c
+		}
+	}
+
+	surpEng := surprisal.NewEngine(surprisal.Options{
+		Mode:               cfg.SurprisalMode,
+		ThresholdNats:      cfg.SurprisalThreshold,
+		BaselineWindowSize: cfg.BaselineWindowSize,
+		HTTPClient:         httpClient,
+	})
+
 	return &Pipeline{
 		cfg:                   cfg,
 		agg:                   template.NewAggregator(template.DefaultMaxClusters),
 		ruleEng:               ruleEng,
+		surprisalEng:          surpEng,
 		sink:                  sink,
 		activeSource:          activeSource,
 		startTime:             time.Now(),
 		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
 		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
+}
+
+// SurprisalEngine returns the active Tier 1 Laplace-LK surprisal engine.
+func (p *Pipeline) SurprisalEngine() *surprisal.Engine {
+	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+	return p.surprisalEng
+}
+
+// AttachSurprisalEngine replaces the Tier 1 surprisal engine (useful for custom
+// warmup tuning, preloaded baselines, or HTTP parity test doubles).
+func (p *Pipeline) AttachSurprisalEngine(eng *surprisal.Engine) {
+	if eng == nil {
+		return
+	}
+	p.burnMu.Lock()
+	p.surprisalEng = eng
+	p.burnMu.Unlock()
 }
 
 // AttachSegReader links a SegReader so Stats() reports segment cursor & corruption telemetry.
@@ -277,9 +326,17 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	}
 }
 
+type windowJoinKey struct {
+	templateID     string
+	displayService string
+	displayLevel   string
+}
+
 // FlushWindow atomically drains collapsed TemplateWindows and exact per-event rule
-// accumulators under windowMu, releases windowMu before emitting alerts, applies
-// MinCount thresholds per rule, and returns emitted alerts separately from sink failures.
+// accumulators under windowMu, evaluates Tier 1 Laplace-LK surprisal on every
+// unsuppressed window, enriches Tier 0 alerts with surprisal context, emits Tier 1
+// alerts for unseen statistical anomalies, and returns emitted alerts separately
+// from sink failures.
 func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	p.burnMu.RLock()
 	defer p.burnMu.RUnlock()
@@ -295,9 +352,66 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 	p.templatesEmitted.Add(uint64(len(windows)))
 
+	// Sort windows deterministically so baseline learning and alert order are reproducible.
+	sort.Slice(windows, func(i, j int) bool {
+		if windows[i].TemplateID != windows[j].TemplateID {
+			return windows[i].TemplateID < windows[j].TemplateID
+		}
+		if windows[i].Service != windows[j].Service {
+			return windows[i].Service < windows[j].Service
+		}
+		return windows[i].Level < windows[j].Level
+	})
+
 	winByID := make(map[string]model.TemplateWindow, len(windows))
 	for _, w := range windows {
 		winByID[w.TemplateID] = w
+	}
+
+	// Track which (templateID, displayService, displayLevel) windows carry Tier 0 signals
+	// so Tier 1 poisoning defense never absorbs rule-flagged or prompt-injection windows.
+	tier0SignalKeys := make(map[windowJoinKey]bool, len(drainedHits))
+	for k, b := range drainedHits {
+		tier0SignalKeys[windowJoinKey{
+			templateID:     k.templateID,
+			displayService: b.displayService,
+			displayLevel:   b.displayLevel,
+		}] = true
+	}
+
+	// Evaluate Tier 1 Laplace-LK surprisal on every non-suppressed window before emitting
+	// alerts so Tier 0 alerts can be enriched with surprisal context in a single pass.
+	surpEng := p.surprisalEng
+	type scoredWindow struct {
+		win        model.TemplateWindow
+		joinKey    windowJoinKey
+		score      model.SurprisalScore
+		suppressed bool
+	}
+	scoredWindows := make([]scoredWindow, 0, len(windows))
+	scoresByKey := make(map[windowJoinKey]model.SurprisalScore, len(windows))
+	if surpEng != nil {
+		ctx := context.Background()
+		for _, w := range windows {
+			cleanSvc, _ := security.SanitizeUntrustedLogText(w.Service, 128)
+			cleanLvl, _ := security.SanitizeUntrustedLogText(w.Level, 64)
+			jk := windowJoinKey{
+				templateID:     w.TemplateID,
+				displayService: cleanSvc,
+				displayLevel:   cleanLvl,
+			}
+			if p.ruleEng != nil && p.ruleEng.IsWindowSuppressed(w) {
+				scoredWindows = append(scoredWindows, scoredWindow{win: w, joinKey: jk, suppressed: true})
+				continue
+			}
+			// Never absorb Tier 0 hits or cluster-overflow buckets into the benign baseline.
+			blockLearn := tier0SignalKeys[jk] || w.Template == "<OVERFLOW>"
+			sc := surpEng.Evaluate(ctx, w, blockLearn)
+			scoredWindows = append(scoredWindows, scoredWindow{win: w, joinKey: jk, score: sc})
+			if prev, exists := scoresByKey[jk]; !exists || sc.TotalNats > prev.TotalNats {
+				scoresByKey[jk] = sc
+			}
+		}
 	}
 
 	// Deterministic alert ordering by (templateID, displayService, displayLevel, hashes)
@@ -323,8 +437,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	})
 
 	var (
-		emitted []emit.Alert
-		failed  []FailedAlert
+		emitted        []emit.Alert
+		failed         []FailedAlert
+		emittedWinKeys = make(map[windowJoinKey]bool, len(keys))
 	)
 	nowUnix := time.Now().Unix()
 
@@ -406,6 +521,26 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		roundedEntropy := math.Round(bestEntropy*10000) / 10000
 
+		jk := windowJoinKey{
+			templateID:     k.templateID,
+			displayService: cleanService,
+			displayLevel:   cleanLevel,
+		}
+		tierLabel := "tier0"
+		var (
+			surpNats      float64
+			surpThreshold float64
+			topFeats      map[string]float64
+		)
+		if sc, ok := scoresByKey[jk]; ok && sc.TotalNats > 0 {
+			surpNats = sc.TotalNats
+			surpThreshold = sc.ThresholdNats
+			topFeats = surprisal.TopFeatures(sc.FeatureContribs, 4)
+			if sc.Anomalous {
+				tierLabel = "tier0+tier1"
+			}
+		}
+
 		msg := fmt.Sprintf("[%s] %s on service=%s count=%d entropy=%.2f sample=%q",
 			strings.Join(ruleIDs, ","),
 			strings.Join(categories, ","),
@@ -414,29 +549,121 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			roundedEntropy,
 			truncateSummary(bestSample, 240),
 		)
-
-		alert := emit.Alert{
-			Timestamp:          ts,
-			Service:            p.cfg.AlertServiceName,
-			Level:              emit.MapSeverityToGenesisLevel(severity),
-			TraceID:            alertID,
-			Message:            msg,
-			AlertID:            alertID,
-			Tier:               "tier0",
-			SourceService:      cleanService,
-			SourceLevel:        cleanLevel,
-			TemplateID:         k.templateID,
-			Template:           cleanTemplate,
-			Count:              maxMatchCount,
-			SampleEntropy:      roundedEntropy,
-			RuleIDs:            ruleIDs,
-			Categories:         categories,
-			Severity:           severity,
-			InjectionSuspected: bucket.injSuspected,
-			InjectionSignals:   bucket.injSignals,
-			SanitizedSample:    bestSample,
+		if tierLabel == "tier0+tier1" {
+			msg = fmt.Sprintf("[%s] %s on service=%s count=%d entropy=%.2f surprisal=%.2fnats sample=%q",
+				strings.Join(ruleIDs, ","),
+				strings.Join(categories, ","),
+				cleanService,
+				maxMatchCount,
+				roundedEntropy,
+				surpNats,
+				truncateSummary(bestSample, 240),
+			)
 		}
 
+		alert := emit.Alert{
+			Timestamp:            ts,
+			Service:              p.cfg.AlertServiceName,
+			Level:                emit.MapSeverityToGenesisLevel(severity),
+			TraceID:              alertID,
+			Message:              msg,
+			AlertID:              alertID,
+			Tier:                 tierLabel,
+			SourceService:        cleanService,
+			SourceLevel:          cleanLevel,
+			TemplateID:           k.templateID,
+			Template:             cleanTemplate,
+			Count:                maxMatchCount,
+			SampleEntropy:        roundedEntropy,
+			SurprisalNats:        surpNats,
+			SurprisalThreshold:   surpThreshold,
+			TopSurprisalFeatures: topFeats,
+			RuleIDs:              ruleIDs,
+			Categories:           categories,
+			Severity:             severity,
+			InjectionSuspected:   bucket.injSuspected,
+			InjectionSignals:     bucket.injSignals,
+			SanitizedSample:      bestSample,
+		}
+
+		emittedWinKeys[jk] = true
+		if err := p.sink.Emit(alert); err != nil {
+			p.sinkErrors.Add(1)
+			failed = append(failed, FailedAlert{Alert: alert, Err: err})
+			continue
+		}
+		p.alertsEmitted.Add(1)
+		emitted = append(emitted, alert)
+	}
+
+	// Emit Tier 1-only alerts for unseen anomalous windows that did not already emit a Tier 0 alert.
+	for _, sw := range scoredWindows {
+		if sw.suppressed || !sw.score.Anomalous || emittedWinKeys[sw.joinKey] {
+			continue
+		}
+		w := sw.win
+		cleanService, svcSigs := security.SanitizeUntrustedLogText(w.Service, 128)
+		cleanLevel, lvlSigs := security.SanitizeUntrustedLogText(w.Level, 64)
+		cleanTemplate, _ := security.SanitizeUntrustedLogText(w.Template, p.cfg.MaxPromptByte)
+		cleanSample, msgSigs := security.SanitizeUntrustedLogText(w.SampleLine, p.cfg.MaxPromptByte)
+
+		var injSignals []string
+		seenSig := make(map[string]struct{})
+		for _, list := range [][]string{msgSigs, svcSigs, lvlSigs} {
+			for _, s := range list {
+				if _, ok := seenSig[s]; !ok {
+					seenSig[s] = struct{}{}
+					injSignals = append(injSignals, s)
+				}
+			}
+		}
+		injSuspected := len(injSignals) > 0
+		if injSuspected {
+			p.injectionSignals.Add(1)
+		}
+
+		severity := mapSurprisalSeverity(sw.score.TotalNats, sw.score.ThresholdNats, cleanLevel)
+		seq := p.alertSeq.Add(1)
+		alertID := fmt.Sprintf("sentinel-%d-%d", nowUnix, seq)
+		ts := normalizeAlertTimestamp(w.LastSeenUnix, nowUnix)
+		roundedEntropy := math.Round(w.SampleEntropy*10000) / 10000
+		topFeats := surprisal.TopFeatures(sw.score.FeatureContribs, 4)
+
+		msg := fmt.Sprintf("[SURPRISAL-001] statistical_anomaly on service=%s count=%d surprisal=%.2fnats (threshold=%.2f) entropy=%.2f sample=%q",
+			cleanService,
+			w.Count,
+			sw.score.TotalNats,
+			sw.score.ThresholdNats,
+			roundedEntropy,
+			truncateSummary(cleanSample, 220),
+		)
+
+		alert := emit.Alert{
+			Timestamp:            ts,
+			Service:              p.cfg.AlertServiceName,
+			Level:                emit.MapSeverityToGenesisLevel(severity),
+			TraceID:              alertID,
+			Message:              msg,
+			AlertID:              alertID,
+			Tier:                 "tier1",
+			SourceService:        cleanService,
+			SourceLevel:          cleanLevel,
+			TemplateID:           w.TemplateID,
+			Template:             cleanTemplate,
+			Count:                w.Count,
+			SampleEntropy:        roundedEntropy,
+			SurprisalNats:        sw.score.TotalNats,
+			SurprisalThreshold:   sw.score.ThresholdNats,
+			TopSurprisalFeatures: topFeats,
+			RuleIDs:              []string{"SURPRISAL-001"},
+			Categories:           []string{"statistical_anomaly"},
+			Severity:             severity,
+			InjectionSuspected:   injSuspected,
+			InjectionSignals:     injSignals,
+			SanitizedSample:      cleanSample,
+		}
+
+		emittedWinKeys[sw.joinKey] = true
 		if err := p.sink.Emit(alert); err != nil {
 			p.sinkErrors.Add(1)
 			failed = append(failed, FailedAlert{Alert: alert, Err: err})
@@ -447,6 +674,17 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 
 	return emitted, failed
+}
+
+func mapSurprisalSeverity(totalNats, thresholdNats float64, level string) string {
+	upperLvl := strings.ToUpper(strings.TrimSpace(level))
+	if upperLvl == "FATAL" || upperLvl == "CRITICAL" || (thresholdNats > 0 && totalNats >= thresholdNats*2.5) {
+		return "HIGH"
+	}
+	if upperLvl == "ERROR" || (thresholdNats > 0 && totalNats >= thresholdNats*1.8) {
+		return "HIGH"
+	}
+	return "MEDIUM"
 }
 
 // Stats returns a thread-safe snapshot of pipeline metrics.
@@ -464,6 +702,7 @@ func (p *Pipeline) Stats() Stats {
 	p.burnMu.RLock()
 	segReader := p.segReader
 	queryPoller := p.queryPoller
+	surpEng := p.surprisalEng
 	p.burnMu.RUnlock()
 
 	st := Stats{
@@ -485,6 +724,19 @@ func (p *Pipeline) Stats() Stats {
 		UptimeSeconds:            int64(time.Since(p.startTime).Seconds()),
 	}
 
+	if surpEng != nil {
+		ss := surpEng.Stats()
+		st.SurprisalMode = ss.Mode
+		st.SurprisalThresholdNats = ss.ThresholdNats
+		st.SurprisalScored = ss.ScoredTotal
+		st.SurprisalAnomalies = ss.AnomaliesTotal
+		st.SurprisalBaselineCases = ss.BaselineCases
+		st.SurprisalBaselineCap = ss.BaselineCapacity
+		st.SurprisalWarmupComplete = ss.WarmupComplete
+		st.SurprisalMaxNats = ss.MaxNatsObserved
+		st.SurprisalHTTPChecks = ss.HTTPChecks
+		st.SurprisalHTTPFallbacks = ss.HTTPFallbacks
+	}
 	if segReader != nil {
 		rs := segReader.Stats()
 		st.CorruptedFrames = rs.CorruptedFrames
@@ -502,7 +754,8 @@ func (p *Pipeline) Stats() Stats {
 }
 
 // Burn waits for any in-flight FlushWindow to finish, resets in-memory templates,
-// pending hits, and active ingest cursors (.seg and /query), and deletes Sentinel-owned disk state.
+// pending hits, Tier 1 rolling surprisal baselines, and active ingest cursors
+// (.seg and /query), and deletes Sentinel-owned disk state.
 func (p *Pipeline) Burn() (BurnReport, error) {
 	p.burnMu.Lock()
 	defer p.burnMu.Unlock()
@@ -512,6 +765,9 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
 	p.windowMu.Unlock()
 
+	if p.surprisalEng != nil {
+		p.surprisalEng.Reset()
+	}
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
 	}

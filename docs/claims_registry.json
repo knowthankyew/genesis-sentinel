@@ -105,6 +105,41 @@
       "used_in": ["SECURITY.md"],
       "description": "Single-frame allocation cap protecting .seg decoding against corrupted lengths"
     },
+    "surprisal_min_deviation_floor": {
+      "source_artifact": "internal/surprisal/math.go",
+      "go_const": "MinDeviationFloor",
+      "format_rule": "{value:.2f}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "MAD substitutability deviation floor matching ml/src/surprisal-service/service.py"
+    },
+    "surprisal_nominal_mismatch_nats": {
+      "source_artifact": "internal/surprisal/math.go",
+      "go_const": "NominalMismatchNats",
+      "format_rule": "{value:.1f} nats",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Nominal feature mismatch penalty in nats matching service.py Equation 7"
+    },
+    "surprisal_default_warmup_cases": {
+      "source_artifact": "internal/surprisal/math.go",
+      "go_const": "DefaultWarmupMinCases",
+      "format_rule": "{value}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Minimum rolling baseline windows learned before Tier 1 flags anomalies"
+    },
+    "surprisal_default_max_candidates": {
+      "source_artifact": "internal/surprisal/math.go",
+      "go_const": "DefaultMaxCandidateCases",
+      "format_rule": "{value}",
+      "used_in": ["docs/ARCHITECTURE.md"],
+      "description": "Maximum evenly-strided candidate neighbors evaluated per window"
+    },
+    "surprisal_max_snapshot_mb": {
+      "source_artifact": "internal/surprisal/math.go",
+      "go_const": "MaxBaselineSnapshotBytes",
+      "format_rule": "bytes_to_mb",
+      "used_in": ["SECURITY.md"],
+      "description": "Maximum byte size accepted when loading persisted baseline.json snapshots"
+    },
     "default_base_model": {
       "source_artifact": "internal/model/types.go",
       "go_const": "ModelSmolLM2135MInstruct",

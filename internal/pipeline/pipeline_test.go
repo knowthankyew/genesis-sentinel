@@ -507,3 +507,102 @@ func TestPipelineAtomicWindowBoundaryUnderConcurrency(t *testing.T) {
 		t.Fatalf("expected total SENT-003 alert count across concurrent flushes = 200, got %d (alerts=%d)", totalSENT003, len(allAlerts))
 	}
 }
+
+func TestPipelineTier1SurprisalCatchesUnseenAnomalyAndBurnWipesBaseline(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.SurprisalMode = "inprocess"
+	cfg.SurprisalThreshold = 5.0
+
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	var alertBuf bytes.Buffer
+	pipe := New(cfg, ruleEng, emit.NewWriterSink(&alertBuf), "file")
+
+	// 1. Warm up rolling baseline across 24 benign windows (nginx/api/cron).
+	for w := 0; w < 24; w++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID:        uint64(w*2 + 1),
+			Timestamp: 1763996000 + int64(w*10),
+			Service:   "nginx",
+			Level:     "INFO",
+			Message:   "GET /healthz HTTP/1.1 200 3ms",
+		})
+		pipe.IngestEvent(model.LogEvent{
+			ID:        uint64(w*2 + 2),
+			Timestamp: 1763996001 + int64(w*10),
+			Service:   "api",
+			Level:     "INFO",
+			Message:   "POST /api/v1/orders HTTP/1.1 200 18ms",
+		})
+		alerts, failed := pipe.FlushWindow()
+		if len(alerts) != 0 || len(failed) != 0 {
+			t.Fatalf("expected 0 alerts during benign warmup window %d, got alerts=%+v failed=%+v", w, alerts, failed)
+		}
+	}
+	if !pipe.Stats().SurprisalWarmupComplete {
+		t.Fatalf("expected SurprisalWarmupComplete=true after warmup, stats=%+v", pipe.Stats())
+	}
+
+	// Persist baseline snapshot to disk so we can verify Burn wipes it too.
+	baselinePath := filepath.Join(dataDir, "baseline.json")
+	if err := pipe.SurprisalEngine().SaveToFile(baselinePath, false); err != nil {
+		t.Fatalf("SaveToFile baseline: %v", err)
+	}
+
+	// 2. Inject a novel unseen anomaly with ordinary entropy (< 4.8) and zero Tier 0 rule matches
+	// (no SQLi, traversal, sudo, FATAL, SSH, or high-entropy blob — purely structural novelty!).
+	pipe.IngestEvent(model.LogEvent{
+		ID:        9000,
+		Timestamp: 1763997000,
+		Service:   "unseen-worker",
+		Level:     "ERROR",
+		Message:   "unexpected outbound relay connection reset by peer during background archive sync retry",
+	})
+	alerts, failed := pipe.FlushWindow()
+	if len(failed) != 0 || len(alerts) != 1 {
+		t.Fatalf("expected exactly 1 Tier 1 anomaly alert, got alerts=%+v failed=%+v", alerts, failed)
+	}
+	a := alerts[0]
+	if a.Tier != "tier1" || a.SurprisalNats < 5.0 || len(a.TopSurprisalFeatures) == 0 {
+		t.Fatalf("expected tier1 alert with surprisal >= 5.0 and feature attributions, got %+v", a)
+	}
+	if len(a.RuleIDs) != 1 || a.RuleIDs[0] != "SURPRISAL-001" {
+		t.Fatalf("expected SURPRISAL-001 rule tag on tier1 alert, got %+v", a.RuleIDs)
+	}
+
+	// 3. Inject an event matching BOTH a Tier 0 rule (SENT-003 path traversal) AND Tier 1 anomaly -> single unified tier0+tier1 alert!
+	pipe.IngestEvent(model.LogEvent{
+		ID:        9001,
+		Timestamp: 1763997010,
+		Service:   "edge-proxy-unknown",
+		Level:     "ERROR",
+		Message:   "GET /../../../../etc/passwd?p=!!!@@@###$$$%%%^^^&&&*** HTTP/1.1 500 payload=A1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3z",
+	})
+	dualAlerts, failed := pipe.FlushWindow()
+	if len(failed) != 0 || len(dualAlerts) != 1 {
+		t.Fatalf("expected single unified tier0+tier1 alert (no duplicate), got alerts=%+v failed=%+v", dualAlerts, failed)
+	}
+	if dualAlerts[0].Tier != "tier0+tier1" || dualAlerts[0].SurprisalNats < 5.0 {
+		t.Fatalf("expected tier0+tier1 enriched alert, got %+v", dualAlerts[0])
+	}
+
+	// 4. Burn wipes both in-memory rolling baseline AND disk baseline.json cleanly.
+	rep, err := pipe.Burn()
+	if err != nil {
+		t.Fatalf("Burn failed: %v", err)
+	}
+	if rep.FilesRemoved != 1 {
+		t.Fatalf("expected Burn to remove baseline.json (1 file), got %+v", rep)
+	}
+	if _, err := os.Stat(baselinePath); !os.IsNotExist(err) {
+		t.Fatal("baseline.json survived Burn()")
+	}
+	if pipe.Stats().SurprisalBaselineCases != 0 || pipe.SurprisalEngine().Dirty() {
+		t.Fatalf("expected empty clean baseline after Burn(), got stats=%+v", pipe.Stats())
+	}
+}

@@ -20,19 +20,24 @@ import (
 
 // ScanReport is the machine-readable summary produced by `sentinel scan`.
 type ScanReport struct {
-	Source           string       `json:"source"`
-	ElapsedMs        float64      `json:"elapsed_ms"`
-	ThroughputLPS    float64      `json:"throughput_lps"`
-	LinesRead        uint64       `json:"lines_read"`
-	OversizedLines   uint64       `json:"oversized_lines"`
-	TemplatesEmitted uint64       `json:"templates_emitted"`
-	CollapseRatio    float64      `json:"collapse_ratio"`
-	AlertsEmitted    uint64       `json:"alerts_emitted"`
-	SinkErrors       uint64       `json:"sink_errors"`
-	InjectionSignals uint64       `json:"injection_signals"`
-	CorruptedFrames  uint64       `json:"corrupted_frames"`
-	HeapBytes        uint64       `json:"heap_bytes"`
-	Alerts           []emit.Alert `json:"alerts"`
+	Source                 string       `json:"source"`
+	ElapsedMs              float64      `json:"elapsed_ms"`
+	ThroughputLPS          float64      `json:"throughput_lps"`
+	LinesRead              uint64       `json:"lines_read"`
+	OversizedLines         uint64       `json:"oversized_lines"`
+	TemplatesEmitted       uint64       `json:"templates_emitted"`
+	CollapseRatio          float64      `json:"collapse_ratio"`
+	AlertsEmitted          uint64       `json:"alerts_emitted"`
+	SinkErrors             uint64       `json:"sink_errors"`
+	InjectionSignals       uint64       `json:"injection_signals"`
+	SurprisalMode          string       `json:"surprisal_mode"`
+	SurprisalScored        uint64       `json:"surprisal_scored"`
+	SurprisalAnomalies     uint64       `json:"surprisal_anomalies"`
+	SurprisalBaselineCases int          `json:"surprisal_baseline_cases"`
+	SurprisalMaxNats       float64      `json:"surprisal_max_nats"`
+	CorruptedFrames        uint64       `json:"corrupted_frames"`
+	HeapBytes              uint64       `json:"heap_bytes"`
+	Alerts                 []emit.Alert `json:"alerts"`
 }
 
 func runScan(args []string, stdout, stderr io.Writer) error {
@@ -44,19 +49,36 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	syntheticN := fs.Int("synthetic", 0, "Generate and replay N Track A synthetic logs through CRC32 .seg files")
 	seed := fs.Uint64("seed", 42, "Deterministic PRNG seed for --synthetic replay")
 	rulesPath := fs.String("rules", "", "Optional path to custom JSON rules.json pack")
+	baselinePath := fs.String("baseline", "", "Optional path to a saved baseline.json snapshot for Tier 1 surprisal scoring")
+	surprisalMode := fs.String("surprisal-mode", "", "Tier 1 surprisal mode: inprocess | http | hybrid")
+	surprisalThreshold := fs.Float64("surprisal-threshold", 0, "Tier 1 surprisal anomaly threshold in nats")
+	windowEvents := fs.Int("window-events", 0, "Optional event batch size per window flush during offline replay (0 = single flush)")
 	asJSON := fs.Bool("json", false, "Emit full ScanReport as JSON")
 	emitGenesis := fs.Bool("emit-genesis", false, "Also emit detected alerts to Genesis TCP ingest")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *windowEvents < 0 {
+		return fmt.Errorf("invalid --window-events %d: must be >= 0", *windowEvents)
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	if *rulesPath != "" {
-		cfg.RulesPath = *rulesPath
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "rules":
+			cfg.RulesPath = *rulesPath
+		case "surprisal-mode":
+			cfg.SurprisalMode = *surprisalMode
+		case "surprisal-threshold":
+			cfg.SurprisalThreshold = *surprisalThreshold
+		}
+	})
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 
 	if *segDir == "" && *filePath == "" && *syntheticN <= 0 {
@@ -70,9 +92,6 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 
 	var sink emit.Sink = emit.NopSink{}
 	if *emitGenesis {
-		if err := cfg.Validate(); err != nil {
-			return fmt.Errorf("config validation failed for --emit-genesis: %w", err)
-		}
 		tcpSink := emit.NewGenesisTCPSink(cfg.GenesisTCPAddr, 2*time.Second)
 		defer func() { _ = tcpSink.Close() }()
 		sink = tcpSink
@@ -111,7 +130,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 
 		sourceLabel = fmt.Sprintf("synthetic-seg (%d lines, seed=%d)", *syntheticN, *seed)
 		startTime = time.Now()
-		pipe, alerts, err = scanSegDirectory(cfg, ruleEng, sink, tmpDir)
+		pipe, alerts, err = scanSegDirectory(cfg, ruleEng, sink, tmpDir, *baselinePath, *windowEvents)
 		if err != nil {
 			return err
 		}
@@ -119,7 +138,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	case *segDir != "":
 		sourceLabel = "segdir:" + *segDir
 		startTime = time.Now()
-		pipe, alerts, err = scanSegDirectory(cfg, ruleEng, sink, *segDir)
+		pipe, alerts, err = scanSegDirectory(cfg, ruleEng, sink, *segDir, *baselinePath, *windowEvents)
 		if err != nil {
 			return err
 		}
@@ -127,7 +146,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	case *filePath != "":
 		sourceLabel = "file:" + *filePath
 		startTime = time.Now()
-		pipe, alerts, oversizedLines, err = scanLogFile(cfg, ruleEng, sink, *filePath)
+		pipe, alerts, oversizedLines, err = scanLogFile(cfg, ruleEng, sink, *filePath, *baselinePath, *windowEvents)
 		if err != nil {
 			return err
 		}
@@ -142,19 +161,24 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	}
 
 	report := ScanReport{
-		Source:           sourceLabel,
-		ElapsedMs:        float64(elapsed.Microseconds()) / 1000.0,
-		ThroughputLPS:    lps,
-		LinesRead:        st.LinesRead,
-		OversizedLines:   oversizedLines,
-		TemplatesEmitted: st.TemplatesEmitted,
-		CollapseRatio:    st.CollapseRatio,
-		AlertsEmitted:    st.AlertsEmitted,
-		SinkErrors:       st.SinkErrors,
-		InjectionSignals: st.InjectionSignals,
-		CorruptedFrames:  st.CorruptedFrames,
-		HeapBytes:        st.HeapBytes,
-		Alerts:           alerts,
+		Source:                 sourceLabel,
+		ElapsedMs:              float64(elapsed.Microseconds()) / 1000.0,
+		ThroughputLPS:          lps,
+		LinesRead:              st.LinesRead,
+		OversizedLines:         oversizedLines,
+		TemplatesEmitted:       st.TemplatesEmitted,
+		CollapseRatio:          st.CollapseRatio,
+		AlertsEmitted:          st.AlertsEmitted,
+		SinkErrors:             st.SinkErrors,
+		InjectionSignals:       st.InjectionSignals,
+		SurprisalMode:          st.SurprisalMode,
+		SurprisalScored:        st.SurprisalScored,
+		SurprisalAnomalies:     st.SurprisalAnomalies,
+		SurprisalBaselineCases: st.SurprisalBaselineCases,
+		SurprisalMaxNats:       st.SurprisalMaxNats,
+		CorruptedFrames:        st.CorruptedFrames,
+		HeapBytes:              st.HeapBytes,
+		Alerts:                 alerts,
 	}
 
 	if *asJSON {
@@ -175,6 +199,10 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		},
 		func() error {
 			return writef("  Templates       : %d (collapse ratio: %.1fx)\n", report.TemplatesEmitted, report.CollapseRatio)
+		},
+		func() error {
+			return writef("  Tier 1 Surprisal: mode=%s scored=%d anomalies=%d max=%.2fnats baseline=%d\n",
+				report.SurprisalMode, report.SurprisalScored, report.SurprisalAnomalies, report.SurprisalMaxNats, report.SurprisalBaselineCases)
 		},
 		func() error {
 			return writef("  Elapsed         : %.2f ms (%.0f lines/sec)\n", report.ElapsedMs, report.ThroughputLPS)
@@ -203,14 +231,23 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func scanSegDirectory(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, segDir string) (*pipeline.Pipeline, []emit.Alert, error) {
+func scanSegDirectory(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, segDir, baselinePath string, windowEvents int) (*pipeline.Pipeline, []emit.Alert, error) {
 	reader, err := ingest.NewSegReader(segDir, "", 0)
 	if err != nil {
 		return nil, nil, err
 	}
 	pipe := pipeline.New(cfg, ruleEng, sink, "segdir")
 	pipe.AttachSegReader(reader)
+	if baselinePath != "" {
+		if _, loadErr := pipe.SurprisalEngine().LoadFromFile(baselinePath); loadErr != nil {
+			return nil, nil, fmt.Errorf("load baseline %q: %w", baselinePath, loadErr)
+		}
+	}
 
+	var (
+		allAlerts []emit.Alert
+		inWindow  int
+	)
 	for {
 		batch, readErr := reader.ReadBatch(8192)
 		if readErr != nil {
@@ -221,16 +258,25 @@ func scanSegDirectory(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink,
 		}
 		for _, ev := range batch {
 			pipe.IngestEvent(ev)
+			if windowEvents > 0 {
+				inWindow++
+				if inWindow >= windowEvents {
+					emitted, _ := pipe.FlushWindow()
+					allAlerts = append(allAlerts, emitted...)
+					inWindow = 0
+				}
+			}
 		}
 	}
-	alerts, _ := pipe.FlushWindow()
-	return pipe, alerts, nil
+	emitted, _ := pipe.FlushWindow()
+	allAlerts = append(allAlerts, emitted...)
+	return pipe, allAlerts, nil
 }
 
 // scanLogFile streams lines with a bounded bufio.Reader so an adversarial >1 MiB
 // line is drained through its newline, counted as oversized, and never aborts
 // scanning of subsequent valid records.
-func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path string) (*pipeline.Pipeline, []emit.Alert, uint64, error) {
+func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path, baselinePath string, windowEvents int) (*pipeline.Pipeline, []emit.Alert, uint64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("open log file %q: %w", path, err)
@@ -238,6 +284,11 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 	defer func() { _ = f.Close() }()
 
 	pipe := pipeline.New(cfg, ruleEng, sink, "file")
+	if baselinePath != "" {
+		if _, loadErr := pipe.SurprisalEngine().LoadFromFile(baselinePath); loadErr != nil {
+			return nil, nil, 0, fmt.Errorf("load baseline %q: %w", baselinePath, loadErr)
+		}
+	}
 	reader := bufio.NewReaderSize(f, 64*1024)
 	defaultSvc := filepath.Base(path)
 
@@ -246,6 +297,8 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 		oversized uint64
 		acc       []byte
 		skipping  bool
+		allAlerts []emit.Alert
+		inWindow  int
 	)
 
 	// Allow up to MaxFrameBytes of payload plus up to 2 bytes for CRLF line ending.
@@ -305,6 +358,14 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 			ev, parseErr := ingest.ParseRawLog(id, payload, 0, defaultSvc)
 			if parseErr == nil {
 				pipe.IngestEvent(ev)
+				if windowEvents > 0 {
+					inWindow++
+					if inWindow >= windowEvents {
+						emitted, _ := pipe.FlushWindow()
+						allAlerts = append(allAlerts, emitted...)
+						inWindow = 0
+					}
+				}
 			} else if errors.Is(parseErr, ingest.ErrOversizedLine) {
 				oversized++
 			}
@@ -316,8 +377,9 @@ func scanLogFile(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, path
 		}
 	}
 
-	alerts, _ := pipe.FlushWindow()
-	return pipe, alerts, oversized, nil
+	emitted, _ := pipe.FlushWindow()
+	allAlerts = append(allAlerts, emitted...)
+	return pipe, allAlerts, oversized, nil
 }
 
 func trimLineEnding(b []byte) []byte {

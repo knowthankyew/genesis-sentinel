@@ -22,7 +22,7 @@ class TestClaimsLinter(unittest.TestCase):
     def test_go_constants_and_safe_bounds(self):
         """Verify Go core constants match expected architectural bounds."""
         version = sync_docs.extract_go_constant(REPO_ROOT / "internal" / "cli" / "cli.go", "Version")
-        self.assertEqual(version, "0.2.0-phase1")
+        self.assertEqual(version, "0.3.0-phase2")
 
         max_clusters = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "template" / "drain.go", "DefaultMaxClusters"
@@ -78,6 +78,31 @@ class TestClaimsLinter(unittest.TestCase):
             REPO_ROOT / "internal" / "ingest" / "segreader.go", "MaxFrameBytes"
         )
         self.assertEqual(max_frame, 1024 * 1024)
+
+        min_dev = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "surprisal" / "math.go", "MinDeviationFloor"
+        )
+        self.assertEqual(min_dev, 0.25)
+
+        nom_nats = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "surprisal" / "math.go", "NominalMismatchNats"
+        )
+        self.assertEqual(nom_nats, 2.5)
+
+        warmup_min = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "surprisal" / "math.go", "DefaultWarmupMinCases"
+        )
+        self.assertEqual(warmup_min, 20)
+
+        max_cand = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "surprisal" / "math.go", "DefaultMaxCandidateCases"
+        )
+        self.assertEqual(max_cand, 120)
+
+        max_snap = sync_docs.extract_go_constant(
+            REPO_ROOT / "internal" / "surprisal" / "math.go", "MaxBaselineSnapshotBytes"
+        )
+        self.assertEqual(max_snap, 16 * 1024 * 1024)
 
         default_model = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "model" / "types.go", "ModelSmolLM2135MInstruct"

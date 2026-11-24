@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0-phase2] - 2026-11-24
+
+### Added
+- **Tier 1 Clean-Room Laplace-LK Log Surprisal Engine (`internal/surprisal`):** Pure-Go stdlib implementation of Equations 4, 6, 7, and 8 (`arXiv:2510.22809`) with MAD substitutability deviations (`MinDeviationFloor = 0.25`), nominal mismatch penalty (`2.5 nats`), strided same-service/global $k$-NN neighborhood scoring (`DefaultMaxCandidateCases = 120`), and numerical parity tests against `ml/src/surprisal-service/service.py` within `1e-6` nats.
+- **Log-Domain Feature Extractor & Poisoning-Resistant Rolling Baseline (`features.go`, `engine.go`, `baseline.go`):** Linear-time extraction of 8 well-conditioned continuous features and 4 structural nominal features (`service`, `level`, `template_class`, HTTP status family / syslog `<PRI>` facility), cold-start warmup guard (`DefaultWarmupMinCases = 20`), baseline poisoning prevention, and atomic `baseline.json` persistence (`0600`, 16 MiB load cap) wiped cleanly by `sentinel burn`.
+- **Loopback HTTP Parity Client (`http_client.go`):** Optional `surprisal_mode=http|hybrid` client targeting local `ml/src/surprisal-service` (`:5200`) with dial-time loopback enforcement and automatic fallback to in-process scoring.
+- **Pipeline, Alert & CLI Wiring (`internal/pipeline`, `internal/emit`, `internal/cli`):** Unified `tier0+tier1` alert enrichment, standalone `tier1` (`SURPRISAL-001`) anomaly alerts for unseen traffic, Tier 1 telemetry on `/stats`, and `--surprisal-mode` / `--surprisal-threshold` / `--baseline` / `--window-events` CLI flags on `watch` and `scan`.
+
+---
+
 ## [0.2.0-phase1] - 2026-11-24
 
 ### Added

@@ -5,7 +5,7 @@
 > **Active Base Model Tier**: **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default; `SmolLM2-360M-Instruct` step-up)  
 > **Phase 5 Reasoning Tier**: **Gemma 2 2B IT** (`google/gemma-2-2b-it`)  
 > **Explicitly Excluded**: **BitNet b1.58** (experimental; deferred pending upstream development cycle)  
-> **Status**: 🟢 **PHASES 0–1 COMPLETE** | 🟡 **PHASE 2 NEXT**  
+> **Status**: 🟢 **PHASES 0–2 COMPLETE** | 🟡 **PHASE 3 NEXT**  
 > **Date**: 2026-11-24
 
 ---
@@ -35,7 +35,7 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 0** | **Scaffold & Governance** | Local Git repo, pure-Go stdlib scaffold, domain contracts, loopback & prompt-injection guards, ADRs, Architecture Spec, Roadmap | Contract-only (`SmolLM2` default) | 🟢 **Completed** |
 | **Phase 1** | **Genesis Bridge & Tier 0** | Lossless `.seg` CRC32 tailer + `/query` sliding-window reader, Drain-style template collapser, JSON deterministic rule/IOC engine, Genesis alert sink (`service=sentinel`), `watch`/`scan`/`stats`/`burn` | None (Pure Go) | 🟢 **Completed** |
-| **Phase 2** | **Tier 1 Surprisal Engine** | Log-domain feature extractor + Laplace-LK surprisal scorer (in-process Go engine + optional `surprisal-service` HTTP parity mode), rolling baseline manager, anomaly threshold calibration | None (Information-Theoretic Math) | ⬜ Planned |
+| **Phase 2** | **Tier 1 Surprisal Engine** | Log-domain feature extractor + Laplace-LK surprisal scorer (in-process Go engine + optional `surprisal-service` HTTP parity mode), rolling baseline manager, anomaly threshold calibration | None (Information-Theoretic Math) | 🟢 **Completed** |
 | **Phase 3** | **Tier 2 SmolLM2 Triage & FTaaS Loop** | Curated log triage dataset generator (synthetic + redacted local baselines), FTaaS training integration (`max_length` tuning in `ml`), `sentinel feedback` & `sentinel train`, local SmolLM2 inference client (HTTP / ONNX) | **SmolLM2-135M** (or `SmolLM2-135M-Instruct`) | ⬜ Planned |
 | **Phase 4** | **Hardening, Benchmarks & Ops** | Hostile-log prompt-injection test harness, live replay benchmark (`cmd/sentinel-bench`), empirical metrics & claims audit (`scripts/audit-claims.py`), `launchd`/`systemd` units, optional `all-MiniLM-L6-v2` comparison | SmolLM2 | ⬜ Planned |
 | **Phase 5** | **Gemma 2 2B IT Upgrade** | High-capacity reasoning adapter training on `google/gemma-2-2b-it`, tiered Smol-to-Gemma escalation for high-severity incidents, side-by-side quality vs. latency benchmark report | **Gemma 2 2B IT** | ⬜ Deferred to End |
@@ -73,7 +73,7 @@ flowchart LR
 
 ---
 
-### Phase 2: Tier 1 Laplace-LK Log Surprisal Engine
+### Phase 2: Tier 1 Laplace-LK Log Surprisal Engine (Completed)
 - **Goal**: Catch novel, previously unseen, or subtly weird log patterns—even without matching a static rule or a labeled training example—using the information-theoretic Laplace-LK surprisal mathematics from `ml/src/surprisal-service` (Hazard et al., `arXiv:2510.22809`, Equations 4, 6, 7, 8).
 - **Deliverables**:
   - `internal/surprisal/features.go`: Log-domain feature extractor replacing the fintech/SaaS keywords in `ml/src/surprisal-service/service.py` with security & telemetry features:

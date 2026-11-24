@@ -385,6 +385,15 @@ func (e *Engine) IsTemplateSuppressed(service, tmpl string) bool {
 	return false
 }
 
+// IsWindowSuppressed reports whether a collapsed TemplateWindow is suppressed by an
+// operator service-only or template-only suppression rule (safe for nil receiver).
+func (e *Engine) IsWindowSuppressed(w model.TemplateWindow) bool {
+	if e == nil {
+		return false
+	}
+	return e.isWindowSuppressed(w)
+}
+
 // Evaluate inspects a standalone TemplateWindow against suppressions, adversarial
 // prompt-injection heuristics, and compiled deterministic rules.
 // Enforces message-pattern suppressions per candidate sample, tests MinLength and

@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/knowthankyew/genesis-sentinel/internal/model"
+	"github.com/knowthankyew/genesis-sentinel/internal/surprisal"
 )
 
 func TestExecuteVersionAndHelp(t *testing.T) {
@@ -286,5 +289,57 @@ func TestExecuteDataSubcommands(t *testing.T) {
 	}
 	if !st.Exists || st.FileCount != 1 || st.TotalBytes != 9 {
 		t.Fatalf("unexpected data status after write: %+v", st)
+	}
+}
+
+func TestExecuteScanWithPreloadedBaselineSurfacesTier1Anomaly(t *testing.T) {
+	dir := t.TempDir()
+	baselinePath := filepath.Join(dir, "baseline.json")
+
+	// Preload 25 benign baseline windows into baseline.json.
+	eng := surprisal.NewEngine(surprisal.Options{BaselineWindowSize: 100, WarmupMinCases: 20})
+	for i := 0; i < 25; i++ {
+		eng.LearnBaseline(model.TemplateWindow{
+			TemplateID:    "tmpl-health",
+			Template:      "GET /healthz HTTP/1.1 200 <DUR>",
+			Service:       "api",
+			Level:         "INFO",
+			Count:         10,
+			FirstSeenUnix: 1763996000,
+			LastSeenUnix:  1763996010,
+			SampleLine:    "GET /healthz HTTP/1.1 200 4ms",
+		})
+	}
+	if err := eng.SaveToFile(baselinePath, true); err != nil {
+		t.Fatalf("SaveToFile baseline: %v", err)
+	}
+
+	// Write a log file containing a normal-entropy novel unseen anomaly that matches ZERO Tier 0 static rules.
+	logPath := filepath.Join(dir, "novel.log")
+	logLine := `{"timestamp":1763996500,"service":"unseen-daemon","level":"ERROR","message":"unexpected outbound relay connection reset by peer during background archive sync retry"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(logLine), 0600); err != nil {
+		t.Fatalf("write novel.log: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"scan", "--file", logPath, "--baseline", baselinePath, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("scan --baseline failed: %v (stderr=%s)", err, errBuf.String())
+	}
+
+	var rep ScanReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode scan JSON: %v", err)
+	}
+	if rep.SurprisalAnomalies < 1 || rep.AlertsEmitted < 1 {
+		t.Fatalf("expected Tier 1 surprisal anomaly alert with preloaded baseline, got %+v", rep)
+	}
+	foundTier1 := false
+	for _, a := range rep.Alerts {
+		if a.Tier == "tier1" && a.SurprisalNats >= 5.0 {
+			foundTier1 = true
+		}
+	}
+	if !foundTier1 {
+		t.Fatalf("expected a tier1 alert with surprisal_nats >= 5.0, got alerts=%+v", rep.Alerts)
 	}
 }
