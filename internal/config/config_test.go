@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,6 +55,14 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 	cfg.BaselineWindowSize = MaxBaselineWindowSize + 1
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected BaselineWindowSize=%d to fail validation", MaxBaselineWindowSize+1)
+	}
+
+	for _, badThresh := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0, -1.5} {
+		cfg = DefaultConfig()
+		cfg.SurprisalThreshold = badThresh
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected SurprisalThreshold=%v to fail validation", badThresh)
+		}
 	}
 }
 

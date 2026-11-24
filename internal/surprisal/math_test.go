@@ -151,7 +151,15 @@ func TestOverflowSafeMathOnExtremeFiniteRanges(t *testing.T) {
 	want := 2.0 + 0.5*math.Exp(-2.0)*5.0 - 1.5
 	assertClose(t, "MarginalSurprisalCont(1e308, -1e308, 1e308)", got, want)
 
-	// KNNMean of two 1e308 neighbors AND mixed-sign [-1e308, 1e308] must remain exact and finite.
+	// Closely spaced large finite floats (3*2^52 and 3*2^52 - 2, delta=0.25 -> exact u=8)
+	// must subtract before dividing so precision is not lost to premature scaling.
+	bigX1 := float64(3 * (1 << 52))
+	bigX2 := bigX1 - 2.0
+	wantBig := 8.0 + 0.5*math.Exp(-8.0)*11.0 - 1.5
+	assertClose(t, "MarginalSurprisalCont(3*2^52, 3*2^52-2, 0.25)", MarginalSurprisalCont(bigX1, bigX2, 0.25), wantBig)
+
+	// KNNMean of two 1e308 neighbors, mixed-sign [-1e308, 1e308], AND cancellation [-1e308, 1, 1e308]
+	// must all remain exact and finite.
 	km := KNNMean([]float64{1e308, 1e308}, 2)
 	if math.IsNaN(km) || math.IsInf(km, 0) || math.Abs(km-1e308)/1e308 > 1e-12 {
 		t.Fatalf("KNNMean([1e308, 1e308], 2) = %v, want 1e308", km)
@@ -159,6 +167,10 @@ func TestOverflowSafeMathOnExtremeFiniteRanges(t *testing.T) {
 	kmMixed := KNNMean([]float64{-1e308, 1e308}, 2)
 	if math.IsNaN(kmMixed) || math.IsInf(kmMixed, 0) || math.Abs(kmMixed) > 1e-12 {
 		t.Fatalf("KNNMean([-1e308, 1e308], 2) = %v, want 0", kmMixed)
+	}
+	kmCancel := KNNMean([]float64{-1e308, 1.0, 1e308}, 3)
+	if math.IsNaN(kmCancel) || math.IsInf(kmCancel, 0) || math.Abs(kmCancel-(1.0/3.0)) > 1e-12 {
+		t.Fatalf("KNNMean([-1e308, 1, 1e308], 3) = %.15f, want 1/3", kmCancel)
 	}
 
 	// LukaszykKarmowskiDiff(5e307, 5e307) must not overflow intermediate 3*delta+d.

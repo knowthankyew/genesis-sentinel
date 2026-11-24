@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Supported base model identifiers for the Genesis Sentinel LoRA pipeline.
@@ -165,4 +167,33 @@ type FeedbackRecord struct {
 	Label      string    `json:"label,omitempty"`
 	Redacted   bool      `json:"redacted"`
 	ReviewedAt time.Time `json:"reviewed_at"`
+}
+
+// CanonicalFold maps every string in the same strings.EqualFold equivalence class to
+// the exact same canonical UTF-8 string using unicode.SimpleFold's minimum rune per fold
+// orbit. Two strings satisfy strings.EqualFold(a, b) if and only if
+// CanonicalFold(a) == CanonicalFold(b).
+func CanonicalFold(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < utf8.RuneSelf {
+			// In unicode.SimpleFold, every ASCII letter's minimum orbit member is its
+			// uppercase ASCII letter (65..90 < 97..122 < all non-ASCII equivalents like
+			// Kelvin 'K' U+212A and long s 'ſ' U+017F).
+			if r >= 'a' && r <= 'z' {
+				r -= 'a' - 'A'
+			}
+			b.WriteByte(byte(r))
+			continue
+		}
+		minR := r
+		for cur := unicode.SimpleFold(r); cur != r; cur = unicode.SimpleFold(cur) {
+			if cur < minR {
+				minR = cur
+			}
+		}
+		b.WriteRune(minR)
+	}
+	return b.String()
 }

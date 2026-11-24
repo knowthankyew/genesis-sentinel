@@ -1,6 +1,8 @@
 package surprisal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"strconv"
 	"strings"
@@ -112,10 +114,26 @@ func ExtractFeatures(w model.TemplateWindow) LogFeatures {
 	}
 	f.Continuous[5] = math.Log1p(interArrivalMs)
 
-	// Nominal features (bounded & normalized)
-	f.Nominal[0] = clampStr(strings.ToLower(strings.TrimSpace(w.Service)), maxServiceFeatureBytes)
-	if f.Nominal[0] == "" {
+	// Nominal features (bounded & normalized).
+	// Preserve full canonical service identity for truncated or >128-byte services via
+	// a bounded sha256 digest so distinct long services sharing a 128-byte display prefix
+	// never collide in peer selection or service-mismatch surprisal (including across save/restore).
+	trimmedSvc := strings.TrimSpace(w.Service)
+	if w.ServiceTruncated && w.HasIdentityHash {
+		f.Nominal[0] = "sha256:" + hex.EncodeToString(w.ServiceLowerHash[:])
+	} else if trimmedSvc == "" {
 		f.Nominal[0] = "unknown"
+	} else {
+		normSvc := strings.ToLower(trimmedSvc)
+		if !utf8.ValidString(normSvc) {
+			normSvc = strings.ToValidUTF8(normSvc, "\uFFFD")
+		}
+		if len(normSvc) > maxServiceFeatureBytes {
+			sum := sha256.Sum256([]byte(model.CanonicalFold(w.Service)))
+			f.Nominal[0] = "sha256:" + hex.EncodeToString(sum[:])
+		} else {
+			f.Nominal[0] = normSvc
+		}
 	}
 	f.Nominal[1] = clampStr(strings.ToUpper(strings.TrimSpace(w.Level)), maxLevelFeatureBytes)
 	if f.Nominal[1] == "" {
@@ -282,11 +300,14 @@ func extractProtoClass(sample string) string {
 		}
 	}
 
-	// 2. HTTP status family when an HTTP method/version or status= token is present.
+	// 2. Mask any HTTP request-target path token (e.g. "GET /docs/HTTP/1.1 HTTP/1.1" or
+	// "TRACE /status=200 HTTP/1.1") BEFORE locating the protocol version or scanning
+	// status=/code= key-value pairs so URL path/query segments cannot spoof HTTP status families.
+	scanStr := stripHTTPRequestTarget(trimmed)
 	hasHTTPVer := false
-	if idx := strings.Index(trimmed, "HTTP/"); idx >= 0 {
+	if idx := strings.Index(scanStr, "HTTP/"); idx >= 0 {
 		hasHTTPVer = true
-		rest := trimmed[idx+5:]
+		rest := scanStr[idx+5:]
 		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
 			after := strings.TrimLeft(rest[sp+1:], " ")
 			if fam := parseHTTPStatusFamily(after); fam != "" {
@@ -294,10 +315,6 @@ func extractProtoClass(sample string) string {
 			}
 		}
 	}
-	// Mask any HTTP request-target path token (e.g. "GET /status=500 HTTP/1.1") before
-	// scanning for status=/code= key-value pairs so URL path/query strings cannot spoof
-	// response status families.
-	scanStr := stripHTTPRequestTarget(trimmed)
 	lower := strings.ToLower(scanStr)
 	for _, key := range []string{"status=", "status:", `"status":`, "code="} {
 		searchFrom := 0
@@ -331,11 +348,13 @@ func extractProtoClass(sample string) string {
 	return "none"
 }
 
+var httpMethodPrefixes = []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ", "TRACE ", "CONNECT "}
+
 // stripHTTPRequestTarget removes the request-target token immediately following an
 // HTTP method verb (e.g. "GET /status=500 HTTP/1.1" -> "GET  HTTP/1.1") so path
 // segments or query strings are never misread as HTTP response status fields.
 func stripHTTPRequestTarget(s string) string {
-	for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "} {
+	for _, m := range httpMethodPrefixes {
 		idx := -1
 		if strings.HasPrefix(s, m) {
 			idx = 0
@@ -361,7 +380,7 @@ func stripHTTPRequestTarget(s string) string {
 }
 
 func extractCompactHTTPStatus(s string) string {
-	for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "} {
+	for _, m := range httpMethodPrefixes {
 		idx := -1
 		if strings.HasPrefix(s, m) {
 			idx = 0
@@ -465,5 +484,6 @@ func clampStr(s string, maxBytes int) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut]
+	// Clone truncated slice so large backing strings from snapshots are not pinned in RAM.
+	return strings.Clone(s[:cut])
 }

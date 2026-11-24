@@ -531,7 +531,7 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 		if !isGlobalOverflow {
 			win.HasIdentityHash = true
 			win.ServiceHash = sha256.Sum256([]byte(ev.Service))
-			win.ServiceLowerHash = sha256.Sum256([]byte(strings.ToLower(ev.Service)))
+			win.ServiceLowerHash = sha256.Sum256([]byte(model.CanonicalFold(ev.Service)))
 			win.LevelHash = sha256.Sum256([]byte(ev.Level))
 		}
 		a.windows[tmplID] = win

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -152,8 +153,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid surprisal_mode %q: must be inprocess, http, or hybrid", c.SurprisalMode)
 	}
 
-	if c.SurprisalThreshold <= 0 {
-		return fmt.Errorf("surprisal_threshold_nats must be positive, got %v", c.SurprisalThreshold)
+	if math.IsNaN(c.SurprisalThreshold) || math.IsInf(c.SurprisalThreshold, 0) || c.SurprisalThreshold <= 0 {
+		return fmt.Errorf("surprisal_threshold_nats must be a positive finite number, got %v", c.SurprisalThreshold)
 	}
 	if c.BaselineWindowSize <= 0 || c.BaselineWindowSize > MaxBaselineWindowSize {
 		return fmt.Errorf("baseline_window_size must be between 1 and %d, got %d", MaxBaselineWindowSize, c.BaselineWindowSize)

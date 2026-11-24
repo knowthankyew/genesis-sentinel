@@ -135,6 +135,7 @@ type Pipeline struct {
 	windowMu              sync.Mutex
 	maxPendingRuleBuckets int
 	pendingHits           map[ruleBucketKey]*bucketAccumulator
+	droppedRuleBuckets    bool
 
 	segReader   *ingest.SegReader
 	queryPoller *ingest.QueryPoller
@@ -290,6 +291,7 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	bucket, exists := p.pendingHits[key]
 	if !exists {
 		if len(p.pendingHits) >= p.maxPendingRuleBuckets {
+			p.droppedRuleBuckets = true
 			p.ruleBucketsDropped.Add(1)
 			return
 		}
@@ -376,6 +378,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	windows := p.agg.Flush()
 	drainedHits := p.pendingHits
 	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
+	droppedRuleBuckets := p.droppedRuleBuckets
+	p.droppedRuleBuckets = false
 	p.windowMu.Unlock()
 
 	if len(windows) == 0 && len(drainedHits) == 0 {
@@ -434,8 +438,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 				scoredWindows = append(scoredWindows, scoredWindow{win: w, bucketKey: bk, hasKey: hasKey, suppressed: true})
 				continue
 			}
-			// Never absorb Tier 0 hits or cluster-overflow buckets into the benign baseline.
-			blockLearn := (hasKey && tier0SignalKeys[bk]) || w.Template == "<OVERFLOW>"
+			// Never absorb Tier 0 hits, cluster-overflow buckets, or windows from a flush
+			// where pendingHits overflowed (which may have dropped a Tier 0 signal) into
+			// the rolling benign baseline.
+			blockLearn := droppedRuleBuckets || (hasKey && tier0SignalKeys[bk]) || w.Template == "<OVERFLOW>"
 			sc := surpEng.Evaluate(evalCtx, w, blockLearn)
 			scoredWindows = append(scoredWindows, scoredWindow{win: w, bucketKey: bk, hasKey: hasKey, score: sc})
 			if hasKey {
@@ -799,6 +805,7 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	p.windowMu.Lock()
 	p.agg.Reset()
 	p.pendingHits = make(map[ruleBucketKey]*bucketAccumulator, 64)
+	p.droppedRuleBuckets = false
 	p.windowMu.Unlock()
 
 	if p.surprisalEng != nil {

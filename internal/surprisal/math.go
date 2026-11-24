@@ -2,6 +2,7 @@ package surprisal
 
 import (
 	"math"
+	"math/big"
 	"sort"
 )
 
@@ -140,19 +141,27 @@ func MarginalSurprisalCont(x1, x2, delta float64) float64 {
 	if x1 == x2 {
 		return 0
 	}
-	scale := math.Max(math.Abs(x1), math.Abs(x2))
-	if delta > scale {
-		scale = delta
+	var u float64
+	if diff := math.Abs(x1 - x2); !math.IsInf(diff, 0) {
+		// Subtract finite operands directly before dividing by delta so closely spaced
+		// large values (e.g. 3*2^52 and 3*2^52-2) retain exact difference precision.
+		u = diff / delta
+	} else {
+		// Fallback to scale-normalized subtraction only when x1 - x2 overflows float64.
+		scale := math.Max(math.Abs(x1), math.Abs(x2))
+		if delta > scale {
+			scale = delta
+		}
+		if scale == 0 {
+			return 0
+		}
+		scaledDiff := math.Abs((x1 / scale) - (x2 / scale))
+		scaledDelta := delta / scale
+		if scaledDelta == 0 {
+			return math.MaxFloat64
+		}
+		u = scaledDiff / scaledDelta
 	}
-	if scale == 0 {
-		return 0
-	}
-	scaledDiff := math.Abs((x1 / scale) - (x2 / scale))
-	scaledDelta := delta / scale
-	if scaledDelta == 0 {
-		return math.MaxFloat64
-	}
-	u := scaledDiff / scaledDelta
 	if math.IsNaN(u) || math.IsInf(u, 0) {
 		return math.MaxFloat64
 	}
@@ -198,10 +207,10 @@ func CaseSurprisal(c1, c2 CaseVector, deviations map[string]float64, contKeys, n
 	return total, contribs
 }
 
-// KNNMean returns the overflow-safe mean of the k smallest finite values in scores
-// (matching statistics.mean(sorted(surprisals)[:min(k, len(surprisals))]) in service.py).
-// Uses max-magnitude scaling so both same-sign and opposite-sign extreme finite inputs
-// (e.g. [1e308, 1e308] and [-1e308, 1e308]) remain exact and finite.
+// KNNMean returns the exact overflow- and cancellation-safe mean of the k smallest finite
+// values in scores (matching CPython's statistics.mean(sorted(surprisals)[:k]) in service.py).
+// Uses exact math/big.Rat accumulation so same-sign overflow ([1e308, 1e308]) and large
+// opposite-sign cancellation ([-1e308, 1, 1e308]) both round accurately to the nearest float64.
 func KNNMean(scores []float64, k int) float64 {
 	if len(scores) == 0 || k <= 0 {
 		return 0
@@ -219,20 +228,19 @@ func KNNMean(scores []float64, k int) float64 {
 	if k > len(cp) {
 		k = len(cp)
 	}
-	var scale float64
+	sum := new(big.Rat)
+	term := new(big.Rat)
 	for i := 0; i < k; i++ {
-		if av := math.Abs(cp[i]); av > scale {
-			scale = av
+		if term.SetFloat64(cp[i]) != nil {
+			sum.Add(sum, term)
 		}
 	}
-	if scale == 0 {
+	sum.Quo(sum, new(big.Rat).SetInt64(int64(k)))
+	out, _ := sum.Float64()
+	if math.IsNaN(out) || math.IsInf(out, 0) {
 		return 0
 	}
-	var sumScaled float64
-	for i := 0; i < k; i++ {
-		sumScaled += cp[i] / scale
-	}
-	return (sumScaled / float64(k)) * scale
+	return out
 }
 
 // saturatingAdd adds two nonnegative finite floats, saturating at math.MaxFloat64

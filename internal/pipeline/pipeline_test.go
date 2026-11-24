@@ -655,24 +655,58 @@ func TestPipelineLongServiceNamesDoNotCollideOnTier1JoinKey(t *testing.T) {
 	if len(failed) != 0 || len(alerts) != 2 {
 		t.Fatalf("expected 2 distinct alerts (one tier0/tier0+tier1 for svcA, one tier1 for svcB), got %d alerts=%+v", len(alerts), alerts)
 	}
-	hasTier1Only := false
-	hasTier0 := false
+	hasSvcATier0 := false
+	hasSvcBTier1 := false
 	for _, a := range alerts {
-		if a.Tier == "tier1" {
-			hasTier1Only = true
+		if (a.Tier == "tier0" || a.Tier == "tier0+tier1") && strings.Contains(a.Template, "/etc/passwd") {
+			for _, rid := range a.RuleIDs {
+				if rid == "SENT-003" {
+					hasSvcATier0 = true
+				}
+			}
 		}
-		if a.Tier == "tier0" || a.Tier == "tier0+tier1" {
-			hasTier0 = true
+		if a.Tier == "tier1" && strings.Contains(a.Template, "unexpected outbound relay") {
+			for _, rid := range a.RuleIDs {
+				if rid == "SURPRISAL-001" {
+					hasSvcBTier1 = true
+				}
+			}
 		}
 	}
-	if !hasTier0 || !hasTier1Only {
-		t.Fatalf("expected both Tier 0 (svcA) and Tier 1-only (svcB) alerts without key collision, got %+v", alerts)
+	if !hasSvcATier0 || !hasSvcBTier1 {
+		t.Fatalf("expected svcA Tier 0 (SENT-003) and svcB Tier 1-only (SURPRISAL-001) alerts without key collision, got %+v", alerts)
 	}
 
-	// Verify SaveBaseline serializes cleanly under burnMu with concurrent Burn():
-	// regardless of lock acquisition order, Burn clears dirtyDisk and deletes baseline.json,
-	// so baseline.json MUST be absent immediately after wg.Wait() without any second Burn().
+	// Deterministic ordering checks for SaveBaseline vs Burn:
+	// (a) Save-first: baseline.json exists after SaveBaseline, then Burn removes it.
 	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
+	pipe.SurprisalEngine().LearnBaseline(model.TemplateWindow{TemplateID: "t-save-first", Service: "nginx", Level: "INFO", SampleLine: "ok"})
+	if err := pipe.SaveBaseline(baselinePath, false); err != nil {
+		t.Fatalf("SaveBaseline (save-first): %v", err)
+	}
+	if _, err := os.Stat(baselinePath); err != nil {
+		t.Fatalf("expected baseline.json to exist after SaveBaseline: %v", err)
+	}
+	if _, err := pipe.Burn(); err != nil {
+		t.Fatalf("Burn (save-first): %v", err)
+	}
+	if _, err := os.Stat(baselinePath); !os.IsNotExist(err) {
+		t.Fatal("expected Burn to remove baseline.json in save-first order")
+	}
+
+	// (b) Burn-first: Burn clears dirty state so a subsequent non-forced SaveBaseline does NOT recreate baseline.json.
+	pipe.SurprisalEngine().LearnBaseline(model.TemplateWindow{TemplateID: "t-burn-first", Service: "nginx", Level: "INFO", SampleLine: "ok"})
+	if _, err := pipe.Burn(); err != nil {
+		t.Fatalf("Burn (burn-first): %v", err)
+	}
+	if err := pipe.SaveBaseline(baselinePath, false); err != nil {
+		t.Fatalf("SaveBaseline (burn-first): %v", err)
+	}
+	if _, err := os.Stat(baselinePath); !os.IsNotExist(err) {
+		t.Fatal("expected non-forced SaveBaseline after Burn to leave baseline.json absent")
+	}
+
+	// (c) Concurrent SaveBaseline + Burn race verification.
 	pipe.SurprisalEngine().LearnBaseline(model.TemplateWindow{TemplateID: "t-dirty", Service: "nginx", Level: "INFO", SampleLine: "ok"})
 	var (
 		saveErr error
@@ -799,5 +833,76 @@ func TestPipelineRound4LongServiceSuppressionAndHigherSeverity(t *testing.T) {
 	}
 	if mergedAlerts[0].Tier != "tier0+tier1" || mergedAlerts[0].Severity != "HIGH" {
 		t.Fatalf("expected tier0+tier1 alert to preserve higher Tier 1 severity HIGH over LOW Tier 0 rule, got %+v", mergedAlerts[0])
+	}
+}
+
+func TestPipelineRound5PendingRuleOverflowBlocksLearnAndUnicodeCaseFold(t *testing.T) {
+	// 1. Exhausting pending rule bucket capacity must block baseline learning for that flush
+	// so a non-overflow window whose Tier 0 bucket was dropped cannot poison the benign baseline.
+	cfg := config.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.SurprisalThreshold = 5.0
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+	pipe.maxPendingRuleBuckets = 2
+	for i := 0; i < 3; i++ {
+		pipe.IngestEvent(model.LogEvent{
+			ID:        uint64(i + 1),
+			Timestamp: 1763996400,
+			Service:   fmt.Sprintf("svc-%d", i),
+			Level:     "WARN",
+			Message:   "GET /../../../../etc/passwd HTTP/1.1 403",
+		})
+	}
+	_, _ = pipe.FlushWindow()
+	if got := pipe.Stats().SurprisalBaselineCases; got != 0 {
+		t.Fatalf("expected dropped pending-rule bucket flush to learn 0 baseline cases, got %d", got)
+	}
+
+	// 2. Unicode simple-fold parity for truncated (>128-byte) service suppressions:
+	// - prefix+"İ" must NOT suppress prefix+"i" (matches strings.EqualFold("İ", "i") == false)
+	// - prefix+"Σ" MUST suppress prefix+"ς" (matches strings.EqualFold("Σ", "ς") == true)
+	prefix := strings.Repeat("x", 128)
+	pack := rules.DefaultRulePack()
+	pack.Suppressions = append(pack.Suppressions,
+		rules.Suppression{ID: "SUP-DOTTED-I", Service: prefix + "İ", Template: "relay reset alpha"},
+		rules.Suppression{ID: "SUP-SIGMA", Service: prefix + "Σ", Template: "relay reset beta"},
+	)
+	ruleEngUni, err := rules.NewEngine(pack)
+	if err != nil {
+		t.Fatalf("NewEngine unicode: %v", err)
+	}
+	pipeUni := New(cfg, ruleEngUni, emit.NopSink{}, "file")
+	for w := 0; w < 22; w++ {
+		pipeUni.IngestEvent(model.LogEvent{
+			ID: uint64(w + 1), Timestamp: 1763996000 + int64(w*10),
+			Service: "nginx", Level: "INFO", Message: "GET /healthz HTTP/1.1 200 3ms",
+		})
+		_, _ = pipeUni.FlushWindow()
+	}
+
+	// prefix+"i" must NOT be suppressed by prefix+"İ" -> fires Tier 1 alert!
+	pipeUni.IngestEvent(model.LogEvent{
+		ID: 9201, Timestamp: 1763997000,
+		Service: prefix + "i", Level: "ERROR",
+		Message: "relay reset alpha",
+	})
+	alertsI, failed := pipeUni.FlushWindow()
+	if len(failed) != 0 || len(alertsI) != 1 {
+		t.Fatalf("expected prefix+'i' NOT to be suppressed by prefix+'İ', got alerts=%+v failed=%+v", alertsI, failed)
+	}
+
+	// prefix+"ς" MUST be suppressed by prefix+"Σ" -> 0 alerts!
+	pipeUni.IngestEvent(model.LogEvent{
+		ID: 9202, Timestamp: 1763997010,
+		Service: prefix + "ς", Level: "ERROR",
+		Message: "relay reset beta",
+	})
+	alertsSigma, failed := pipeUni.FlushWindow()
+	if len(failed) != 0 || len(alertsSigma) != 0 {
+		t.Fatalf("expected prefix+'ς' to be suppressed by prefix+'Σ', got alerts=%+v failed=%+v", alertsSigma, failed)
 	}
 }

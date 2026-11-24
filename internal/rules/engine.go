@@ -230,7 +230,7 @@ func NewEngine(pack RulePack) (*Engine, error) {
 		}
 		cs := compiledSuppression{supp: s}
 		if s.Service != "" {
-			cs.serviceLowerHash = sha256.Sum256([]byte(strings.ToLower(s.Service)))
+			cs.serviceLowerHash = sha256.Sum256([]byte(model.CanonicalFold(s.Service)))
 		}
 		if s.Pattern != "" {
 			re, err := regexp.Compile(s.Pattern)

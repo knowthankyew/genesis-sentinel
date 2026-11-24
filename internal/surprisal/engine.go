@@ -55,6 +55,7 @@ type Engine struct {
 	maxCandidates  int
 	httpCooldown   time.Duration
 	httpOpenUntil  time.Time
+	httpCircuitGen uint64
 	httpClient     *HTTPClient
 
 	// Fixed-capacity circular buffer of benign baseline LogFeatures.
@@ -228,6 +229,7 @@ func (e *Engine) Reset() {
 	e.revision++
 	e.resetGen++
 	e.httpOpenUntil = time.Time{}
+	e.httpCircuitGen++
 	for i := range e.devs {
 		e.devs[i] = MinDeviationFloor
 	}
@@ -322,9 +324,11 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 	}
 
 	// Copy only the bounded <=64 chronological references that VerifyWindow sends,
-	// capturing baseline revision so we can detect concurrent learning during I/O.
+	// capturing baseline revision and circuit generation so concurrent learning or
+	// earlier circuit generations cannot corrupt state after I/O completes.
 	refsCopy = e.stridedReferencesLocked(maxHTTPReferenceCases)
 	rev := e.revision
+	circuitGen := e.httpCircuitGen
 	// Release lock before loopback HTTP parity request (never hold mutex across I/O).
 	e.mu.Unlock()
 
@@ -351,9 +355,12 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 	if err != nil {
 		e.httpFallbacks++
 		callerCanceled := ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
-		if !callerCanceled {
+		if !callerCanceled && e.httpCircuitGen == circuitGen {
 			e.httpOpenUntil = time.Now().Add(e.httpCooldown)
+			e.httpCircuitGen++
 		}
+	} else if !e.httpOpenUntil.IsZero() && e.httpCircuitGen == circuitGen {
+		e.httpOpenUntil = time.Time{}
 	}
 
 	if e.revision != rev {

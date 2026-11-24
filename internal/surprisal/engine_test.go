@@ -109,8 +109,8 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 		LastSeenUnix:  1763996401000,
 		SampleLine:    "ok",
 	})
-	if !(math.Abs(secFeat.Continuous[5]-msFeat.Continuous[5]) <= 1e-9) {
-		t.Fatalf("timestamp unit normalization mismatch: sec=%v vs ms=%v", secFeat.Continuous[5], msFeat.Continuous[5])
+	if !(math.Abs(secFeat.Continuous[5]-math.Log1p(1000)) <= 1e-9) || !(math.Abs(secFeat.Continuous[5]-msFeat.Continuous[5]) <= 1e-9) {
+		t.Fatalf("timestamp unit normalization mismatch: sec=%v ms=%v want=%v", secFeat.Continuous[5], msFeat.Continuous[5], math.Log1p(1000))
 	}
 
 	// Unicode case-folding safety: U+023A (Ⱥ) expands UTF-8 byte length when lowercased.
@@ -125,7 +125,7 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 		t.Fatalf("expected Unicode-prefixed status=200 -> http_2xx, got %q", uniWin.Nominal[3])
 	}
 
-	// Subsecond 100ms span must match identically within a second and across a second boundary.
+	// Subsecond 100ms span must match log1p(100) identically within a second and across a second boundary.
 	withinSec := ExtractFeatures(model.TemplateWindow{
 		TemplateID:    "tmpl-sub",
 		Service:       "api",
@@ -144,21 +144,28 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 		LastSeenUnix:  1763996401050,
 		SampleLine:    "ok",
 	})
-	if !(math.Abs(withinSec.Continuous[5]-acrossSec.Continuous[5]) <= 1e-9) {
-		t.Fatalf("subsecond 100ms span mismatch across second boundary: within=%v across=%v",
-			withinSec.Continuous[5], acrossSec.Continuous[5])
+	if !(math.Abs(withinSec.Continuous[5]-math.Log1p(100)) <= 1e-9) || !(math.Abs(withinSec.Continuous[5]-acrossSec.Continuous[5]) <= 1e-9) {
+		t.Fatalf("subsecond 100ms span mismatch across second boundary: within=%v across=%v want=%v",
+			withinSec.Continuous[5], acrossSec.Continuous[5], math.Log1p(100))
 	}
 
-	// UTF-8 boundary clamping: 127 ASCII bytes + 2-byte 'é' must truncate cleanly without invalid UTF-8.
-	utf8Svc := strings.Repeat("a", 127) + "é"
+	// UTF-8 boundary clamping on TemplateID: 63 ASCII bytes + 2-byte 'é' must truncate cleanly to 63 valid bytes.
+	utf8Tmpl := strings.Repeat("a", 63) + "é"
 	utf8Feat := ExtractFeatures(model.TemplateWindow{
-		TemplateID: "tmpl-utf8",
-		Service:    utf8Svc,
+		TemplateID: utf8Tmpl,
+		Service:    "api",
 		Level:      "INFO",
 		SampleLine: "ok",
 	})
-	if !utf8.ValidString(utf8Feat.Nominal[0]) || len(utf8Feat.Nominal[0]) != 127 {
-		t.Fatalf("expected valid 127-byte UTF-8 clamped service, got len=%d valid=%v", len(utf8Feat.Nominal[0]), utf8.ValidString(utf8Feat.Nominal[0]))
+	if !utf8.ValidString(utf8Feat.Nominal[2]) || len(utf8Feat.Nominal[2]) != 63 {
+		t.Fatalf("expected valid 63-byte UTF-8 clamped template_class, got len=%d valid=%v", len(utf8Feat.Nominal[2]), utf8.ValidString(utf8Feat.Nominal[2]))
+	}
+
+	// Long (>128-byte) services sharing identical 128-byte prefixes must preserve distinct bounded canonical identities.
+	longSvcA := ExtractFeatures(model.TemplateWindow{TemplateID: "t1", Service: strings.Repeat("a", 127) + "é", Level: "INFO", SampleLine: "ok"})
+	longSvcB := ExtractFeatures(model.TemplateWindow{TemplateID: "t1", Service: strings.Repeat("a", 127) + "è", Level: "INFO", SampleLine: "ok"})
+	if !strings.HasPrefix(longSvcA.Nominal[0], "sha256:") || longSvcA.Nominal[0] == longSvcB.Nominal[0] {
+		t.Fatalf("expected distinct bounded sha256 service identities for >128-byte services, got A=%q B=%q", longSvcA.Nominal[0], longSvcB.Nominal[0])
 	}
 
 	// Missing HTTP response status followed by a 3-digit byte count must NOT be misread as http_5xx.
@@ -188,6 +195,26 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 	})
 	if compactMissing.Nominal[3] != "none" {
 		t.Fatalf("expected compact HTTP log with dash status and 512 bytes -> none, got %q", compactMissing.Nominal[3])
+	}
+	// TRACE request target must be masked so path segments cannot spoof response status.
+	traceNoStatus := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-trace",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: "TRACE /status=200 HTTP/1.1",
+	})
+	if traceNoStatus.Nominal[3] != "none" {
+		t.Fatalf("expected TRACE /status=200 HTTP/1.1 -> none, got %q", traceNoStatus.Nominal[3])
+	}
+	// HTTP/ inside the request-target path must NOT shadow the real HTTP/1.1 version + 200 status.
+	pathWithHTTP := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-path-http",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: `10.0.0.1 - - [24/Nov/2026:12:00:00 +0000] "GET /docs/HTTP/1.1 HTTP/1.1" 200 512`,
+	})
+	if pathWithHTTP.Nominal[3] != "http_2xx" {
+		t.Fatalf("expected GET /docs/HTTP/1.1 HTTP/1.1 200 512 -> http_2xx, got %q", pathWithHTTP.Nominal[3])
 	}
 }
 
@@ -917,5 +944,114 @@ func TestRound4MalformedUTF8HybridDisagreementAndPeerSelection(t *testing.T) {
 	peerSc := engPeer.Evaluate(context.Background(), peerWin, true)
 	if peerSc.TotalNats != 0 {
 		t.Fatalf("expected peer selection with effective k=min(KNeighbors,MaxCandidateCases)=2 to score 0.0 against exact peers, got %+v", peerSc)
+	}
+}
+
+func TestRound5DuplicateCasesLongServiceIdentityAndStaleCircuitGeneration(t *testing.T) {
+	// 1. Snapshot with duplicate "cases" fields must be rejected instead of silently keeping earlier entries.
+	dupPath := filepath.Join(t.TempDir(), "dup.json")
+	dupPayload := `{"version":1,"cases":[{"c":[1,2,3,0,1,6,0,0],"n":["api","INFO","t1","none"]}],"cases":[]}`
+	if err := os.WriteFile(dupPath, []byte(dupPayload), 0600); err != nil {
+		t.Fatalf("write dup.json: %v", err)
+	}
+	engDup := NewEngine(Options{Mode: "inprocess", BaselineWindowSize: 10})
+	if _, err := engDup.LoadFromFile(dupPath); err == nil {
+		t.Fatal("expected LoadFromFile to reject snapshot with duplicate cases field")
+	}
+
+	// 2. Distinct >128-byte services sharing a 128-byte prefix must receive the 2.5-nat service mismatch
+	// penalty and preserve exact separation across SaveToFile/LoadFromFile round-trips.
+	prefix := strings.Repeat("p", 128)
+	winA := model.TemplateWindow{TemplateID: "t-same", Service: prefix + "A", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}
+	winB := model.TemplateWindow{TemplateID: "t-same", Service: prefix + "B", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}
+	engLong := NewEngine(Options{Mode: "inprocess", ThresholdNats: 5.0, BaselineWindowSize: 20, WarmupMinCases: 3})
+	for i := 0; i < 4; i++ {
+		engLong.LearnBaseline(winA)
+	}
+	scB := engLong.Evaluate(context.Background(), winB, true)
+	if math.Abs(scB.TotalNats-NominalMismatchNats) > 1e-6 || scB.FeatureContribs["service"] != NominalMismatchNats {
+		t.Fatalf("expected long service B to incur %v nats service mismatch against service A, got %+v", NominalMismatchNats, scB)
+	}
+	snapPath := filepath.Join(t.TempDir(), "long_svc.json")
+	if err := engLong.SaveToFile(snapPath, true); err != nil {
+		t.Fatalf("SaveToFile: %v", err)
+	}
+	engLongLoaded := NewEngine(Options{Mode: "inprocess", ThresholdNats: 5.0, BaselineWindowSize: 20, WarmupMinCases: 3})
+	if _, err := engLongLoaded.LoadFromFile(snapPath); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	scBLoaded := engLongLoaded.Evaluate(context.Background(), winB, true)
+	if math.Abs(scBLoaded.TotalNats-NominalMismatchNats) > 1e-6 {
+		t.Fatalf("expected long service mismatch to survive save/restore, got %+v", scBLoaded)
+	}
+
+	// 3. Stale HTTP failure from an earlier circuit generation must NOT re-open the breaker after recovery.
+	reqAStarted := make(chan struct{})
+	releaseA := make(chan struct{})
+	var closeAOnce sync.Once
+	closeA := func() { closeAOnce.Do(func() { close(releaseA) }) }
+	var reqNum atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := reqNum.Add(1)
+		switch n {
+		case 1:
+			// Request A: stalls across B's failure and C's recovery, then fails with 500.
+			close(reqAStarted)
+			<-releaseA
+			w.WriteHeader(http.StatusInternalServerError)
+		case 2:
+			// Request B: fails immediately, tripping the circuit breaker (gen 0 -> 1).
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			// Requests C (recovery probe) and D (post-stale-failure check): succeed cleanly.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"is_conforming":true,"measured_surprisal_nats":0.2}`))
+		}
+	}))
+	t.Cleanup(func() {
+		closeA()
+		srv.Close()
+	})
+	hc, err := NewHTTPClient(srv.URL, 5*time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	engCB := NewEngine(Options{
+		Mode:               "http",
+		ThresholdNats:      5.0,
+		BaselineWindowSize: 50,
+		WarmupMinCases:     3,
+		HTTPCooldown:       40 * time.Millisecond,
+		HTTPClient:         hc,
+	})
+	okWin := model.TemplateWindow{TemplateID: "t-ok", Service: "api", Level: "INFO", Count: 5, SampleLine: "GET /ok 200"}
+	for i := 0; i < 4; i++ {
+		engCB.LearnBaseline(okWin)
+	}
+
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		engCB.Evaluate(context.Background(), okWin, true)
+	}()
+	select {
+	case <-reqAStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request A dispatch")
+	}
+
+	// Request B trips the circuit breaker (generation 0 -> 1).
+	engCB.Evaluate(context.Background(), okWin, true)
+	// Wait for cooldown to expire, then request C succeeds in generation 1.
+	time.Sleep(60 * time.Millisecond)
+	engCB.Evaluate(context.Background(), okWin, true)
+	// Now let stale request A (from generation 0) complete with HTTP 500.
+	closeA()
+	<-aDone
+
+	// Request D must still reach the recovered sidecar (reqNum becomes 4, not blocked by stale A!).
+	engCB.Evaluate(context.Background(), okWin, true)
+	if got := reqNum.Load(); got != 4 {
+		t.Fatalf("expected stale failure from earlier generation NOT to re-open recovered circuit (reqNum=%d, want 4)", got)
 	}
 }

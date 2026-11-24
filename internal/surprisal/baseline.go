@@ -127,6 +127,9 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 				return BaselineSnapshot{}, true, fmt.Errorf("parse baseline %q updated_at: %w", path, err)
 			}
 		case "cases":
+			if hasCases {
+				return BaselineSnapshot{}, true, fmt.Errorf("parse baseline %q: duplicate cases field", path)
+			}
 			hasCases = true
 			arrTok, err := dec.Token()
 			if err != nil {
