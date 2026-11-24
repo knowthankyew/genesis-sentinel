@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -55,15 +56,28 @@ type Config struct {
 	InferenceAddr string `json:"inference_http"`
 	MaxPromptByte int    `json:"max_prompt_bytes"`
 
-	// Feedback & Privacy Guardrails
+	// Local Disk State & Privacy Guardrails (intentional Pillar 1 variance; see ADR-4)
+	DataDir              string `json:"data_dir"`
 	FeedbackDir          string `json:"feedback_dir"`
 	RequireRedaction     bool   `json:"require_redaction"`
 	AllowRemoteEndpoints bool   `json:"allow_remote_endpoints"`
 	MaxMemMB             int64  `json:"max_mem_mb"`
 }
 
-// DefaultConfig returns safe local-first defaults matching Genesis privacy invariants.
+// DefaultDataDir resolves Sentinel's default local state directory (~/.genesis-sentinel).
+// Operators can inspect or open this folder without memorizing hidden paths via
+// `sentinel data path`, `sentinel data status`, and `sentinel data open`.
+func DefaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ".genesis-sentinel"
+	}
+	return filepath.Join(home, ".genesis-sentinel")
+}
+
+// DefaultConfig returns safe local-first defaults matching Sentinel ADRs 1-7.
 func DefaultConfig() *Config {
+	dataDir := DefaultDataDir()
 	return &Config{
 		HTTPAddr:             "127.0.0.1:8090",
 		AllowAllInterfaces:   false,
@@ -80,11 +94,12 @@ func DefaultConfig() *Config {
 		SurprisalHTTPAddr:    "http://127.0.0.1:5200",
 		SurprisalThreshold:   DefaultSurprisalThreshold,
 		BaselineWindowSize:   2000,
-		BaseModel:            model.ModelSmolLM2135M,
+		BaseModel:            model.ModelSmolLM2135MInstruct,
 		AdapterPath:          "",
 		FTaaSAPIAddr:         "http://127.0.0.1:5100",
 		InferenceAddr:        "http://127.0.0.1:8000",
 		MaxPromptByte:        DefaultMaxPromptBytes,
+		DataDir:              dataDir,
 		FeedbackDir:          "",
 		RequireRedaction:     true,
 		AllowRemoteEndpoints: false,
@@ -107,6 +122,10 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	loadFromEnv(cfg)
+
+	if cfg.FeedbackDir == "" && cfg.DataDir != "" {
+		cfg.FeedbackDir = filepath.Join(cfg.DataDir, "feedback")
+	}
 
 	if cfg.WindowStr != "" {
 		d, err := time.ParseDuration(cfg.WindowStr)
@@ -238,6 +257,9 @@ func loadFromEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MaxPromptByte = n
 		}
+	}
+	if v := os.Getenv("SENTINEL_DATA_DIR"); v != "" {
+		cfg.DataDir = v
 	}
 	if v := os.Getenv("SENTINEL_FEEDBACK_DIR"); v != "" {
 		cfg.FeedbackDir = v

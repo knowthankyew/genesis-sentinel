@@ -2,7 +2,7 @@
 
 > **Repository**: `knowthankyew/genesis-sentinel` (local-first scaffold)  
 > **Companion Repositories**: `genesis` (high-throughput Go log engine) &bull; `ml` / `event-driven-ftaas` (FTaaS training furnace & `surprisal-service`)  
-> **Active Base Model Tier**: **SmolLM2** (`HuggingFaceTB/SmolLM2-135M` / optional `SmolLM2-135M-Instruct`)  
+> **Active Base Model Tier**: **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default; `SmolLM2-360M-Instruct` step-up)  
 > **Phase 5 Reasoning Tier**: **Gemma 2 2B IT** (`google/gemma-2-2b-it`)  
 > **Explicitly Excluded**: **BitNet b1.58** (experimental; deferred pending upstream development cycle)  
 > **Status**: 🟢 **PHASE 0 COMPLETE** | 🟡 **PHASE 1 NEXT**  
@@ -55,16 +55,19 @@ flowchart LR
 ---
 
 ### Phase 1: Genesis Bridge & Tier 0 Deterministic Engine
-- **Goal**: Ingest Genesis logs reliably without loss under burst load and collapse repetitive noise before any statistical or ML layer touches the stream.
+- **Goal**: Ingest Genesis logs losslessly via `.seg` file tailing, surface all local disk paths transparently to the operator, and collapse repetitive noise before statistical or ML scoring.
+- **Starter Log Target Tracks (Locked In)**:
+  - **Track A (Synthetic Attack & Noise Replay Corpus):** Deterministic generator emitting normal web/cron/system noise interleaved with realistic SSH brute-force, HTTP SQLi/path-traversal/scanner probes, high-entropy DNS/outbound exfil bursts, and `sudo`/privilege-escalation anomalies—giving reproducible CI tests and Phase 4 benchmarks.
+  - **Track B (Live Local Host & Container Logs):** macOS host telemetry (`log stream` / auth / SSH) and local Docker Compose / HTTP service logs piped into Genesis (`genesis run` / `genesis pipe`).
 - **Deliverables**:
-  - `internal/ingest/segreader.go`: Read-only follower for Genesis `--data-dir` length-prefixed CRC32 `.seg` files (handling segment rotation, torn-tail recovery, and `genesis burn` unlinks cleanly).
-  - `internal/ingest/querypoller.go`: Cursor-based `/query` fallback reader for volatile-mode Genesis instances (respecting Genesis's `10,000`-row limit and tracking eviction gaps explicitly in metrics).
+  - `internal/ingest/segreader.go`: **Primary** read-only follower for Genesis `--data-dir` length-prefixed CRC32 `.seg` files with persisted read cursor (`~/.genesis-sentinel/cursor.json`), handling segment rotation, torn-tail recovery, and `genesis burn` unlinks cleanly.
+  - `internal/ingest/querypoller.go`: Secondary cursor-based `/query` fallback reader for volatile-mode Genesis instances (tracking eviction gaps explicitly in metrics).
   - `internal/template/drain.go`: Fast pure-Go Drain-style log template miner masking dynamic tokens (IPv4/IPv6, UUIDs, hex blobs, paths with IDs, timestamps, numeric ports) and aggregating identical lines into `TemplateWindow` summaries with Shannon entropy measurements.
-  - `internal/rules/engine.go`: Deterministic JSON-defined rule engine supporting regex/substring IOCs, severity escalation, rate-burst thresholds (e.g., >N SSH failures / 10s), and allowlist suppressions.
+  - `internal/rules/engine.go`: Deterministic JSON-defined rule engine supporting regex/substring IOCs, severity escalation, rate-burst thresholds (e.g., >N SSH failures / 10s), and allowlist suppressions, shipped with starter rules for Track A/B logs.
   - `internal/emit/genesis_sink.go`: Loopback TCP/pipe emitter writing structured Sentinel alert events back into Genesis under `service=sentinel` (with loop-prevention guard ignoring incoming `service=sentinel` lines).
-  - `sentinel watch`, `sentinel scan`, `sentinel stats`, and `sentinel burn` CLI commands.
+  - `sentinel watch`, `sentinel scan`, `sentinel stats`, and `sentinel burn` CLI commands (completing full disk cleanup paired with the Phase 0 `sentinel data path|status|open` commands so operators never hunt for hidden folders).
 - **Exit Gate**:
-  - Replays 100,000+ synthetic mixed logs through Tier 0 with measured throughput, memory plateau, and collapse ratio recorded.
+  - Replays 100,000+ Track A synthetic mixed logs through `.seg` tailing + Tier 0 with measured throughput, memory plateau, and collapse ratio recorded.
   - Zero infinite alert feedback loops (`service=sentinel` strictly ignored on ingest).
   - `go test -race ./...` passes with zero races.
 
@@ -146,11 +149,11 @@ Based on a scan of the local Hugging Face cache (`~/.cache/huggingface/hub`):
 
 ---
 
-## 6. Open Questions for Operator Input
+## 6. Locked-In Operator Decisions (Pre-Phase 1)
 
-Before kicking off Phase 1 implementation, confirm your preferences on these four points:
+All four architectural decision points are finalized for Phase 1–5 execution:
 
-1. **Smol Base vs. Smol Instruct**: Start Phase 3 on your already-cached `HuggingFaceTB/SmolLM2-135M` (zero downloads, zero `ml` registry changes), or pull `HuggingFaceTB/SmolLM2-135M-Instruct` (~270 MB) / `SmolLM2-360M-Instruct` (~720 MB) for stronger instruction adherence?
-2. **Primary Genesis Log Sources**: Which real logs on this machine / homelab do you want Sentinel targeting first (e.g., macOS unified logs / SSH / firewall / Docker compose apps / router Syslog)? This shapes the Tier 0 starter rules and Phase 3 seed taxonomy.
-3. **Tier 1 Surprisal Execution**: Confirm our recommended hybrid approach—in-process Go Laplace-LK for real-time Tier 1 scoring (fast, zero-dep) **plus** `ml`'s `surprisal-service` (`:5200`) for FTaaS training dataset preflight ablation—or would you prefer routing online Tier 1 traffic through `ml/src/surprisal-service` over HTTP as well?
-4. **Genesis Persistence Mode**: Are you comfortable running Genesis with `--data-dir` + `--redact` enabled so Sentinel can read `.seg` files losslessly during traffic bursts, or do you want pure volatile `/query` polling prioritized first?
+1. **Smol Instruct Models (ADR-5):** Default to **`HuggingFaceTB/SmolLM2-135M-Instruct`** (~270 MB) with **`HuggingFaceTB/SmolLM2-360M-Instruct`** (~720 MB) pulled locally as the optional Smol step-up; both will be registered in `ml`'s model catalog during Phase 3. `google/gemma-2-2b-it` remains reserved for Phase 5; BitNet remains excluded.
+2. **Starter Log Sources (Phase 1):** Dual-track baseline—**Track A** synthetic deterministic attack/noise replay corpus (SSH brute-force, HTTP SQLi/traversal/scanners, DNS/exfil entropy spikes, privilege-escalation anomalies) + **Track B** live macOS host & local Docker/HTTP logs piped into Genesis.
+3. **Performance-First Online Surprisal (ADR-7):** Prioritize raw per-template throughput via an **in-process pure-Go Laplace-LK engine** (`surprisal_mode="inprocess"` default, avoiding HTTP/JSON/Python GIL overhead on the hot path), paired with cross-repo numerical parity tests and `ml`'s containerized `surprisal-service` (`:5200`) for offline FTaaS training dataset preflight ablation.
+4. **Disk-Backed `.seg` Tailing & Portfolio Pillar Variance (ADR-4):** Start with lossless `.seg` file tailing and bounded local state in `~/.genesis-sentinel/`. This **intentional variance from Portfolio Pillar 1 (volatile-memory-only default)** is documented transparently in `README.md`, `NOTICE.md`, `SECURITY.md`, and `docs/DECISIONS.md`, and paired with first-class operator ergonomics (`sentinel data path`, `sentinel data status`, `sentinel data open`, and `sentinel burn`) so users never need to memorize hidden paths or toggle hidden folders.

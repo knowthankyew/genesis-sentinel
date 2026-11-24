@@ -55,10 +55,11 @@ Sentinel mitigates this threat in three layers:
 
 ---
 
-## 4. Redaction & Amnesiac Burn Caveats
+## 4. Local Disk State, Redaction & Amnesiac Burn Caveats
 
+* **Intentional Variance from Volatile-Only Operation:** Sentinel deliberately tails Genesis `--data-dir` `.seg` segments and stores bounded operational state (segment read cursors, rolling surprisal baselines, and redacted feedback queues) locally in `~/.genesis-sentinel/` (configurable via `SENTINEL_DATA_DIR`) so log floods cannot silently blind detection. Operators can inspect or open this directory directly via `sentinel data path`, `sentinel data status`, and `sentinel data open` without modifying hidden-folder settings.
 * **Mandatory Pre-Training Redaction:** `require_redaction` defaults to `true`. Operators should run Genesis with `--redact` enabled and must never export raw unredacted credentials, bearer tokens, SSNs, or payment cards into FTaaS training JSONL files.
-* **Amnesiac Burn Scope:** Running `sentinel burn` wipes Sentinel's in-memory rolling baselines and any unexported local feedback queues. **Important caveat:** once feedback examples are submitted to FTaaS and fine-tuned into a LoRA adapter (`adapter_model.safetensors`), statistical traces of those records are encoded in the adapter weights on disk and in MLflow artifacts; `genesis burn` and `sentinel burn` do **not** un-train existing model weights. Deleting trained adapters requires explicitly removing the corresponding FTaaS job artifacts.
+* **Amnesiac Burn Scope:** Running `sentinel burn` wipes Sentinel's local disk state (cursors, baseline snapshots, and unexported feedback queues) as well as in-memory baselines. **Important caveat:** once feedback examples are submitted to FTaaS and fine-tuned into a LoRA adapter (`adapter_model.safetensors`), statistical traces of those records are encoded in the adapter weights on disk and in MLflow artifacts; `genesis burn` and `sentinel burn` do **not** un-train existing model weights. Deleting trained adapters requires explicitly removing the corresponding FTaaS job artifacts.
 
 ---
 

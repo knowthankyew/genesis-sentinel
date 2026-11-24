@@ -14,8 +14,14 @@ func TestDefaultConfigValidates(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("DefaultConfig().Validate() failed: %v", err)
 	}
-	if cfg.BaseModel != model.ModelSmolLM2135M {
-		t.Fatalf("expected default base model %q, got %q", model.ModelSmolLM2135M, cfg.BaseModel)
+	if cfg.BaseModel != model.ModelSmolLM2135MInstruct {
+		t.Fatalf("expected default base model %q, got %q", model.ModelSmolLM2135MInstruct, cfg.BaseModel)
+	}
+	if cfg.SurprisalMode != "inprocess" {
+		t.Fatalf("expected default surprisal mode %q, got %q", "inprocess", cfg.SurprisalMode)
+	}
+	if cfg.DataDir == "" {
+		t.Fatalf("expected non-empty default DataDir, got %q", cfg.DataDir)
 	}
 	if !cfg.RequireRedaction {
 		t.Fatal("expected RequireRedaction to default to true")

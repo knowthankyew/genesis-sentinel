@@ -38,28 +38,30 @@ This document records the foundational architectural decisions and trade-offs ma
 
 ---
 
-## ADR 4: Lossless `.seg` Ingestion as Primary Source (Why `/tail` Is Not Primary)
+## ADR 4: Lossless `.seg` Ingestion & Intentional Variance from Portfolio Pillar 1 (Volatile-Only Default)
 
-* **Context:** Genesis exposes three ways to observe logs: (a) `/tail` SSE streaming, (b) `/query` HTTP time-range lookups, and (c) opt-in `--data-dir` length-prefixed CRC32 `.seg` segment files. In Genesis `internal/engine/engine.go`, `/tail` subscribers receive a bounded 512-entry non-blocking channel that silently drops entries when a consumer lags. Under a burst or intentional attacker log flood, a `/tail`-only scanner becomes blind.
+* **Context:** The `knowthankyew` Portfolio Master Brief establishes **Pillar 1 (Volatile Memory-Only Telemetry & Amnesiac State Purge)** for consumer reality engines, and Project Genesis follows this by defaulting to volatile RAM (`--data-dir ""`). However, Genesis exposes three read paths: (a) `/tail` SSE streaming (a bounded 512-entry non-blocking drop channel that silently drops lines on slow consumers), (b) `/query` HTTP time-range lookups (bounded by RAM partition eviction), and (c) opt-in `--data-dir` length-prefixed CRC32 `.seg` segment files. Under a sudden traffic burst or intentional attacker log flood, a volatile-only or `/tail`-only antivirus/IDS scanner can be blinded before evidence is analyzed. Furthermore, Sentinel must retain segment read cursors, rolling surprisal baselines, and curated redacted feedback queues across restarts.
+* **Intentional Portfolio Variance:** **Genesis Sentinel intentionally varies from Portfolio Pillar 1's volatile-memory-only default.** Rather than forcing volatile RAM operation where it compromises detection completeness, Sentinel prioritizes **lossless disk-backed `.seg` file tailing** as its primary ingestion path and maintains bounded, local-only state on disk (`~/.genesis-sentinel/` by default, configurable via `SENTINEL_DATA_DIR` / `data_dir`). All other portfolio invariants—**zero external network egress, pure-Go stdlib zero-dependency core, strict allowlists, honest claims, and atomic Amnesiac Burn**—remain enforced without compromise.
 * **Decision:**
-  - Make **read-only `.seg` segment tailing** (when Genesis runs with `--data-dir`) the primary lossless ingestion source for Sentinel.
-  - Support **cursor-based `/query` window polling** as the fallback for volatile-only Genesis deployments, explicitly recording any observed eviction gaps in `sentinel stats`.
+  - Make **read-only `.seg` segment tailing** (paired with Genesis `--data-dir` + `--redact`) the primary lossless ingestion source for Sentinel.
+  - Keep **cursor-based `/query` window polling** as a secondary fallback for volatile-only Genesis instances, explicitly recording eviction gaps in `sentinel stats`.
   - Do not rely on `/tail` SSE as a security-critical primary feed.
+  - **Eliminate hidden-folder friction:** Surface exact disk paths on startup and in `sentinel config`, and provide first-class CLI commands (`sentinel data path`, `sentinel data status`, and `sentinel data open` to open the directory directly in Finder / the OS file manager) plus one-command `sentinel burn` cleanup so operators never need to memorize dotfile paths or toggle hidden folders manually.
 * **Consequences:**
-  - Bursts and brief scanner restarts do not silently drop security events when `--data-dir` is enabled.
-  - Volatile-only operators still get working monitoring with transparent gap telemetry.
+  - Bursts, attacker log floods, and brief scanner restarts do not silently drop security events.
+  - Disk usage is explicitly disclosed in `README.md`, `NOTICE.md`, and `SECURITY.md`, inspectable in one command, and erasable via `sentinel burn`.
 
 ---
 
-## ADR 5: Model Tier Strategy — SmolLM2 First, Gemma 2B in Phase 5, BitNet Excluded
+## ADR 5: Model Tier Strategy — SmolLM2-Instruct First, Gemma 2B in Phase 5, BitNet Excluded
 
-* **Context:** Local development runs on a 16 GB RAM host where LoRA training turnaround time directly governs iteration speed. Empirical runs in the `ml` repository recorded ~2m 14s training for `SmolLM2-135M` (~310 MB inference RAM, 1.84 MB adapter), ~7m 03s for `Gemma 2 2B IT` (~5.6 GB CPU inference RAM, 12.21 MB adapter), and ~53m 39s for `BitNet b1.58` (`float32` MPS) with runtime generation capped at `16` tokens (`MAX_SAFE_GENERATE_TOKENS = 16`) and no GGUF LoRA converter wired.
+* **Context:** Local development runs on a 16 GB RAM host where LoRA training turnaround time directly governs iteration speed. Empirical runs in the `ml` repository recorded ~2m 14s training for `SmolLM2-135M` (~310 MB inference RAM, 1.84 MB adapter), ~7m 03s for `Gemma 2 2B IT` (~5.6 GB CPU inference RAM, 12.21 MB adapter), and ~53m 39s for `BitNet b1.58` (`float32` MPS) with runtime generation capped at `16` tokens (`MAX_SAFE_GENERATE_TOKENS = 16`) and no GGUF LoRA converter wired. Additionally, instruction-tuned ChatML checkpoints (`SmolLM2-135M-Instruct` and `SmolLM2-360M-Instruct`) produce cleaner structured tags and zero-shot triage output than the base pretrained `SmolLM2-135M` checkpoint.
 * **Decision:**
-  1. **Phases 0–4 (Primary Development & Edge Tier):** Target **SmolLM2** (`HuggingFaceTB/SmolLM2-135M` locally cached by default, with allowlist support for `HuggingFaceTB/SmolLM2-135M-Instruct` and `HuggingFaceTB/SmolLM2-360M-Instruct`). The pipeline, feedback loop, prompt framing, and adapter hot-swapping are structurally identical across model sizes.
+  1. **Phases 0–4 (Primary Development & Edge Tier):** Default to **`HuggingFaceTB/SmolLM2-135M-Instruct`** (~270 MB, Apache 2.0), with **`HuggingFaceTB/SmolLM2-360M-Instruct`** (~720 MB, Apache 2.0) allowlisted as an immediate Smol step-up if complex obfuscated logs benefit from additional capacity (base `HuggingFaceTB/SmolLM2-135M` remains in the allowlist for backward compatibility). The pipeline, feedback loop, prompt framing, and adapter hot-swapping are structurally identical across model sizes.
   2. **Phase 5 (Reasoning Upgrade):** Add `google/gemma-2-2b-it` (already cached locally) as a high-capacity triage/escalation tier once the end-to-end funnel and curated datasets are validated on Smol.
   3. **BitNet Exclusion:** Explicitly exclude `microsoft/BitNet-*` models in `internal/model.ValidateBaseModel` (`ErrExperimentalModelExcluded`) until an upstream development cycle matures BitNet's context handling, GGUF LoRA serving, and training throughput.
 * **Consequences:**
-  - Fast 2-minute training loops during initial development and ~310 MB steady-state inference footprint.
+  - Fast ~2-minute training loops during initial development with clean ChatML instruction following and ~310 MB steady-state inference footprint.
   - Zero architectural rework required when promoting adapters to Gemma 2 2B IT in Phase 5.
   - Prevents experimental runtime instability from obscuring core detection engineering bugs.
 
@@ -80,12 +82,13 @@ This document records the foundational architectural decisions and trade-offs ma
 
 ---
 
-## ADR 7: Dual-Role Surprisal Architecture (Online Go Engine + Offline FTaaS Preflight)
+## ADR 7: Dual-Role Surprisal Architecture (Performance-First Go Engine + Offline FTaaS Preflight)
 
-* **Context:** `ml/src/surprisal-service/service.py` implements an independent MIT-licensed Laplace-LK surprisal engine based on Hazard et al. (`arXiv:2510.22809`). However, its current `extract_features()` function targets fintech/SaaS support tickets (hardcoded keywords like `wire`, `transfer`, `gdpr`, `sla`), and calling a Python HTTP container for every individual log template adds per-request serialization latency.
-* **Decision:** Use the Laplace-LK surprisal methodology in **two complementary roles**:
-  1. **Online Tier 1 (In-Process Go Default, Optional HTTP Parity):** Implement the clean-room Laplace-LK equations (Equations 4, 6, 7, 8) directly in Go stdlib `math` over log-domain continuous and nominal features for high-throughput real-time novelty scoring, while keeping `surprisal_mode=http` / `hybrid` available to validate parity or share state with `ml/src/surprisal-service`.
+* **Context:** `ml/src/surprisal-service/service.py` implements an independent MIT-licensed Laplace-LK surprisal engine based on Hazard et al. (`arXiv:2510.22809`). However, its current `extract_features()` function targets fintech/SaaS support tickets (hardcoded keywords like `wire`, `transfer`, `gdpr`, `sla`), and calling a Python HTTP container over localhost for every collapsed log template window introduces TCP/HTTP framing, JSON serialization, and Python GIL overhead on the hot path.
+* **Decision:** Deliberately optimize for **raw online performance over strict cross-repo DRY**, using the Laplace-LK surprisal methodology in **two complementary roles**:
+  1. **Online Tier 1 (In-Process Pure-Go Primary Engine):** Implement the clean-room Laplace-LK equations (Equations 4, 6, 7, 8) directly in Go stdlib `math` over log-domain continuous and nominal features (`surprisal_mode="inprocess"` default) for microsecond-scale, zero-network-hop anomaly scoring. Automated parity tests verify numerical agreement with `ml/src/surprisal-service/service.py` within $10^{-6}$ nats on shared test vectors so the two implementations never silently drift.
   2. **Offline Training Preflight (FTaaS `surprisal-service` `:5200`):** Continue leveraging FTaaS's existing containerized `surprisal-service` during `sentinel train` dataset submission to perform redundancy ablation (Section 8.1 probability-mass weighting) and catch mislabeled anomalies in curated training sets.
 * **Consequences:**
-  - Sub-millisecond online Tier 1 anomaly scoring with zero Python GIL or HTTP serialization overhead.
+  - Eliminates HTTP/JSON/Python overhead from the hot real-time log scanning path.
+  - Accepts minimal intentional duplication (~120 lines of pure math guarded by cross-repo parity tests) in exchange for raw throughput and single-binary operational simplicity.
   - Preserves MIT clean-room provenance and full integration with FTaaS's existing surprisal preflight pipeline.

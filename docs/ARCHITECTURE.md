@@ -55,9 +55,9 @@ flowchart TD
 ## 2. Phase 0 Implemented Subsystems
 
 1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/config/config.go`):**
-   - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `config`, `version`, `help`).
+   - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
    - Merges compiled safe defaults -> `sentinel.json` -> `SENTINEL_*` environment variables -> CLI flags.
-   - Redacts sensitive auth tokens automatically when rendering resolved config via `sentinel config`.
+   - Surfaces Sentinel's local data directory (`~/.genesis-sentinel/` by default) transparently via `sentinel data path`, `sentinel data status`, and `sentinel data open` without requiring hidden-folder configuration, and redacts sensitive auth tokens automatically in `sentinel config`.
 2. **Domain Contracts & Model Governance (`internal/model/types.go`):**
    - Mirrors Genesis's `parser.LogEntry` JSON contract via `LogEvent`.
    - Defines explicit wire contracts between tiers: `TemplateWindow`, `RuleHit`, `SurprisalScore`, `TriageVerdict`, and `FeedbackRecord`.
@@ -81,7 +81,7 @@ sequenceDiagram
 
     Op->>Sent: sentinel feedback --alert-id ID --label BENIGN_CRON
     Sent->>Sent: Scrub secrets/PII (RequireRedaction=true) & append JSONL
-    Op->>Sent: sentinel train --base-model HuggingFaceTB/SmolLM2-135M
+    Op->>Sent: sentinel train --base-model HuggingFaceTB/SmolLM2-135M-Instruct
     Sent->>FTaaS: POST /api/v1/jobs (redacted JSONL, surprisalPreflight=true)
     FTaaS->>Surp: POST /v1/audit/dataset (redundancy ablation & anomaly audit)
     Surp-->>FTaaS: Cleaned weighted records

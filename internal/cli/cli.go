@@ -5,13 +5,20 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 )
 
 // Version identifies the current Genesis Sentinel release stage.
 const Version = "0.1.0-scaffold"
+
+// openDirFn launches the OS file manager for `sentinel data open` (overridable in tests).
+var openDirFn = openDirectoryOS
 
 // Execute routes CLI subcommands following Genesis's single-binary dispatch style.
 func Execute(args []string) error {
@@ -34,11 +41,13 @@ func ExecuteWithOutput(args []string, stdout, stderr io.Writer) error {
 	case "feedback":
 		return notImplemented("feedback", "Phase 3 (Redacted Feedback Curation for FTaaS)")
 	case "train":
-		return notImplemented("train", "Phase 3 (Async SmolLM2 LoRA Job Submission to FTaaS)")
+		return notImplemented("train", "Phase 3 (Async SmolLM2-Instruct LoRA Job Submission to FTaaS)")
 	case "stats":
 		return notImplemented("stats", "Phase 1 (Sentinel Pipeline Metrics)")
 	case "burn":
 		return notImplemented("burn", "Phase 1 (Amnesiac State & Feedback Purge)")
+	case "data":
+		return runData(args[1:], stdout, stderr)
 	case "config":
 		return runConfig(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
@@ -84,6 +93,93 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	return enc.Encode(safeCopy)
 }
 
+func runData(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("data", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "", "Path to sentinel.json configuration file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
+	action := "status"
+	if fs.NArg() > 0 {
+		action = fs.Arg(0)
+	}
+
+	switch action {
+	case "path":
+		_, _ = fmt.Fprintln(stdout, cfg.DataDir)
+		return nil
+	case "status":
+		status := inspectDataDir(cfg.DataDir, cfg.FeedbackDir, cfg.GenesisDataDir)
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(status)
+	case "open":
+		if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
+			return fmt.Errorf("failed to initialize data directory %q: %w", cfg.DataDir, err)
+		}
+		if err := openDirFn(cfg.DataDir); err != nil {
+			return fmt.Errorf("failed to open %q in file manager: %w", cfg.DataDir, err)
+		}
+		_, _ = fmt.Fprintf(stdout, "Opened Sentinel data directory: %s\n", cfg.DataDir)
+		return nil
+	default:
+		return fmt.Errorf("unknown data subcommand %q (expected: path, status, or open)", action)
+	}
+}
+
+type dataDirStatus struct {
+	DataDir        string `json:"data_dir"`
+	FeedbackDir    string `json:"feedback_dir"`
+	GenesisDataDir string `json:"genesis_data_dir,omitempty"`
+	Exists         bool   `json:"exists"`
+	FileCount      int    `json:"file_count"`
+	TotalBytes     int64  `json:"total_bytes"`
+}
+
+func inspectDataDir(dataDir, feedbackDir, genesisDataDir string) dataDirStatus {
+	st := dataDirStatus{
+		DataDir:        dataDir,
+		FeedbackDir:    feedbackDir,
+		GenesisDataDir: genesisDataDir,
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil || !info.IsDir() {
+		return st
+	}
+	st.Exists = true
+	_ = filepath.WalkDir(dataDir, func(_ string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		st.FileCount++
+		if fi, err := d.Info(); err == nil {
+			st.TotalBytes += fi.Size()
+		}
+		return nil
+	})
+	return st
+}
+
+func openDirectoryOS(dir string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", dir).Run()
+	case "linux":
+		return exec.Command("xdg-open", dir).Run()
+	case "windows":
+		return exec.Command("explorer", dir).Run()
+	default:
+		return fmt.Errorf("unsupported OS %q for graphical folder open; inspect path manually: %s", runtime.GOOS, dir)
+	}
+}
+
 func notImplemented(cmd, roadmapPhase string) error {
 	return fmt.Errorf("%q is scheduled for %s — see docs/ROADMAP.md", cmd, roadmapPhase)
 }
@@ -96,12 +192,13 @@ Usage:
   sentinel [command] [flags]
 
 Commands:
-  watch     Watch Genesis segments or query windows through Tier 0 -> 1 -> 2 (Phase 1+)
+  watch     Watch Genesis .seg files (or /query windows) through Tier 0 -> 1 -> 2 (Phase 1+)
   scan      Run an offline scan over Genesis .seg files or JSONL exports (Phase 1+)
   feedback  Label alerts as true/false positives and export redacted JSONL (Phase 3)
-  train     Submit a redacted feedback dataset to local FTaaS (SmolLM2) (Phase 3)
+  train     Submit a redacted feedback dataset to local FTaaS (SmolLM2-Instruct) (Phase 3)
   stats     Display live pipeline throughput, surprisal, and alert metrics (Phase 1+)
-  burn      Purge Sentinel in-memory baselines and unexported local queues (Phase 1+)
+  burn      Purge Sentinel disk state, baselines, and unexported local queues (Phase 1+)
+  data      Inspect or open Sentinel's local data directory (path | status | open)
   config    Validate and print the resolved Sentinel configuration
   version   Print the Genesis Sentinel version
   help      Show help for Genesis Sentinel

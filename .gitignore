@@ -9,3 +9,4 @@ data/
 __pycache__/
 *.py[cod]
 sentinel.json
+.npp-md-preview.html
