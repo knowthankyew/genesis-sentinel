@@ -93,9 +93,9 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 	var (
 		snap       = BaselineSnapshot{Version: baselineSnapshotVersion}
 		hasVersion bool
+		hasCases   bool
 		ringBuf    []LogFeatures
 		ringHead   int
-		ringCount  int
 		allCases   []LogFeatures
 	)
 
@@ -127,6 +127,7 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 				return BaselineSnapshot{}, true, fmt.Errorf("parse baseline %q updated_at: %w", path, err)
 			}
 		case "cases":
+			hasCases = true
 			arrTok, err := dec.Token()
 			if err != nil {
 				return BaselineSnapshot{}, true, fmt.Errorf("parse baseline %q cases: %w", path, err)
@@ -136,9 +137,6 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 			}
 			if delim, ok := arrTok.(json.Delim); !ok || delim != '[' {
 				return BaselineSnapshot{}, true, fmt.Errorf("parse baseline %q: cases must be a JSON array", path)
-			}
-			if maxCases > 0 && ringBuf == nil {
-				ringBuf = make([]LogFeatures, maxCases)
 			}
 			for dec.More() {
 				var rc rawCasePayload
@@ -150,10 +148,13 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 					return BaselineSnapshot{}, true, fmt.Errorf("invalid baseline %q: %w", path, valErr)
 				}
 				if maxCases > 0 {
-					ringBuf[ringHead] = lf
-					ringHead = (ringHead + 1) % maxCases
-					if ringCount < maxCases {
-						ringCount++
+					// Grow incrementally rather than pre-allocating maxCases up front,
+					// then overwrite circularly once len(ringBuf) == maxCases.
+					if len(ringBuf) < maxCases {
+						ringBuf = append(ringBuf, lf)
+					} else {
+						ringBuf[ringHead] = lf
+						ringHead = (ringHead + 1) % maxCases
 					}
 				} else {
 					allCases = append(allCases, lf)
@@ -188,12 +189,15 @@ func LoadBaselineSnapshot(path string, maxCases int) (BaselineSnapshot, bool, er
 	if cr.exceeded {
 		return BaselineSnapshot{}, true, fmt.Errorf("baseline %q exceeds %d-byte limit", path, MaxBaselineSnapshotBytes)
 	}
+	if !hasCases {
+		return BaselineSnapshot{}, true, fmt.Errorf("invalid baseline %q: missing required field 'cases'", path)
+	}
 	_ = hasVersion
 
 	if maxCases > 0 {
-		ordered := make([]LogFeatures, 0, ringCount)
-		if ringCount < maxCases {
-			ordered = append(ordered, ringBuf[:ringCount]...)
+		ordered := make([]LogFeatures, 0, len(ringBuf))
+		if len(ringBuf) < maxCases {
+			ordered = append(ordered, ringBuf...)
 		} else {
 			ordered = append(ordered, ringBuf[ringHead:]...)
 			ordered = append(ordered, ringBuf[:ringHead]...)

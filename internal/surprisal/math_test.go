@@ -151,9 +151,32 @@ func TestOverflowSafeMathOnExtremeFiniteRanges(t *testing.T) {
 	want := 2.0 + 0.5*math.Exp(-2.0)*5.0 - 1.5
 	assertClose(t, "MarginalSurprisalCont(1e308, -1e308, 1e308)", got, want)
 
-	// KNNMean of two 1e308 neighbors must remain finite 1e308.
+	// KNNMean of two 1e308 neighbors AND mixed-sign [-1e308, 1e308] must remain exact and finite.
 	km := KNNMean([]float64{1e308, 1e308}, 2)
 	if math.IsNaN(km) || math.IsInf(km, 0) || math.Abs(km-1e308)/1e308 > 1e-12 {
 		t.Fatalf("KNNMean([1e308, 1e308], 2) = %v, want 1e308", km)
+	}
+	kmMixed := KNNMean([]float64{-1e308, 1e308}, 2)
+	if math.IsNaN(kmMixed) || math.IsInf(kmMixed, 0) || math.Abs(kmMixed) > 1e-12 {
+		t.Fatalf("KNNMean([-1e308, 1e308], 2) = %v, want 0", kmMixed)
+	}
+
+	// LukaszykKarmowskiDiff(5e307, 5e307) must not overflow intermediate 3*delta+d.
+	elkHuge := LukaszykKarmowskiDiff(5e307, 5e307)
+	wantELK := (1.0 + 0.5*math.Exp(-1.0)*4.0) * 5e307
+	if math.IsNaN(elkHuge) || math.IsInf(elkHuge, 0) || math.Abs(elkHuge-wantELK)/wantELK > 1e-12 {
+		t.Fatalf("LukaszykKarmowskiDiff(5e307, 5e307) = %v, want %v", elkHuge, wantELK)
+	}
+
+	// Joint pairSurprisal across two saturated continuous dimensions must saturate cleanly at MaxFloat64 (never +Inf).
+	var a, b LogFeatures
+	a.Continuous[0], a.Continuous[1] = 1e308, 1e308
+	var d [ContinuousFeatureCount]float64
+	for i := range d {
+		d[i] = MinDeviationFloor
+	}
+	joint, _ := pairSurprisal(a, b, d)
+	if math.IsNaN(joint) || math.IsInf(joint, 0) || joint <= 0 {
+		t.Fatalf("expected finite saturated joint surprisal, got %v", joint)
 	}
 }

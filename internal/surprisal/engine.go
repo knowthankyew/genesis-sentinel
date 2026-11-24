@@ -133,6 +133,14 @@ func NewEngine(opts Options) *Engine {
 // When an explicit empty snapshot exists on disk, the in-memory baseline is replaced
 // cleanly with an empty baseline. Does not mark dirtyDisk since state came from disk.
 func (e *Engine) LoadFromFile(path string) (int, error) {
+	if path == "" {
+		return 0, nil
+	}
+	// Serialize with SaveToFile so an overlapping load cannot read a stale file A
+	// and mark memory clean while a concurrent save commits newer file B.
+	e.saveMu.Lock()
+	defer e.saveMu.Unlock()
+
 	snap, exists, err := LoadBaselineSnapshot(path, e.maxSize)
 	if err != nil {
 		return 0, err
@@ -276,10 +284,12 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 	anomalous := localAnomalous
 	now := time.Now()
 	circuitOpen := !e.httpOpenUntil.IsZero() && now.Before(e.httpOpenUntil)
-	needHTTP := client != nil && warmupDone && !circuitOpen && (mode == "http" || (mode == "hybrid" && localAnomalous))
+	ctxCanceled := ctx != nil && ctx.Err() != nil
+	wantsHTTP := client != nil && warmupDone && (mode == "http" || (mode == "hybrid" && localAnomalous))
+	needHTTP := wantsHTTP && !circuitOpen && !ctxCanceled
 
 	if mode == "inprocess" || !needHTTP {
-		if (mode == "http" || mode == "hybrid") && client != nil && warmupDone && circuitOpen && (mode == "http" || localAnomalous) {
+		if wantsHTTP && (circuitOpen || ctxCanceled) {
 			e.httpFallbacks++
 		}
 		if anomalous {
@@ -306,9 +316,9 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		}
 	}
 
-	// Copy chronological baseline references ONLY when an HTTP parity call will execute,
+	// Copy only the bounded <=64 chronological references that VerifyWindow sends,
 	// capturing baseline revision so we can detect concurrent learning during I/O.
-	refsCopy = e.orderedCasesLocked()
+	refsCopy = e.stridedReferencesLocked(maxHTTPReferenceCases)
 	rev := e.revision
 	// Release lock before loopback HTTP parity request (never hold mutex across I/O).
 	e.mu.Unlock()
@@ -339,10 +349,14 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		if !callerCanceled {
 			e.httpOpenUntil = time.Now().Add(e.httpCooldown)
 		}
-	} else if e.revision != rev {
-		// The rolling baseline changed while the HTTP request was in flight: do not reuse
-		// a verdict computed against an older reference snapshot. Re-score locally against
-		// the current baseline before deciding whether to alert or learn.
+	}
+
+	if e.revision != rev {
+		// The rolling baseline changed while the HTTP request was in flight (whether
+		// HTTP succeeded or failed): clear stale score/contributions and re-score locally
+		// against the current baseline before deciding whether to alert or learn.
+		totalNats = 0
+		contribs = nil
 		if e.count > 0 {
 			if e.devsDirty {
 				e.devs = ComputeLogDeviations(e.activeSliceLocked())
@@ -353,7 +367,7 @@ func (e *Engine) Evaluate(ctx context.Context, w model.TemplateWindow, hasTier0S
 		baseCount = e.count
 		localAnomalous = (e.count >= e.warmupMinCases) && totalNats >= threshold
 		anomalous = localAnomalous
-	} else if mode == "http" {
+	} else if err == nil && mode == "http" {
 		sidecarAnomalous := !vResp.IsConforming || vResp.MeasuredSurprisalNats >= threshold
 		if sidecarAnomalous || !localAnomalous {
 			// Adopt sidecar measurement and clear local contributions so attributions never
@@ -486,6 +500,32 @@ func (e *Engine) chronologicalAtLocked(pos int) LogFeatures {
 		return e.ring[pos]
 	}
 	return e.ring[(e.head+pos)%e.maxSize]
+}
+
+// stridedReferencesLocked copies at most maxN evenly-strided baseline entries in
+// chronological oldest-first order without cloning the entire ring buffer.
+func (e *Engine) stridedReferencesLocked(maxN int) []LogFeatures {
+	n := e.count
+	if n == 0 {
+		return nil
+	}
+	if maxN <= 0 || n <= maxN {
+		out := make([]LogFeatures, n)
+		for i := 0; i < n; i++ {
+			out[i] = e.chronologicalAtLocked(i)
+		}
+		return out
+	}
+	out := make([]LogFeatures, maxN)
+	step := float64(n) / float64(maxN)
+	for i := 0; i < maxN; i++ {
+		idx := int(float64(i) * step)
+		if idx >= n {
+			idx = n - 1
+		}
+		out[i] = e.chronologicalAtLocked(idx)
+	}
+	return out
 }
 
 // scoreAgainstBaselineLocked computes the k-NN mean Laplace-LK surprisal (and

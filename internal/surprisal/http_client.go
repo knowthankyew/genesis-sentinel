@@ -43,7 +43,8 @@ func NewHTTPClient(baseURL string, timeout time.Duration, allowRemote bool) (*HT
 	}
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
-		return nil, fmt.Errorf("parse surprisal-service URL %q: %w", trimmed, err)
+		// Never echo the raw URL or wrapped *url.Error since malformed input may contain credentials.
+		return nil, fmt.Errorf("parse surprisal-service URL: invalid URL syntax")
 	}
 	if parsed.User != nil {
 		return nil, fmt.Errorf("surprisal-service base URL must not contain embedded userinfo or credentials")
@@ -60,9 +61,18 @@ func NewHTTPClient(baseURL string, timeout time.Duration, allowRemote bool) (*HT
 	if !allowRemote && !security.IsLoopbackEndpoint(parsed.String()) {
 		return nil, fmt.Errorf("refusing non-loopback surprisal-service URL %q without allow_remote_endpoints=true", parsed.Redacted())
 	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	if parsed.RawPath != "" {
-		parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	// Trim literal trailing '/' on the escaped path BEFORE decoding so trailing
+	// percent-encoded slashes (e.g. /tenant%2F/) are preserved accurately.
+	escapedBase := strings.TrimRight(parsed.EscapedPath(), "/")
+	decodedBase, unescErr := url.PathUnescape(escapedBase)
+	if unescErr != nil {
+		return nil, fmt.Errorf("parse surprisal-service URL: invalid escaped path")
+	}
+	parsed.Path = decodedBase
+	if escapedBase != decodedBase {
+		parsed.RawPath = escapedBase
+	} else {
+		parsed.RawPath = ""
 	}
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeout
@@ -126,15 +136,15 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 		return fmt.Errorf("surprisal-service health request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("surprisal-service health returned status %d", resp.StatusCode)
+	}
 	n, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxHTTPResponseBytes+1))
 	if copyErr != nil {
 		return fmt.Errorf("read surprisal-service health response: %w", copyErr)
 	}
 	if n > maxHTTPResponseBytes {
 		return fmt.Errorf("surprisal-service health response exceeded %d-byte limit", maxHTTPResponseBytes)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("surprisal-service health returned status %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -189,6 +199,9 @@ func (c *HTTPClient) VerifyWindow(
 		return VerifyResponse{}, fmt.Errorf("post %s: %w", c.redactedEndpointURL("/v1/verify/completion"), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return VerifyResponse{}, fmt.Errorf("surprisal-service returned status %d", resp.StatusCode)
+	}
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPResponseBytes+1))
 	if err != nil {
@@ -196,9 +209,6 @@ func (c *HTTPClient) VerifyWindow(
 	}
 	if len(respBytes) > maxHTTPResponseBytes {
 		return VerifyResponse{}, fmt.Errorf("surprisal response exceeded %d-byte limit", maxHTTPResponseBytes)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return VerifyResponse{}, fmt.Errorf("surprisal-service returned status %d", resp.StatusCode)
 	}
 
 	var raw struct {

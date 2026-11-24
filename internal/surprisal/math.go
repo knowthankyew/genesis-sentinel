@@ -93,6 +93,9 @@ func ComputeDeviations(cases []map[string]float64, keys []string) map[string]flo
 // under Laplace uncertainty with substitutability deviation delta:
 //
 //	E_LK(d, delta) = d + 0.5 * exp(-d / delta) * (3*delta + d)
+//
+// Evaluated in normalized units u = d / delta so extreme finite inputs
+// (e.g. d = delta = 5e307) do not overflow intermediate 3*delta + d sums.
 func LukaszykKarmowskiDiff(d, delta float64) float64 {
 	if math.IsNaN(d) || math.IsInf(d, 0) {
 		d = 0
@@ -103,7 +106,16 @@ func LukaszykKarmowskiDiff(d, delta float64) float64 {
 	if math.IsNaN(delta) || math.IsInf(delta, 0) || delta < MinDeviationFloor {
 		delta = MinDeviationFloor
 	}
-	return d + 0.5*math.Exp(-d/delta)*(3.0*delta+d)
+	u := d / delta
+	if math.IsInf(u, 0) || math.IsNaN(u) {
+		// Limiting correction for d/delta -> +Inf is 0.
+		return d
+	}
+	corr := 0.5 * math.Exp(-u) * (3.0 + u) * delta
+	if math.IsNaN(corr) || math.IsInf(corr, 0) {
+		return d
+	}
+	return saturatingAdd(d, corr)
 }
 
 // MarginalSurprisalCont implements Equation 6: continuous marginal surprisal in nats
@@ -170,18 +182,20 @@ func CaseSurprisal(c1, c2 CaseVector, deviations map[string]float64, contKeys, n
 		}
 		m := MarginalSurprisalCont(c1.Continuous[k], c2.Continuous[k], delta)
 		contribs[k] = m
-		total += m
+		total = saturatingAdd(total, m)
 	}
 	for _, k := range nomKeys {
 		m := MarginalSurprisalNom(c1.Nominal[k], c2.Nominal[k])
 		contribs[k] = m
-		total += m
+		total = saturatingAdd(total, m)
 	}
 	return total, contribs
 }
 
 // KNNMean returns the overflow-safe mean of the k smallest finite values in scores
 // (matching statistics.mean(sorted(surprisals)[:min(k, len(surprisals))]) in service.py).
+// Uses max-magnitude scaling so both same-sign and opposite-sign extreme finite inputs
+// (e.g. [1e308, 1e308] and [-1e308, 1e308]) remain exact and finite.
 func KNNMean(scores []float64, k int) float64 {
 	if len(scores) == 0 || k <= 0 {
 		return 0
@@ -199,12 +213,35 @@ func KNNMean(scores []float64, k int) float64 {
 	if k > len(cp) {
 		k = len(cp)
 	}
-	// Divide each value before accumulation so large finite values (e.g. 1e308) do not overflow.
-	mean := cp[0]
-	for i := 1; i < k; i++ {
-		mean += (cp[i] - mean) / float64(i+1)
+	var scale float64
+	for i := 0; i < k; i++ {
+		if av := math.Abs(cp[i]); av > scale {
+			scale = av
+		}
 	}
-	return mean
+	if scale == 0 {
+		return 0
+	}
+	var sumScaled float64
+	for i := 0; i < k; i++ {
+		sumScaled += cp[i] / scale
+	}
+	return (sumScaled / float64(k)) * scale
+}
+
+// saturatingAdd adds two nonnegative finite floats, saturating at math.MaxFloat64
+// instead of overflowing to +Inf (which would poison downstream averaging with Inf-Inf=NaN).
+func saturatingAdd(a, b float64) float64 {
+	if math.IsNaN(a) || a < 0 {
+		a = 0
+	}
+	if math.IsNaN(b) || b < 0 {
+		b = 0
+	}
+	if math.IsInf(a, 0) || math.IsInf(b, 0) || b > math.MaxFloat64-a {
+		return math.MaxFloat64
+	}
+	return a + b
 }
 
 func sanitizeFinite(v float64) float64 {

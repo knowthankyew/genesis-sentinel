@@ -67,6 +67,17 @@ func TestExtractFeaturesProtocolAndScaling(t *testing.T) {
 		t.Fatalf("expected http_4xx, got %q", http403.Nominal[3])
 	}
 
+	// Request-target path token must NOT be misread as an HTTP response status family.
+	reqTargetWin := ExtractFeatures(model.TemplateWindow{
+		TemplateID: "tmpl-req-target",
+		Service:    "nginx",
+		Level:      "INFO",
+		SampleLine: "GET /status=500 HTTP/1.1",
+	})
+	if reqTargetWin.Nominal[3] != "none" {
+		t.Fatalf("expected GET /status=500 HTTP/1.1 without response code -> none, got %q", reqTargetWin.Nominal[3])
+	}
+
 	// Field boundary check: previous_status=500 must NOT shadow standalone status=200.
 	boundaryWin := ExtractFeatures(model.TemplateWindow{
 		TemplateID: "tmpl-boundary",
@@ -399,6 +410,15 @@ func TestBaselinePersistenceAndCorruptSnapshotHandling(t *testing.T) {
 		t.Fatal("expected error loading baseline with incomplete {} case objects")
 	}
 
+	// Snapshots omitting the required 'cases' key must be rejected rather than silently clearing state.
+	missingCasesPath := filepath.Join(dir, "missing-cases.json")
+	if err := os.WriteFile(missingCasesPath, []byte(`{"version":1}`), 0600); err != nil {
+		t.Fatalf("write missing-cases.json: %v", err)
+	}
+	if _, err := eng.LoadFromFile(missingCasesPath); err == nil {
+		t.Fatal("expected error loading snapshot missing required 'cases' field")
+	}
+
 	// An explicit empty snapshot file (cases:[]) must replace a populated engine with 0 cases.
 	explicitEmptyPath := filepath.Join(dir, "empty.json")
 	if err := SaveBaselineSnapshot(explicitEmptyPath, BaselineSnapshot{Version: 1, MaxSize: 50, Cases: []LogFeatures{}}); err != nil {
@@ -422,19 +442,32 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 	} else if strings.Contains(err.Error(), "supersecretpass") {
 		t.Fatalf("NewHTTPClient error leaked embedded password: %v", err)
 	}
+	// Malformed URL with invalid escape AND password must not leak password in parse error.
+	if _, err := NewHTTPClient("http://user:supersecretpass@127.0.0.1:5200/%zz", time.Second, false); err == nil {
+		t.Fatal("expected NewHTTPClient to reject malformed URL")
+	} else if strings.Contains(err.Error(), "supersecretpass") {
+		t.Fatalf("NewHTTPClient malformed parse error leaked embedded password: %v", err)
+	}
 	if _, err := NewHTTPClient("http://127.0.0.1:5200?tenant=local", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject base URL with query parameters")
 	}
 	if _, err := NewHTTPClient("http://127.0.0.1:5200#frag", time.Second, false); err == nil {
 		t.Fatal("expected NewHTTPClient to reject base URL with fragment")
 	}
-	// Preserve escaped path segments when appending endpoint suffixes.
+	// Preserve escaped path segments (interior AND trailing encoded slash) when appending endpoints.
 	escClient, err := NewHTTPClient("http://127.0.0.1:5200/tenant%2Fblue", time.Second, false)
 	if err != nil {
 		t.Fatalf("NewHTTPClient escaped prefix failed: %v", err)
 	}
 	if got := escClient.endpointURL("/health"); got != "http://127.0.0.1:5200/tenant%2Fblue/health" {
 		t.Fatalf("escaped path prefix corrupted: got %q", got)
+	}
+	escTrailClient, err := NewHTTPClient("http://127.0.0.1:5200/tenant%2F/", time.Second, false)
+	if err != nil {
+		t.Fatalf("NewHTTPClient trailing encoded slash failed: %v", err)
+	}
+	if got := escTrailClient.endpointURL("/health"); got != "http://127.0.0.1:5200/tenant%2F/health" {
+		t.Fatalf("trailing encoded slash corrupted: got %q", got)
 	}
 
 	var calls atomic.Int32
@@ -502,9 +535,9 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 	}
 
 	// Verify graceful fallback AND circuit breaker when sidecar goes down:
-	// first failure opens circuit, next 100 windows fall back immediately without hanging.
+	// first failure opens circuit (HTTPChecks == 2 total: 1 before shutdown + 1 failed),
+	// and all 100 subsequent calls skip HTTP completely!
 	srv.Close()
-	start := time.Now()
 	scFallback := eng.Evaluate(context.Background(), model.TemplateWindow{
 		TemplateID: "t-weird-2",
 		Template:   "ERR unexpected 2",
@@ -523,10 +556,9 @@ func TestHTTPParityClientModesAndLoopbackGuard(t *testing.T) {
 			SampleLine: "GET /ok 200",
 		}, false)
 	}
-	elapsed := time.Since(start)
 	st := eng.Stats()
-	if st.HTTPFallbacks < 101 || !scFallback.Anomalous || elapsed > 2*time.Second {
-		t.Fatalf("expected circuit-breaker fast fallback (elapsed=%v), stats=%+v score=%+v", elapsed, st, scFallback)
+	if st.HTTPChecks != 2 || st.HTTPFallbacks != 101 || !scFallback.Anomalous {
+		t.Fatalf("expected circuit breaker to cap HTTPChecks=2 with 101 fallbacks, stats=%+v score=%+v", st, scFallback)
 	}
 }
 

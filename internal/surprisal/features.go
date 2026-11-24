@@ -216,12 +216,12 @@ func pairSurprisal(
 	for k := 0; k < ContinuousFeatureCount; k++ {
 		m := MarginalSurprisalCont(a.Continuous[k], b.Continuous[k], devs[k])
 		contribs[k] = m
-		total += m
+		total = saturatingAdd(total, m)
 	}
 	for k := 0; k < NominalFeatureCount; k++ {
 		m := MarginalSurprisalNom(a.Nominal[k], b.Nominal[k])
 		contribs[ContinuousFeatureCount+k] = m
-		total += m
+		total = saturatingAdd(total, m)
 	}
 	return total, contribs
 }
@@ -292,7 +292,11 @@ func extractProtoClass(sample string) string {
 			}
 		}
 	}
-	lower := strings.ToLower(trimmed)
+	// Mask any HTTP request-target path token (e.g. "GET /status=500 HTTP/1.1") before
+	// scanning for status=/code= key-value pairs so URL path/query strings cannot spoof
+	// response status families.
+	scanStr := stripHTTPRequestTarget(trimmed)
+	lower := strings.ToLower(scanStr)
 	for _, key := range []string{"status=", "status:", `"status":`, "code="} {
 		searchFrom := 0
 		for searchFrom < len(lower) {
@@ -315,7 +319,7 @@ func extractProtoClass(sample string) string {
 	}
 	if hasHTTPMethodPrefix(trimmed) {
 		// Common compact access-log tail: "GET /path 403" or "POST /login 200 12ms"
-		for tok := range strings.FieldsSeq(trimmed) {
+		for tok := range strings.FieldsSeq(scanStr) {
 			if len(tok) == 3 && tok[0] >= '1' && tok[0] <= '5' && isAllDigits(tok) {
 				return "http_" + tok[:1] + "xx"
 			}
@@ -323,6 +327,35 @@ func extractProtoClass(sample string) string {
 	}
 
 	return "none"
+}
+
+// stripHTTPRequestTarget removes the request-target token immediately following an
+// HTTP method verb (e.g. "GET /status=500 HTTP/1.1" -> "GET  HTTP/1.1") so path
+// segments or query strings are never misread as HTTP response status fields.
+func stripHTTPRequestTarget(s string) string {
+	for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "} {
+		idx := -1
+		if strings.HasPrefix(s, m) {
+			idx = 0
+		} else if pos := strings.Index(s, `"`+m); pos >= 0 {
+			idx = pos + 1
+		}
+		if idx < 0 {
+			continue
+		}
+		targetStart := idx + len(m)
+		for targetStart < len(s) && s[targetStart] == ' ' {
+			targetStart++
+		}
+		targetEnd := targetStart
+		for targetEnd < len(s) && s[targetEnd] != ' ' && s[targetEnd] != '\t' && s[targetEnd] != '"' {
+			targetEnd++
+		}
+		if targetEnd > targetStart {
+			return s[:targetStart] + s[targetEnd:]
+		}
+	}
+	return s
 }
 
 func hasHTTPMethodPrefix(s string) bool {
