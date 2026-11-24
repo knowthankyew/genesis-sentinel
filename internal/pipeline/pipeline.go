@@ -402,9 +402,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		if ts <= 0 && hasWin {
 			ts = w.LastSeenUnix
 		}
-		if ts <= 0 {
-			ts = nowUnix
-		}
+		ts = normalizeAlertTimestamp(ts, nowUnix)
 
 		roundedEntropy := math.Round(bestEntropy*10000) / 10000
 
@@ -713,6 +711,27 @@ func isOwnedFeedbackFile(name string) bool {
 		return true
 	}
 	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
+}
+
+// normalizeAlertTimestamp converts sub-second Unix epochs (ms/us/ns) to Unix seconds
+// matching Genesis's LogEntry.Timestamp contract and guarantees the serialized bare
+// JSON integer is never a 16-digit run that Genesis --redact would replace with an
+// unquoted [REDACTED_CARD] token.
+func normalizeAlertTimestamp(ts, fallbackUnix int64) int64 {
+	if ts <= 0 {
+		return fallbackUnix
+	}
+	if ts >= 1_000_000_000_000_000_000 { // nanoseconds (>= 1e18)
+		ts /= 1_000_000_000
+	} else if ts >= 1_000_000_000_000_000 { // microseconds (>= 1e15, 16-digit range!)
+		ts /= 1_000_000
+	} else if ts >= 1_000_000_000_000 { // milliseconds (>= 1e12)
+		ts /= 1_000
+	}
+	if ts >= 1_000_000_000_000_000 && ts <= 9_999_999_999_999_999 {
+		return fallbackUnix
+	}
+	return ts
 }
 
 func isTemplateInList(list []string, tmpl string) bool {

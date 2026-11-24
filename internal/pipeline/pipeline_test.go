@@ -168,10 +168,49 @@ func TestPipelineEndToEnd100kSyntheticSegmentReplay(t *testing.T) {
 		}
 	}
 
-	// Raw JSON regression check over full non-empty output: no 16-digit float mantissas that collide with Genesis --redact
+	// Simulate Genesis --redact card replacement across emitted JSON alerts and verify every
+	// redacted line still decodes as valid JSON (unquoted 16-digit numbers break JSON, whereas
+	// quoted 16-digit strings inside messages remain valid JSON).
 	genesisCardPattern := regexp.MustCompile(`\b(?:\d{4}[ -]?){3}\d{4}\b`)
-	if match := genesisCardPattern.FindString(string(rawAlerts)); match != "" {
-		t.Fatalf("emitted alert JSON contains 16-digit sequence %q that breaks Genesis --redact JSON parsing", match)
+	applyGenesisRedact := func(b []byte) []byte {
+		return genesisCardPattern.ReplaceAll(b, []byte("[REDACTED_CARD]"))
+	}
+	var badCheck map[string]any
+	if err := json.Unmarshal(applyGenesisRedact([]byte(`{"timestamp":1763996400000000}`)), &badCheck); err == nil {
+		t.Fatal("expected unquoted 16-digit numeric field to become invalid JSON after Genesis --redact")
+	}
+	var goodQuoted map[string]any
+	if err := json.Unmarshal(applyGenesisRedact([]byte(`{"timestamp":1763996400,"message":"card 4111222233334444"}`)), &goodQuoted); err != nil {
+		t.Fatalf("expected quoted 16-digit string to remain valid JSON after Genesis --redact: %v", err)
+	}
+	redactedScanner := bufio.NewScanner(bytes.NewReader(applyGenesisRedact(rawAlerts)))
+	for redactedScanner.Scan() {
+		var a emit.Alert
+		if err := json.Unmarshal(redactedScanner.Bytes(), &a); err != nil {
+			t.Fatalf("emitted alert became invalid JSON after Genesis --redact: %v (line=%s)", err, redactedScanner.Text())
+		}
+	}
+	if err := redactedScanner.Err(); err != nil {
+		t.Fatalf("scan redacted rawAlerts: %v", err)
+	}
+
+	// Verify microsecond 16-digit event timestamps + quoted 16-digit messages normalize cleanly for Genesis --redact
+	var usBuf bytes.Buffer
+	usPipe := New(cfg, ruleEng, emit.NewWriterSink(&usBuf), "file")
+	usPipe.IngestEvent(model.LogEvent{
+		ID:        1,
+		Timestamp: 1763996400000000, // 16-digit microsecond epoch
+		Service:   "nginx",
+		Level:     "WARN",
+		Message:   "GET /../../etc/passwd?card=4111222233334444 HTTP/1.1 403",
+	})
+	usAlerts, _ := usPipe.FlushWindow()
+	if len(usAlerts) != 1 || usAlerts[0].Timestamp != 1763996400 {
+		t.Fatalf("expected microsecond timestamp normalized to Unix seconds 1763996400, got %+v", usAlerts)
+	}
+	var usDecoded emit.Alert
+	if err := json.Unmarshal(applyGenesisRedact(bytes.TrimSpace(usBuf.Bytes())), &usDecoded); err != nil {
+		t.Fatalf("alert with microsecond timestamp + quoted card failed JSON parse after Genesis --redact: %v", err)
 	}
 
 	// Verify Burn wipes Sentinel-owned cursor.json & sentinel-feedback.jsonl while preserving unrelated user files!
@@ -263,6 +302,10 @@ func TestBurnLocalStateRejectsFeedbackSymlinkEscape(t *testing.T) {
 	if _, err := BurnLocalState(dataDir); err == nil {
 		t.Fatal("expected BurnLocalState to reject symlinked feedback directory")
 	}
+	if _, err := os.Stat(outsideFile); err != nil {
+		t.Fatalf("outside sentinel-feedback.jsonl was deleted through feedback symlink: %v", err)
+	}
+
 	// Verify BurnLocalState leaves an unrelated empty feedback directory in place
 	emptyFeedbackRoot := t.TempDir()
 	emptyFeedbackDir := filepath.Join(emptyFeedbackRoot, "feedback")

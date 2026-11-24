@@ -138,10 +138,17 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 		t.Fatalf("expected restricted client to use a Transport with Proxy == nil and loopback DialContext, got %#v", defaultClient.Transport)
 	}
 
-	// Verify DialLoopbackContext rejects non-loopback IPs and hostnames with policy-specific errors.
+	// Verify the dialer installed on the restricted client's transport AND DialLoopbackContext
+	// reject non-loopback destinations with policy-specific errors.
 	// Use a pre-canceled context so any policy regression cannot initiate a network dial.
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
+	if conn, err := tr.DialContext(canceledCtx, "tcp", "example.com:80"); err == nil || !strings.Contains(err.Error(), "refusing non-loopback dial target") {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("expected restricted client transport DialContext policy rejection, got err=%v", err)
+	}
 	if conn, err := DialLoopbackContext(canceledCtx, "tcp", "192.0.2.1:80"); err == nil || !strings.Contains(err.Error(), "refusing non-loopback dial target") {
 		if conn != nil {
 			_ = conn.Close()

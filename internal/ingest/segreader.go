@@ -80,12 +80,16 @@ type SegReader struct {
 	defaultService    string
 
 	// recoveryScanSeg and recoveryScanOffset track incremental bounded forward resync
-	// progress across polls; pendingCandidates remembers incomplete active-segment headers
-	// separately so forward scanning never stalls on a quiet segment while still retrying
-	// incomplete candidates once the segment grows to their required size.
-	recoveryScanSeg    uint64
-	recoveryScanOffset int64
-	pendingCandidates  []incompleteCandidate
+	// progress across polls; pendingCandidates remembers up to maxPendingRecoveryCandidates
+	// incomplete active-segment headers, and discardedCandidate* retains a bounded rescan
+	// checkpoint for any candidates evicted at capacity so growth revisits them without
+	// restarting scans on quiet polls.
+	recoveryScanSeg            uint64
+	recoveryScanOffset         int64
+	pendingCandidates          []incompleteCandidate
+	discardedCandidateOffset   int64
+	discardedCandidateMinSize  int64
+	discardedCandidateLastSize int64
 
 	// partialTail tracking distinguishes in-flight writes from persistent corrupt lengths
 	// on a quiet active segment.
@@ -182,8 +186,12 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 		recoveryRemaining:         maxRecoveryScanBytes,
 		recoveryChecksumRemaining: maxRecoveryChecksumBytes,
 	}
-	var events []model.LogEvent
-	for idx, segID := range segments {
+	var (
+		events  []model.LogEvent
+		rewound bool
+	)
+	for idx := 0; idx < len(segments); idx++ {
+		segID := segments[idx]
 		if segID < r.cursor.SegmentID {
 			continue
 		}
@@ -192,7 +200,15 @@ func (r *SegReader) ReadBatch(maxEvents int) ([]model.LogEvent, error) {
 			r.resetCursorToLocked(segID, false)
 		}
 
-		segEvents, advancedToNext, readErr := r.readSegmentLocked(segID, isLatest, budget)
+		segEvents, advancedToNext, replaced, readErr := r.readSegmentLocked(segID, isLatest, budget)
+		if replaced && !rewound {
+			// Segment identity mismatch (e.g. `genesis burn` recreated segments 1..N):
+			// rewind strictly to the first available segment and restart the scan.
+			rewound = true
+			r.resetCursorToLocked(segments[0], true)
+			idx = -1
+			continue
+		}
 		events = append(events, segEvents...)
 		if readErr != nil {
 			return events, readErr
@@ -227,6 +243,9 @@ func (r *SegReader) clearRecoveryStateLocked() {
 	r.recoveryScanSeg = 0
 	r.recoveryScanOffset = 0
 	r.pendingCandidates = nil
+	r.discardedCandidateOffset = 0
+	r.discardedCandidateMinSize = 0
+	r.discardedCandidateLastSize = 0
 }
 
 func (r *SegReader) clearStallStateLocked() {
@@ -236,21 +255,21 @@ func (r *SegReader) clearStallStateLocked() {
 	r.stallCount = 0
 }
 
-func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batchBudget) ([]model.LogEvent, bool, error) {
+func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batchBudget) ([]model.LogEvent, bool, bool, error) {
 	segPath := segmentPath(r.segDir, segID)
 	f, err := os.Open(segPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, true, nil
+			return nil, true, false, nil
 		}
-		return nil, false, fmt.Errorf("open segment %q: %w", segPath, err)
+		return nil, false, false, fmt.Errorf("open segment %q: %w", segPath, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	// Validate size and file identity strictly on the SAME open file handle before seeking.
 	info, err := f.Stat()
 	if err != nil {
-		return nil, false, fmt.Errorf("stat segment %q: %w", segPath, err)
+		return nil, false, false, fmt.Errorf("stat segment %q: %w", segPath, err)
 	}
 	fileSize := info.Size()
 	currentFileID := fileIdentity(info)
@@ -264,14 +283,15 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 		} else if r.cursor.SegmentFingerprint != "" && r.cursor.FingerprintLen > 0 {
 			fp, fpLen, fpErr := computeSegmentFingerprintFromFile(f, r.cursor.FingerprintLen)
 			if fpErr != nil {
-				return nil, false, fmt.Errorf("verify segment identity %q: %w", segPath, fpErr)
+				return nil, false, false, fmt.Errorf("verify segment identity %q: %w", segPath, fpErr)
 			}
 			if fpLen < r.cursor.FingerprintLen || fp != r.cursor.SegmentFingerprint {
 				replaced = true
 			}
 		}
 		if replaced {
-			r.resetCursorToLocked(segID, true)
+			// Signal ReadBatch to rewind to segments[0] (e.g. if genesis burn recreated 1..N).
+			return nil, false, true, nil
 		}
 	}
 
@@ -281,18 +301,18 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 	if r.cursor.SegmentFingerprint == "" && fileSize >= MagicHeaderLen {
 		fp, fpLen, fpErr := computeSegmentFingerprintFromFile(f, maxFingerprintBytes)
 		if fpErr != nil {
-			return nil, false, fmt.Errorf("fingerprint segment %q: %w", segPath, fpErr)
+			return nil, false, false, fmt.Errorf("fingerprint segment %q: %w", segPath, fpErr)
 		}
 		r.cursor.SegmentFingerprint = fp
 		r.cursor.FingerprintLen = fpLen
 	}
 
 	if r.cursor.Offset >= fileSize {
-		return nil, !isLatest, nil
+		return nil, !isLatest, false, nil
 	}
 
 	if _, err := f.Seek(r.cursor.Offset, io.SeekStart); err != nil {
-		return nil, false, fmt.Errorf("seek segment %q: %w", segPath, err)
+		return nil, false, false, fmt.Errorf("seek segment %q: %w", segPath, err)
 	}
 
 	var (
@@ -302,25 +322,25 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 
 	for budget.eventsRemaining > 0 {
 		if budget.bytesRemaining <= 0 && budget.framesProcessed > 0 {
-			return events, false, nil
+			return events, false, false, nil
 		}
 
 		remaining := fileSize - r.cursor.Offset
 		if remaining < MagicHeaderLen {
 			if isLatest {
-				return events, false, nil
+				return events, false, false, nil
 			}
 			if remaining > 0 {
 				r.corruptedFrames++
 			}
-			return events, true, nil
+			return events, true, false, nil
 		}
 
 		if _, err := io.ReadFull(f, header[:]); err != nil {
 			if isEOFError(err) {
-				return events, !isLatest, nil
+				return events, !isLatest, false, nil
 			}
-			return events, false, fmt.Errorf("read header in %q at %d: %w", segPath, r.cursor.Offset, err)
+			return events, false, false, fmt.Errorf("read header in %q at %d: %w", segPath, r.cursor.Offset, err)
 		}
 
 		payloadLen := binary.BigEndian.Uint32(header[0:4])
@@ -331,12 +351,12 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 			r.clearStallStateLocked()
 			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, isLatest, budget)
 			if recErr != nil {
-				return events, false, recErr
+				return events, false, false, recErr
 			}
 			if recovered {
 				continue
 			}
-			return events, doneSeg, nil
+			return events, doneSeg, false, nil
 		}
 
 		frameBytes := int64(MagicHeaderLen) + int64(payloadLen)
@@ -357,7 +377,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 				if r.stallCount >= r.partialStallPolls {
 					recovered, _, recErr := r.advanceRecoveryLocked(f, segID, fileSize, true, budget)
 					if recErr != nil {
-						return events, false, recErr
+						return events, false, false, recErr
 					}
 					if recovered {
 						r.corruptedFrames++
@@ -365,35 +385,35 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 						continue
 					}
 				}
-				return events, false, nil
+				return events, false, false, nil
 			}
 			r.corruptedFrames++
 			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, false, budget)
 			if recErr != nil {
-				return events, false, recErr
+				return events, false, false, recErr
 			}
 			if recovered {
 				continue
 			}
-			return events, doneSeg, nil
+			return events, doneSeg, false, nil
 		}
 
 		// Enforce per-batch byte budget before allocating payload, allowing the over-budget
 		// exception strictly before the first CRC-valid frame in the batch is processed.
 		if frameBytes > budget.bytesRemaining && budget.framesProcessed > 0 {
-			return events, false, nil
+			return events, false, false, nil
 		}
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(f, payload); err != nil {
 			if isEOFError(err) {
 				if isLatest {
-					return events, false, nil
+					return events, false, false, nil
 				}
 				r.corruptedFrames++
-				return events, true, nil
+				return events, true, false, nil
 			}
-			return events, false, fmt.Errorf("read payload in %q at %d: %w", segPath, r.cursor.Offset, err)
+			return events, false, false, fmt.Errorf("read payload in %q at %d: %w", segPath, r.cursor.Offset, err)
 		}
 
 		actualCRC := crc32.ChecksumIEEE(payload)
@@ -402,12 +422,12 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 			r.clearStallStateLocked()
 			recovered, doneSeg, recErr := r.advanceRecoveryLocked(f, segID, fileSize, isLatest, budget)
 			if recErr != nil {
-				return events, false, recErr
+				return events, false, false, recErr
 			}
 			if recovered {
 				continue
 			}
-			return events, doneSeg, nil
+			return events, doneSeg, false, nil
 		}
 
 		r.clearRecoveryStateLocked()
@@ -428,7 +448,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 		}
 	}
 
-	return events, r.cursor.Offset >= fileSize && !isLatest, nil
+	return events, r.cursor.Offset >= fileSize && !isLatest, false, nil
 }
 
 // advanceRecoveryLocked shares one batch-wide recovery scan budget across ReadBatch
@@ -441,6 +461,9 @@ func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int
 		r.recoveryScanSeg = segID
 		r.recoveryScanOffset = minStart
 		r.pendingCandidates = nil
+		r.discardedCandidateOffset = 0
+		r.discardedCandidateMinSize = 0
+		r.discardedCandidateLastSize = 0
 	} else if r.recoveryScanOffset < minStart {
 		r.recoveryScanOffset = minStart
 	}
@@ -494,12 +517,88 @@ func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int
 		r.pendingCandidates = remaining
 	}
 
+	// If earlier incomplete candidates were evicted at the 64-entry cap and the segment
+	// has grown enough for at least one discarded candidate to complete (and grew since our
+	// last rescan), run a bounded rescan across [discardedCandidateOffset .. recoveryScanOffset)
+	// without restarting on quiet polls.
+	if r.discardedCandidateOffset > 0 && fileSize >= r.discardedCandidateMinSize && fileSize > r.discardedCandidateLastSize {
+		if budget.recoveryRemaining <= 0 || (budget.recoveryChecksumRemaining <= 0 && budget.recoveryChecksumsRun > 0) {
+			return false, false, nil
+		}
+		rescanStart := max(r.discardedCandidateOffset, minStart)
+		rescanLimit := r.recoveryScanOffset
+		var (
+			nextDiscardedOffset  int64
+			nextDiscardedMinSize int64
+		)
+		trackNextDiscarded := func(c incompleteCandidate) {
+			if nextDiscardedOffset == 0 || c.offset < nextDiscardedOffset {
+				nextDiscardedOffset = c.offset
+			}
+			if nextDiscardedMinSize == 0 || c.needSize < nextDiscardedMinSize {
+				nextDiscardedMinSize = c.needSize
+			}
+		}
+		if rescanStart < rescanLimit {
+			nextOff, scannedTo, bytesScanned, found, checksumExhausted, rescanCands, rescanDropped, scanErr := findNextValidFrameBounded(f, rescanStart, rescanLimit, fileSize, isLatest, budget)
+			if scanErr != nil {
+				return false, false, scanErr
+			}
+			budget.recoveryRemaining -= bytesScanned
+			if budget.recoveryRemaining < 0 {
+				budget.recoveryRemaining = 0
+			}
+			if found {
+				r.clearRecoveryStateLocked()
+				r.cursor.Offset = nextOff
+				if _, seekErr := f.Seek(nextOff, io.SeekStart); seekErr != nil {
+					return false, false, seekErr
+				}
+				return true, false, nil
+			}
+			if isLatest {
+				for _, c := range rescanCands {
+					var dropped *incompleteCandidate
+					r.pendingCandidates, dropped = addIncompleteCandidate(r.pendingCandidates, c)
+					if dropped != nil {
+						trackNextDiscarded(*dropped)
+					}
+				}
+				if rescanDropped != nil {
+					trackNextDiscarded(*rescanDropped)
+				}
+			}
+			if scannedTo < rescanLimit || checksumExhausted {
+				// Partial rescan: advance checkpoint and continue on next poll without losing progress.
+				r.discardedCandidateOffset = scannedTo
+				if nextDiscardedOffset > 0 && nextDiscardedOffset < r.discardedCandidateOffset {
+					r.discardedCandidateOffset = nextDiscardedOffset
+				}
+				if nextDiscardedMinSize > 0 && nextDiscardedMinSize < r.discardedCandidateMinSize {
+					r.discardedCandidateMinSize = nextDiscardedMinSize
+				}
+				r.recoveryStalls++
+				return false, false, nil
+			}
+		}
+		// Finished rescanning up to recoveryScanOffset for this fileSize.
+		if isLatest && nextDiscardedOffset > 0 {
+			r.discardedCandidateOffset = nextDiscardedOffset
+			r.discardedCandidateMinSize = nextDiscardedMinSize
+			r.discardedCandidateLastSize = fileSize
+		} else {
+			r.discardedCandidateOffset = 0
+			r.discardedCandidateMinSize = 0
+			r.discardedCandidateLastSize = 0
+		}
+	}
+
 	if budget.recoveryRemaining <= 0 || (budget.recoveryChecksumRemaining <= 0 && budget.recoveryChecksumsRun > 0) {
 		return false, false, nil
 	}
 
 	scanStart := r.recoveryScanOffset
-	nextOff, scannedTo, bytesScanned, found, checksumExhausted, newCandidates, scanErr := findNextValidFrame(f, scanStart, fileSize, isLatest, budget)
+	nextOff, scannedTo, bytesScanned, found, checksumExhausted, newCandidates, scanDropped, scanErr := findNextValidFrameBounded(f, scanStart, fileSize-MagicHeaderLen, fileSize, isLatest, budget)
 	if scanErr != nil {
 		return false, false, scanErr
 	}
@@ -521,9 +620,16 @@ func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int
 	if scannedTo > r.recoveryScanOffset {
 		r.recoveryScanOffset = scannedTo
 	}
-	if isLatest && len(newCandidates) > 0 {
+	if isLatest {
 		for _, c := range newCandidates {
-			r.pendingCandidates = addIncompleteCandidate(r.pendingCandidates, c)
+			var dropped *incompleteCandidate
+			r.pendingCandidates, dropped = addIncompleteCandidate(r.pendingCandidates, c)
+			if dropped != nil {
+				r.recordDiscardedCandidateLocked(*dropped, fileSize)
+			}
+		}
+		if scanDropped != nil {
+			r.recordDiscardedCandidateLocked(*scanDropped, fileSize)
 		}
 	}
 
@@ -542,6 +648,16 @@ func (r *SegReader) advanceRecoveryLocked(f *os.File, segID uint64, fileSize int
 	}
 	r.recoveryStalls++
 	return false, false, nil
+}
+
+func (r *SegReader) recordDiscardedCandidateLocked(cand incompleteCandidate, fileSize int64) {
+	if r.discardedCandidateOffset == 0 || cand.offset < r.discardedCandidateOffset {
+		r.discardedCandidateOffset = cand.offset
+	}
+	if r.discardedCandidateMinSize == 0 || cand.needSize < r.discardedCandidateMinSize {
+		r.discardedCandidateMinSize = cand.needSize
+	}
+	r.discardedCandidateLastSize = fileSize
 }
 
 func verifyCandidateFrame(f *os.File, offset, fileSize int64) (valid bool, headerBytes int64, hashedBytes int64, err error) {
@@ -571,14 +687,15 @@ func verifyCandidateFrame(f *os.File, offset, fileSize int64) (valid bool, heade
 }
 
 // addIncompleteCandidate records an incomplete candidate in ascending offset order,
-// evicting the candidate with the largest required completion size if at capacity so
-// genuine short in-flight tail frames are not displaced by huge corrupt length headers.
-func addIncompleteCandidate(cands []incompleteCandidate, cand incompleteCandidate) []incompleteCandidate {
+// evicting the candidate with the largest required completion size if at capacity and
+// returning any evicted/discarded candidate so the caller can maintain a bounded rescan checkpoint.
+func addIncompleteCandidate(cands []incompleteCandidate, cand incompleteCandidate) ([]incompleteCandidate, *incompleteCandidate) {
 	for _, existing := range cands {
 		if existing.offset == cand.offset {
-			return cands
+			return cands, nil
 		}
 	}
+	var dropped *incompleteCandidate
 	if len(cands) >= maxPendingRecoveryCandidates {
 		worstIdx := -1
 		worstNeed := cand.needSize
@@ -589,35 +706,41 @@ func addIncompleteCandidate(cands []incompleteCandidate, cand incompleteCandidat
 			}
 		}
 		if worstIdx == -1 {
-			return cands
+			d := cand
+			return cands, &d
 		}
+		evicted := cands[worstIdx]
+		dropped = &evicted
 		cands[worstIdx] = cand
 	} else {
 		cands = append(cands, cand)
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].offset < cands[j].offset })
-	return cands
+	return cands, dropped
 }
 
-// findNextValidFrame scans forward up to budget.recoveryRemaining offsets from startOff
-// looking for the next byte offset whose 8-byte [len][crc32] header points to a complete
-// payload within fileSize passing IEEE CRC32. Checksum payload bytes are budgeted
-// separately via budget.recoveryChecksumRemaining (permitting one candidate to exceed
-// budget when recoveryChecksumsRun == 0 so progress is guaranteed).
-func findNextValidFrame(f *os.File, startOff, fileSize int64, isLatest bool, budget *batchBudget) (foundOff int64, nextScanOff int64, bytesScanned int64, found bool, checksumExhausted bool, incomplete []incompleteCandidate, err error) {
+// findNextValidFrameBounded scans forward from startOff up to min(endOffExclusive-1, startOff+budget.recoveryRemaining-1)
+// looking for the next byte offset whose 8-byte [len][crc32] header points to a complete payload within
+// fileSize passing IEEE CRC32. Checksum payload bytes are budgeted separately via budget.recoveryChecksumRemaining.
+func findNextValidFrameBounded(f *os.File, startOff, endOffExclusive, fileSize int64, isLatest bool, budget *batchBudget) (foundOff int64, nextScanOff int64, bytesScanned int64, found bool, checksumExhausted bool, incomplete []incompleteCandidate, discarded *incompleteCandidate, err error) {
 	maxScan := budget.recoveryRemaining
-	if maxScan <= 0 || startOff+MagicHeaderLen >= fileSize {
-		return 0, startOff, 0, false, false, nil, nil
+	maxValidEnd := fileSize - MagicHeaderLen
+	if endOffExclusive > maxValidEnd {
+		endOffExclusive = maxValidEnd
 	}
-	limit := min(fileSize-MagicHeaderLen-1, startOff+maxScan-1)
+	if maxScan <= 0 || startOff >= endOffExclusive {
+		return 0, startOff, 0, false, false, nil, nil, nil
+	}
+	limit := min(endOffExclusive-1, startOff+maxScan-1)
 	if limit < startOff {
-		return 0, startOff, 0, false, false, nil, nil
+		return 0, startOff, 0, false, false, nil, nil, nil
 	}
-	scanWindowSize := int(min(fileSize-startOff, maxScan+MaxFrameBytes+MagicHeaderLen))
+	scanSpan := (limit - startOff) + 1
+	scanWindowSize := int(min(fileSize-startOff, scanSpan+MaxFrameBytes+MagicHeaderLen))
 	buf := make([]byte, scanWindowSize)
 	n, readErr := f.ReadAt(buf, startOff)
 	if readErr != nil && !isEOFError(readErr) {
-		return 0, startOff, 0, false, false, nil, fmt.Errorf("scan recovery window at %d: %w", startOff, readErr)
+		return 0, startOff, 0, false, false, nil, nil, fmt.Errorf("scan recovery window at %d: %w", startOff, readErr)
 	}
 	buf = buf[:n]
 
@@ -626,7 +749,7 @@ func findNextValidFrame(f *os.File, startOff, fileSize int64, isLatest bool, bud
 		maxRel = len(buf) - MagicHeaderLen - 1
 	}
 	if maxRel < 0 {
-		return 0, startOff, 0, false, false, nil, nil
+		return 0, startOff, 0, false, false, nil, nil, nil
 	}
 
 	for rel := 0; rel <= maxRel; rel++ {
@@ -637,17 +760,27 @@ func findNextValidFrame(f *os.File, startOff, fileSize int64, isLatest bool, bud
 		end := rel + MagicHeaderLen + int(pLen)
 		if end > len(buf) {
 			if isLatest && startOff+int64(end) > fileSize {
-				incomplete = addIncompleteCandidate(incomplete, incompleteCandidate{
+				var dropped *incompleteCandidate
+				incomplete, dropped = addIncompleteCandidate(incomplete, incompleteCandidate{
 					offset:   startOff + int64(rel),
 					needSize: startOff + int64(end),
 				})
+				if dropped != nil {
+					if discarded == nil || dropped.offset < discarded.offset {
+						d := *dropped
+						discarded = &d
+					}
+					if dropped.needSize < discarded.needSize {
+						discarded.needSize = dropped.needSize
+					}
+				}
 			}
 			continue
 		}
 		payloadBytes := int64(pLen)
 		if payloadBytes > budget.recoveryChecksumRemaining && budget.recoveryChecksumsRun > 0 {
 			// Pause before hashing this candidate so the next poll resumes right here.
-			return 0, startOff + int64(rel), int64(rel), false, true, incomplete, nil
+			return 0, startOff + int64(rel), int64(rel), false, true, incomplete, discarded, nil
 		}
 		budget.recoveryChecksumsRun++
 		budget.recoveryChecksumRemaining -= payloadBytes
@@ -656,19 +789,19 @@ func findNextValidFrame(f *os.File, startOff, fileSize int64, isLatest bool, bud
 		}
 		wantCRC := binary.BigEndian.Uint32(buf[rel+4 : rel+8])
 		if crc32.ChecksumIEEE(buf[rel+MagicHeaderLen:end]) == wantCRC {
-			return startOff + int64(rel), startOff + int64(rel), int64(rel) + 1, true, false, nil, nil
+			return startOff + int64(rel), startOff + int64(rel), int64(rel) + 1, true, false, nil, nil, nil
 		}
 	}
 
 	scanned := int64(maxRel) + 1
 	nextOff := startOff + scanned
-	if nextOff > fileSize-MagicHeaderLen {
-		nextOff = fileSize - MagicHeaderLen
+	if nextOff > endOffExclusive {
+		nextOff = endOffExclusive
 	}
 	if nextOff < startOff {
 		nextOff = startOff
 	}
-	return 0, nextOff, scanned, false, false, incomplete, nil
+	return 0, nextOff, scanned, false, false, incomplete, discarded, nil
 }
 
 func isEOFError(err error) bool {
@@ -765,7 +898,11 @@ func listSegmentIDs(dir string) ([]uint64, error) {
 		}
 		base := strings.TrimSuffix(entry.Name(), ".seg")
 		if id, err := strconv.ParseUint(base, 10, 64); err == nil {
-			ids = append(ids, id)
+			// Accept only canonical zero-padded names matching segmentPath so stray files
+			// like "2.seg" cannot falsely seal an active segment or stall rotation.
+			if entry.Name() == fmt.Sprintf("%08d.seg", id) {
+				ids = append(ids, id)
+			}
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })

@@ -64,6 +64,13 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	if err != nil || ev.Message != " nilvalue msg " {
 		t.Fatalf("RFC 5424 NILVALUE SD failed to preserve MSG whitespace: got %q err=%v", ev.Message, err)
 	}
+	// RFC 5424 with 255-byte hostname under maxLineLen=256 must still preserve APP-NAME=sentinel
+	longHost := strings.Repeat("h", 255)
+	longRFC5424 := []byte("<35>1 2026-11-24T10:00:00Z " + longHost + " sentinel 42 - - alert payload")
+	ev, err = ParseRawLog(43, longRFC5424, 256, "genesis")
+	if err != nil || ev.Service != "sentinel" || ev.Message != "alert payload" {
+		t.Fatalf("RFC 5424 long hostname under maxLineLen=256 lost APP-NAME=sentinel: ev=%+v err=%v", ev, err)
+	}
 
 	// 5. Syslog RFC 3164 (including IPv6 hostname with colons, space-delimited tag, PID tag, and '(' delimiter)
 	ev, err = ParseRawLog(5, []byte(`<36>Nov 24 10:00:00 macbook sudo[991]: user dev : command not allowed`), 0, "genesis")
@@ -94,6 +101,11 @@ func TestParseRawLogAllFormatsAndEdgeCases(t *testing.T) {
 	ev, err = ParseRawLog(522, []byte(`<36>Nov 24 10:00:00 host1 sentinel(alert)`), 0, "genesis")
 	if err != nil || ev.Service != "sentinel" || ev.Message != "(alert)" {
 		t.Fatalf("RFC 3164 '(' content delimiter lost service=sentinel: ev=%+v err=%v", ev, err)
+	}
+	// Bracketed non-numeric CONTENT starting with '[' must NOT be stripped as a PID
+	ev, err = ParseRawLog(524, []byte(`<36>Nov 24 10:00:00 host1 sshd[notice: failed]`), 0, "genesis")
+	if err != nil || ev.Service != "sshd" || ev.Message != "[notice: failed]" {
+		t.Fatalf("RFC 3164 bracketed CONTENT mangled as PID: ev=%+v err=%v", ev, err)
 	}
 	// Whitespace-only input must return ErrEmptyInput instead of plain-text INFO event
 	if _, err := ParseRawLog(523, []byte("    \t   "), 0, "genesis"); !errors.Is(err, ErrEmptyInput) {
@@ -632,5 +644,100 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 	}
 	if len(recovered) != 1 || recovered[0].Message != "recovered-after-checksum-budget" {
 		t.Fatalf("expected recovery after checksum-budget pause, got %+v", recovered)
+	}
+
+	// 5. Stray non-canonical segment names (e.g. "2.seg") are ignored so active 00000001.seg keeps tailing.
+	segDir5 := t.TempDir()
+	seg5 := filepath.Join(segDir5, "00000001.seg")
+	_ = os.WriteFile(filepath.Join(segDir5, "2.seg"), []byte("stray"), 0600)
+	f5, _ := os.Create(seg5)
+	_ = WriteSegmentFrame(f5, []byte(`{"timestamp":800,"service":"api","level":"INFO","message":"before-append"}`))
+	_ = f5.Close()
+	r5, _ := NewSegReader(segDir5, filepath.Join(t.TempDir(), "c5.json"), 0)
+	if b, err := r5.ReadBatch(10); err != nil || len(b) != 1 {
+		t.Fatalf("seg5 initial read: len=%d err=%v", len(b), err)
+	}
+	f5a, _ := os.OpenFile(seg5, os.O_APPEND|os.O_WRONLY, 0600)
+	_ = WriteSegmentFrame(f5a, []byte(`{"timestamp":801,"service":"api","level":"INFO","message":"after-append-with-stray-2seg"}`))
+	_ = f5a.Close()
+	if b, err := r5.ReadBatch(10); err != nil || len(b) != 1 || b[0].Message != "after-append-with-stray-2seg" {
+		t.Fatalf("stray 2.seg interfered with active 00000001.seg tailing: got %+v err=%v", b, err)
+	}
+
+	// 6. Burn replacement when cursor is on segment 2 and both segments 1 and 2 are recreated rewinds to segment 1.
+	segDir6 := t.TempDir()
+	cursor6 := filepath.Join(t.TempDir(), "c6.json")
+	f61, _ := os.Create(filepath.Join(segDir6, "00000001.seg"))
+	_ = WriteSegmentFrame(f61, []byte(`{"timestamp":900,"service":"api","level":"INFO","message":"old-seg1"}`))
+	_ = f61.Close()
+	f62, _ := os.Create(filepath.Join(segDir6, "00000002.seg"))
+	_ = WriteSegmentFrame(f62, []byte(`{"timestamp":901,"service":"api","level":"INFO","message":"old-seg2"}`))
+	_ = f62.Close()
+
+	r6, _ := NewSegReader(segDir6, cursor6, 0)
+	if b, err := r6.ReadBatch(10); err != nil || len(b) != 2 {
+		t.Fatalf("seg6 initial read: len=%d err=%v", len(b), err)
+	}
+	_ = r6.SaveCursor()
+
+	// Recreate both 00000001.seg and 00000002.seg with brand-new content (simulating `genesis burn` + rapid rotation)
+	_ = os.Remove(filepath.Join(segDir6, "00000001.seg"))
+	_ = os.Remove(filepath.Join(segDir6, "00000002.seg"))
+	f61New, _ := os.Create(filepath.Join(segDir6, "00000001.seg"))
+	_ = WriteSegmentFrame(f61New, []byte(`{"timestamp":950,"service":"api","level":"INFO","message":"new-seg1-after-burn"}`))
+	_ = f61New.Close()
+	f62New, _ := os.Create(filepath.Join(segDir6, "00000002.seg"))
+	_ = WriteSegmentFrame(f62New, []byte(`{"timestamp":951,"service":"api","level":"INFO","message":"new-seg2-after-burn-with-extra-padding-to-exceed-old-offset"}`))
+	_ = f62New.Close()
+
+	r6Resume, _ := NewSegReader(segDir6, cursor6, 0)
+	bRewind, err := r6Resume.ReadBatch(10)
+	if err != nil || len(bRewind) != 2 || bRewind[0].Message != "new-seg1-after-burn" || !strings.HasPrefix(bRewind[1].Message, "new-seg2-after-burn") {
+		t.Fatalf("burn replacement on seg2 failed to rewind to new seg1: got %+v err=%v", bRewind, err)
+	}
+
+	// 7. Discarded incomplete candidate checkpoint revisits dropped genuine in-flight frame after growth.
+	segDir7 := t.TempDir()
+	seg7 := filepath.Join(segDir7, "00000001.seg")
+	var raw7 bytes.Buffer
+	// 8 bytes corrupt header at offset 0 (payloadLen = 0)
+	raw7.Write(make([]byte, 8))
+	// 70 fake incomplete headers (> maxPendingRecoveryCandidates=64) each needing just 10 bytes past current cut
+	const fakeIncompleteCount = 70
+	for i := 0; i < fakeIncompleteCount; i++ {
+		var hdr [8]byte
+		// Place each at offset 8 + i*8; total prefix before genuine frame = 8 + 70*8 = 568.
+		// Choose pLen so needSize is small (just past initialCut = 600).
+		needLen := uint32(610 - (8 + i*8) - 8)
+		binary.BigEndian.PutUint32(hdr[0:4], needLen)
+		binary.BigEndian.PutUint32(hdr[4:8], 0xabcdef01)
+		raw7.Write(hdr[:])
+	}
+	// Genuine frame starts at offset 568 with a 200-byte payload (needSize = 776, larger than all 70 fake needSizes!)
+	var genuine7 bytes.Buffer
+	_ = WriteSegmentFrame(&genuine7, []byte(`{"timestamp":999,"service":"sshd","level":"ERROR","message":"`+strings.Repeat("G", 140)+`"}`))
+	full7 := append(raw7.Bytes(), genuine7.Bytes()...)
+	initialCut := 600
+	if err := os.WriteFile(seg7, full7[:initialCut], 0600); err != nil {
+		t.Fatalf("write partial seg7: %v", err)
+	}
+	r7, _ := NewSegReader(segDir7, filepath.Join(t.TempDir(), "c7.json"), 0)
+	if evs, err := r7.ReadBatch(10); err != nil || len(evs) != 0 {
+		t.Fatalf("seg7 poll 1: len=%d err=%v", len(evs), err)
+	}
+	// Now complete the append so fileSize reaches len(full7) >= 776
+	if err := os.WriteFile(seg7, full7, 0600); err != nil {
+		t.Fatalf("write full seg7: %v", err)
+	}
+	var recovered7 []model.LogEvent
+	for attempt := 0; attempt < 5 && len(recovered7) == 0; attempt++ {
+		b, readErr := r7.ReadBatch(10)
+		if readErr != nil {
+			t.Fatalf("seg7 recovery poll %d: %v", attempt, readErr)
+		}
+		recovered7 = append(recovered7, b...)
+	}
+	if len(recovered7) != 1 || recovered7[0].Service != "sshd" {
+		t.Fatalf("discarded genuine in-flight frame was missed after growth: got %+v", recovered7)
 	}
 }

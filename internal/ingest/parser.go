@@ -87,7 +87,28 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// Bound remaining non-JSON/non-pipe lines safely before format parsing.
+	// 3. Syslog RFC 5424: parse structured header BEFORE maxLineLen truncation so a long
+	// hostname cannot truncate APP-NAME (e.g. service=sentinel) and relabel the record as plain text.
+	if raw[0] == '<' {
+		idxClose := bytes.IndexByte(raw, '>')
+		if idxClose > 1 && idxClose <= 5 {
+			if pri, err := strconv.Atoi(string(raw[1:idxClose])); err == nil && pri >= 0 {
+				rest := bytes.TrimLeft(raw[idxClose+1:], " \t")
+				if bytes.HasPrefix(rest, []byte("1 ")) {
+					level := syslogSeverityMap[pri&7]
+					ev, rfcErr := parseSyslogRFC5424Bounded(id, rest[2:], level, defaultService, len(raw), maxLineLen)
+					if rfcErr == nil {
+						return ev, nil
+					}
+					if errors.Is(rfcErr, ErrOversizedLine) || len(raw) > maxLineLen {
+						return model.LogEvent{}, fmt.Errorf("%w: malformed or oversized RFC 5424 record (%d bytes)", ErrOversizedLine, len(raw))
+					}
+				}
+			}
+		}
+	}
+
+	// Bound remaining non-JSON/non-pipe/non-RFC5424 lines safely before format parsing.
 	if len(raw) > maxLineLen {
 		raw = truncateUTF8Bytes(raw, maxLineLen)
 		if len(bytes.TrimSpace(raw)) == 0 {
@@ -95,7 +116,7 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// 3. Syslog RFC 5424 / 3164
+	// 4. Syslog RFC 3164 (and short/fallback syslog)
 	if raw[0] == '<' {
 		idxClose := bytes.IndexByte(raw, '>')
 		if idxClose > 1 && idxClose <= 5 {
@@ -103,7 +124,7 @@ func ParseRawLog(id uint64, raw []byte, maxLineLen int, defaultService string) (
 		}
 	}
 
-	// 4. Plain text fallback (preserves original untrimmed whitespace)
+	// 5. Plain text fallback (preserves original untrimmed whitespace)
 	return parsePlainText(id, raw, defaultService), nil
 }
 
@@ -390,14 +411,31 @@ func parseSyslog(id uint64, raw []byte, idxClose int, defaultService string) mod
 	return parseSyslogRFC3164(id, bytes.TrimSpace(rest), level, defaultService, len(raw))
 }
 
-func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
+func parseSyslogRFC5424Bounded(id uint64, rest []byte, level, defaultService string, rawLen, maxLineLen int) (model.LogEvent, error) {
+	const (
+		maxRFC5424TimestampBytes = 64
+		maxRFC5424HostnameBytes  = 1024
+		maxRFC5424AppNameBytes   = 256
+		maxRFC5424ProcIDBytes    = 256
+		maxRFC5424MsgIDBytes     = 256
+	)
 	parts := strings.SplitN(string(rest), " ", 6)
 	if len(parts) < 6 {
+		if rawLen > maxLineLen {
+			return model.LogEvent{}, ErrOversizedLine
+		}
 		ev := parsePlainText(id, rest, defaultService)
 		ev.Level = level
-		return ev
+		return ev, nil
 	}
-	tsStr, appName, msgID, msg := parts[0], parts[2], parts[4], parts[5]
+	tsStr, hostname, appName, procID, msgID, msg := parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+	if len(tsStr) > maxRFC5424TimestampBytes ||
+		len(hostname) > maxRFC5424HostnameBytes ||
+		len(appName) > maxRFC5424AppNameBytes ||
+		len(procID) > maxRFC5424ProcIDBytes ||
+		len(msgID) > maxRFC5424MsgIDBytes {
+		return model.LogEvent{}, ErrOversizedLine
+	}
 
 	var ts int64
 	if t, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
@@ -408,15 +446,20 @@ func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, ra
 		ts = time.Now().Unix()
 	}
 
-	service := appName
+	service := strings.Clone(appName)
 	if service == "-" || service == "" {
 		service = defaultService
 	}
-	traceID := msgID
+	traceID := strings.Clone(msgID)
 	if traceID == "-" {
 		traceID = ""
 	}
 	msg = stripRFC5424StructuredData(msg)
+	if len(msg) > maxLineLen {
+		msg = truncateUTF8String(msg, maxLineLen)
+	} else {
+		msg = strings.Clone(msg)
+	}
 
 	return model.LogEvent{
 		ID:        id,
@@ -426,7 +469,17 @@ func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, ra
 		TraceID:   traceID,
 		Message:   msg,
 		SizeBytes: rawLen,
+	}, nil
+}
+
+func parseSyslogRFC5424(id uint64, rest []byte, level, defaultService string, rawLen int) model.LogEvent {
+	ev, err := parseSyslogRFC5424Bounded(id, rest, level, defaultService, rawLen, DefaultMaxLineLength)
+	if err != nil {
+		fallback := parsePlainText(id, rest, defaultService)
+		fallback.Level = level
+		return fallback
 	}
+	return ev
 }
 
 // stripRFC5424StructuredData consumes either NILVALUE ("-") or all adjacent
@@ -599,11 +652,19 @@ func hasRFC3164ContentDelimiter(word string) bool {
 	return delimIdx > 0 && delimIdx < len(word) && isValidSyslogTag(word[:delimIdx])
 }
 
+// stripPIDBracket strips a trailing bracketed numeric "[PID]" suffix from rawTag.
+// Bracketed non-numeric CONTENT (such as "sshd[notice" in "sshd[notice: failed]")
+// is left intact so RFC 3164 CONTENT starting with '[' is never mangled.
 func stripPIDBracket(rawTag string) string {
-	if idx := strings.IndexByte(rawTag, '['); idx > 0 {
-		return rawTag[:idx]
+	idx := strings.IndexByte(rawTag, '[')
+	if idx <= 0 || !strings.HasSuffix(rawTag, "]") {
+		return rawTag
 	}
-	return rawTag
+	pid := rawTag[idx+1 : len(rawTag)-1]
+	if len(pid) == 0 || !isAllDigits([]byte(pid)) {
+		return rawTag
+	}
+	return rawTag[:idx]
 }
 
 // isPIDTaggedSyslogWord reports whether word is a hostname-free RFC 3164 TAG with a

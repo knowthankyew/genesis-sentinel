@@ -90,13 +90,20 @@ func NewDrainMiner(maxClusters int, similarityThreshold float64) *DrainMiner {
 	}
 }
 
-// SetMaxClusterBytes overrides the cluster string-byte cap (primarily for testing).
-func (m *DrainMiner) SetMaxClusterBytes(n int) {
+// SetMaxClusterBytes overrides the cluster string-byte cap. Returns an error if n <= 0
+// or n is below the currently retained ClusterBytes() so the active tree never violates
+// its configured cap (call Reset() first to shrink below current usage).
+func (m *DrainMiner) SetMaxClusterBytes(n int) error {
 	m.mu.Lock()
-	if n > 0 {
-		m.maxClusterBytes = n
+	defer m.mu.Unlock()
+	if n <= 0 {
+		return fmt.Errorf("max cluster bytes must be positive, got %d", n)
 	}
-	m.mu.Unlock()
+	if n < m.clusterBytes {
+		return fmt.Errorf("cannot set max cluster bytes to %d below current usage %d (reset miner first)", n, m.clusterBytes)
+	}
+	m.maxClusterBytes = n
+	return nil
 }
 
 // ClusterBytes reports total retained string bytes inside learned Drain clusters and tree keys.
@@ -106,23 +113,37 @@ func (m *DrainMiner) ClusterBytes() int {
 	return m.clusterBytes
 }
 
-// ExtractTemplate normalizes msg into masked tokens, merges it into the Drain prefix
+// extractBoundedTokens iterates msg lazily via Go 1.24 strings.FieldsSeq, masking only
+// up to maxTokens fields and inspecting at most one additional field to append "<*>"
+// when more tokens exist, avoiding large temporary slices on multi-thousand-token lines.
+func extractBoundedTokens(msg string, maxTokens, maxTokenBytes int) []string {
+	var tokens []string
+	for rawTok := range strings.FieldsSeq(msg) {
+		if len(tokens) >= maxTokens {
+			tokens = append(tokens, "<*>")
+			break
+		}
+		if tokens == nil {
+			tokens = make([]string, 0, 16)
+		}
+		tok := maskToken(rawTok)
+		if len(tok) > maxTokenBytes {
+			tok = "<*>"
+		}
+		tokens = append(tokens, tok)
+	}
+	return tokens
+}
+
+// ExtractTemplate normalizes msg into bounded masked tokens, merges it into the Drain prefix
 // tree for (service, level), and returns (stableTemplateID, templateString, overflowed).
 // Retained cluster tokens and tree keys are detached via strings.Clone and capped by
 // maxClusters and maxClusterBytes so giant log lines cannot pin backing arrays after Flush.
 func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string, bool) {
-	tokens := NormalizeTokens(msg)
+	tokens := extractBoundedTokens(msg, maxClusterTokens, maxClusterTokenBytes)
 	if len(tokens) == 0 {
 		tmpl := "<EMPTY>"
 		return TemplateHash(service, level, tmpl), tmpl, false
-	}
-	if len(tokens) > maxClusterTokens {
-		tokens = append(tokens[:maxClusterTokens], "<*>")
-	}
-	for i, tok := range tokens {
-		if len(tok) > maxClusterTokenBytes {
-			tokens[i] = "<*>"
-		}
 	}
 
 	rootKey := drainRootKey{
@@ -377,8 +398,8 @@ func (a *Aggregator) SetSampleByteLimits(maxTotal, maxPerWindow, maxSingle int) 
 }
 
 // SetMaxClusterBytes overrides the underlying DrainMiner's cluster string-byte cap.
-func (a *Aggregator) SetMaxClusterBytes(n int) {
-	a.miner.SetMaxClusterBytes(n)
+func (a *Aggregator) SetMaxClusterBytes(n int) error {
+	return a.miner.SetMaxClusterBytes(n)
 }
 
 // RetainedSampleBytes returns the total preview sample bytes currently retained in active windows.
@@ -468,15 +489,16 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 			}
 		}
 		a.windows[tmplID] = &model.TemplateWindow{
-			TemplateID:    tmplID,
-			Template:      tmpl,
-			Service:       svc,
-			Level:         lvl,
-			Count:         1,
-			FirstSeenUnix: ev.Timestamp,
-			LastSeenUnix:  ev.Timestamp,
-			SampleLine:    retainedSample,
-			SampleEntropy: ent,
+			TemplateID:      tmplID,
+			Template:        tmpl,
+			Service:         svc,
+			Level:           lvl,
+			Count:           1,
+			FirstSeenUnix:   ev.Timestamp,
+			LastSeenUnix:    ev.Timestamp,
+			SampleLine:      retainedSample,
+			SampleTruncated: len(retainedSample) < len(ev.Message),
+			SampleEntropy:   ent,
 		}
 		a.windowBytes[tmplID] = len(retainedSample)
 		a.totalSampleBytes += len(retainedSample)
@@ -501,6 +523,8 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 	// preview cache (up to maxAdditionalSamples) in AdditionalSamples. Deterministic
 	// Tier 0 rule coverage evaluates each full event at ingest time rather than relying on this cache.
 	prevSample := w.SampleLine
+	prevTruncated := w.SampleTruncated
+	sampleTruncated := len(sample) < len(ev.Message)
 	if ent > w.SampleEntropy {
 		w.SampleEntropy = ent
 		// If the incoming preview already exists in AdditionalSamples, remove it first so
@@ -524,11 +548,16 @@ func (a *Aggregator) AddWithEntropy(ev model.LogEvent, ent float64) (string, boo
 		a.windowBytes[tmplID] += delta
 		a.totalSampleBytes += delta
 		w.SampleLine = newPrimary
+		w.SampleTruncated = len(newPrimary) < len(ev.Message)
 		if prevSample != "" && prevSample != newPrimary {
-			a.addEvidenceSampleLocked(tmplID, w, prevSample)
+			a.addEvidenceSampleLocked(tmplID, w, prevSample, prevTruncated)
+		}
+	} else if sample != "" && sample == w.SampleLine {
+		if w.SampleTruncated && !sampleTruncated {
+			w.SampleTruncated = false
 		}
 	} else if sample != "" && sample != w.SampleLine {
-		a.addEvidenceSampleLocked(tmplID, w, sample)
+		a.addEvidenceSampleLocked(tmplID, w, sample, sampleTruncated)
 	}
 	return tmplID, overflowed, ent
 }
@@ -540,6 +569,9 @@ func (a *Aggregator) removeEvidenceSampleLocked(tmplID string, w *model.Template
 	for i, existing := range w.AdditionalSamples {
 		if existing == target {
 			w.AdditionalSamples = append(w.AdditionalSamples[:i], w.AdditionalSamples[i+1:]...)
+			if i < len(w.AdditionalSamplesTruncated) {
+				w.AdditionalSamplesTruncated = append(w.AdditionalSamplesTruncated[:i], w.AdditionalSamplesTruncated[i+1:]...)
+			}
 			a.windowBytes[tmplID] -= len(existing)
 			a.totalSampleBytes -= len(existing)
 			return
@@ -547,12 +579,16 @@ func (a *Aggregator) removeEvidenceSampleLocked(tmplID string, w *model.Template
 	}
 }
 
-func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, sample string) {
+func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWindow, sample string, truncated bool) {
 	if sample == "" || sample == w.SampleLine {
 		return
 	}
-	for _, existing := range w.AdditionalSamples {
+	for i, existing := range w.AdditionalSamples {
 		if existing == sample {
+			// If an earlier clipped preview matches a complete message, upgrade it to complete.
+			if i < len(w.AdditionalSamplesTruncated) && w.AdditionalSamplesTruncated[i] && !truncated {
+				w.AdditionalSamplesTruncated[i] = false
+			}
 			return
 		}
 	}
@@ -560,6 +596,7 @@ func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWin
 	totRoom := a.maxTotalSampleBytes - a.totalSampleBytes
 	if len(w.AdditionalSamples) < maxAdditionalSamples && len(sample) <= winRoom && len(sample) <= totRoom {
 		w.AdditionalSamples = append(w.AdditionalSamples, sample)
+		w.AdditionalSamplesTruncated = append(w.AdditionalSamplesTruncated, truncated)
 		a.windowBytes[tmplID] += len(sample)
 		a.totalSampleBytes += len(sample)
 		return
@@ -571,6 +608,9 @@ func (a *Aggregator) addEvidenceSampleLocked(tmplID string, w *model.TemplateWin
 				delta := len(sample) - len(existing)
 				if delta <= winRoom && delta <= totRoom {
 					w.AdditionalSamples[i] = sample
+					if i < len(w.AdditionalSamplesTruncated) {
+						w.AdditionalSamplesTruncated[i] = truncated
+					}
 					a.windowBytes[tmplID] += delta
 					a.totalSampleBytes += delta
 					return
@@ -634,6 +674,9 @@ func (a *Aggregator) Flush() []model.TemplateWindow {
 		copied := *w
 		if len(w.AdditionalSamples) > 0 {
 			copied.AdditionalSamples = append([]string(nil), w.AdditionalSamples...)
+		}
+		if len(w.AdditionalSamplesTruncated) > 0 {
+			copied.AdditionalSamplesTruncated = append([]bool(nil), w.AdditionalSamplesTruncated...)
 		}
 		out = append(out, copied)
 	}
@@ -963,13 +1006,13 @@ func ShannonEntropy(s string) float64 {
 // scored at their enclosing field boundary.
 func PeakShannonEntropy(msg string) float64 {
 	peak := ShannonEntropy(msg)
-	for _, field := range strings.Fields(msg) {
+	for field := range strings.FieldsSeq(msg) {
 		if len(field) >= minEntropyTokenLen {
 			if e := ShannonEntropy(field); e > peak {
 				peak = e
 			}
 			if strings.ContainsRune(field, '.') {
-				for _, label := range strings.Split(field, ".") {
+				for label := range strings.SplitSeq(field, ".") {
 					if len(label) >= minEntropyTokenLen {
 						if e := ShannonEntropy(label); e > peak {
 							peak = e

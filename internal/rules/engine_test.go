@@ -408,4 +408,100 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 	if !foundExactNoPreview {
 		t.Fatalf("expected EvaluateWithMatchCounts to fire SENT-001 from exact count even without preview, got %+v", noPreviewExact.RuleHits)
 	}
+
+	// Reject reserved built-in rule ID SENT-006 in custom rule packs
+	_, reservedErr := NewEngine(RulePack{
+		Version: "1.0",
+		Rules: []Rule{
+			{ID: "SENT-006", Category: "custom", Severity: "LOW", Pattern: "foo", Enabled: true},
+		},
+	})
+	if reservedErr == nil {
+		t.Fatal("expected NewEngine to reject reserved rule ID SENT-006")
+	}
+
+	// Exact counts fire SENT-008 even on a <MIXED> global overflow window
+	mixedOvExact := defEng.EvaluateWithMatchCounts(model.TemplateWindow{
+		Service:  "<MIXED>",
+		Level:    "<MIXED>",
+		Count:    25,
+		Template: "<OVERFLOW>",
+	}, map[string]uint64{"SENT-008": 25}, 1024)
+	foundSent008Mixed := false
+	for _, h := range mixedOvExact.RuleHits {
+		if h.RuleID == "SENT-008" {
+			foundSent008Mixed = true
+		}
+	}
+	if !foundSent008Mixed {
+		t.Fatalf("expected EvaluateWithMatchCounts to fire SENT-008 on <MIXED> overflow window from exact count, got %+v", mixedOvExact.RuleHits)
+	}
+
+	// Suppressed preview sample must NOT discard exact matchCounts for unsuppressed events
+	supExact := supEng.EvaluateWithMatchCounts(model.TemplateWindow{
+		Service:    "sshd",
+		Level:      "ERROR",
+		Count:      6,
+		Template:   "auth event <*>",
+		SampleLine: "heartbeat ok",
+	}, map[string]uint64{"SENT-001": 5}, 1024)
+	foundSent001Sup := false
+	for _, h := range supExact.RuleHits {
+		if h.RuleID == "SENT-001" {
+			foundSent001Sup = true
+		}
+	}
+	if supExact.Suppressed || !foundSent001Sup {
+		t.Fatalf("suppressed preview wrongly discarded exact matchCounts SENT-001=5: %+v", supExact)
+	}
+
+	// Standalone Evaluate must NOT extrapolate w.Count through an applicable message-pattern suppression
+	unobsSup := supEng.Evaluate(model.TemplateWindow{
+		Service:    "api",
+		Level:      "ERROR",
+		Count:      25,
+		Template:   "worker status <*>",
+		SampleLine: "worker status failed",
+	}, 1024)
+	for _, h := range unobsSup.RuleHits {
+		if h.RuleID == "SENT-008" {
+			t.Fatalf("SENT-008 extrapolated w.Count across unobserved events despite applicable pattern suppression: %+v", unobsSup.RuleHits)
+		}
+	}
+
+	// Clipped preview sample must NOT trigger an anchored regex rule in standalone Evaluate
+	anchorEng, err := NewEngine(RulePack{
+		Version: "1.0",
+		Rules: []Rule{{
+			ID:       "ANCHOR-1",
+			Category: "anchored",
+			Severity: "LOW",
+			Pattern:  `^status ok$`,
+			MinCount: 1,
+			Enabled:  true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine anchorEng: %v", err)
+	}
+	resClipped := anchorEng.Evaluate(model.TemplateWindow{
+		Service:         "api",
+		Level:           "INFO",
+		Count:           1,
+		SampleLine:      "status ok",
+		SampleTruncated: true,
+	}, 1024)
+	if len(resClipped.RuleHits) != 0 {
+		t.Fatalf("clipped preview falsely fired anchored regex ^status ok$: %+v", resClipped.RuleHits)
+	}
+	resComplete := anchorEng.Evaluate(model.TemplateWindow{
+		Service:         "api",
+		Level:           "INFO",
+		Count:           1,
+		SampleLine:      "status ok",
+		SampleTruncated: false,
+	}, 1024)
+	if len(resComplete.RuleHits) != 1 || resComplete.RuleHits[0].RuleID != "ANCHOR-1" {
+		t.Fatalf("expected complete preview to fire ANCHOR-1, got %+v", resComplete.RuleHits)
+	}
 }

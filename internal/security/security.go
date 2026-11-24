@@ -141,15 +141,7 @@ func DialLoopbackContext(ctx context.Context, network, addr string) (net.Conn, e
 		case "tcp6", "udp6":
 			return dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
 		default:
-			conn, err4 := dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
-			if err4 == nil || ctx.Err() != nil {
-				return conn, err4
-			}
-			conn6, err6 := dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
-			if err6 == nil {
-				return conn6, nil
-			}
-			return nil, fmt.Errorf("security: loopback dial localhost:%s failed (ipv4: %v; ipv6: %v)", port, err4, err6)
+			return dialLocalhostDualStack(ctx, dialer, network, port)
 		}
 	}
 	ip := net.ParseIP(host)
@@ -157,6 +149,93 @@ func DialLoopbackContext(ctx context.Context, network, addr string) (net.Conn, e
 		return nil, fmt.Errorf("security: refusing non-loopback dial target %q", addr)
 	}
 	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+}
+
+// dialLocalhostDualStack attempts 127.0.0.1 first and staggers ::1 after 150ms (or immediately
+// on IPv4 error) so a stalled/filtered IPv4 loopback dial cannot consume the caller's request
+// timeout before IPv6 loopback is tried.
+func dialLocalhostDualStack(ctx context.Context, dialer *net.Dialer, network, port string) (net.Conn, error) {
+	type dialResult struct {
+		isV6 bool
+		conn net.Conn
+		err  error
+	}
+
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan dialResult, 2)
+	startDial := func(ip string, isV6 bool) {
+		go func() {
+			conn, err := dialer.DialContext(dialCtx, network, net.JoinHostPort(ip, port))
+			results <- dialResult{isV6: isV6, conn: conn, err: err}
+		}()
+	}
+
+	startDial("127.0.0.1", false)
+	v6Started := false
+	var err4, err6 error
+	received := 0
+
+	timer := time.NewTimer(150 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		if !v6Started {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case res := <-results:
+				received++
+				if res.err == nil {
+					return res.conn, nil
+				}
+				err4 = res.err
+				v6Started = true
+				startDial("::1", true)
+			case <-timer.C:
+				v6Started = true
+				startDial("::1", true)
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			cancel()
+			for received < 2 {
+				res := <-results
+				received++
+				if res.conn != nil {
+					_ = res.conn.Close()
+				}
+			}
+			return nil, ctx.Err()
+		case res := <-results:
+			received++
+			if res.err == nil {
+				cancel()
+				// Drain the losing goroutine asynchronously so its socket closes if it also succeeded.
+				if received < 2 {
+					go func() {
+						loser := <-results
+						if loser.conn != nil {
+							_ = loser.conn.Close()
+						}
+					}()
+				}
+				return res.conn, nil
+			}
+			if res.isV6 {
+				err6 = res.err
+			} else {
+				err4 = res.err
+			}
+			if received >= 2 {
+				return nil, fmt.Errorf("security: loopback dial localhost:%s failed (ipv4: %v; ipv6: %v)", port, err4, err6)
+			}
+		}
+	}
 }
 
 // NewLoopbackHTTPClient returns an *http.Client whose CheckRedirect policy enforces

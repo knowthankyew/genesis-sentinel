@@ -193,7 +193,9 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 
 	// 3. Retained sample byte budget and cluster byte budget stay strictly bounded under 64 KiB floods.
 	aggBytes := NewAggregator(64)
-	aggBytes.SetMaxClusterBytes(4096)
+	if err := aggBytes.SetMaxClusterBytes(4096); err != nil {
+		t.Fatalf("SetMaxClusterBytes(4096): %v", err)
+	}
 	aggBytes.SetSampleByteLimits(8192, 2048, 512)
 	bigLine := strings.Repeat("A", 65536)
 	for i := 0; i < 100; i++ {
@@ -217,6 +219,9 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 		if len(w.SampleLine) > 512 {
 			t.Fatalf("SampleLine length %d exceeds single-sample cap 512", len(w.SampleLine))
 		}
+		if w.SampleLine != "" && !w.SampleTruncated {
+			t.Fatalf("expected 64 KiB preview sample to be marked SampleTruncated=true")
+		}
 		totalFlushedBytes += len(w.SampleLine)
 		for _, s := range w.AdditionalSamples {
 			totalFlushedBytes += len(s)
@@ -233,10 +238,16 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 	if ov1 || ov2 || id1 != id2 || nanMiner.ClusterCount() != 1 {
 		t.Fatalf("NaN threshold failed to merge identical messages: id1=%s id2=%s count=%d", id1, id2, nanMiner.ClusterCount())
 	}
+	// Reject lowering maxClusterBytes below current usage without Reset().
+	if err := nanMiner.SetMaxClusterBytes(4); err == nil {
+		t.Fatalf("expected SetMaxClusterBytes(4) to fail when ClusterBytes()=%d", nanMiner.ClusterBytes())
+	}
 
 	// 5. Rejected cluster rolls back newly created tree keys & bytes so subsequent small messages still fit.
 	rbMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
-	rbMiner.SetMaxClusterBytes(12)
+	if err := rbMiner.SetMaxClusterBytes(12); err != nil {
+		t.Fatalf("SetMaxClusterBytes(12): %v", err)
+	}
 	_, _, rejectedOv := rbMiner.ExtractTemplate("", "", "abcdefgh xyz")
 	if !rejectedOv || rbMiner.ClusterBytes() != 0 {
 		t.Fatalf("expected rejected cluster to roll back tree bytes to 0, got ov=%v bytes=%d", rejectedOv, rbMiner.ClusterBytes())
@@ -248,7 +259,9 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 
 	// 6. Generalization checks byte cap BEFORE mutating cluster tokens.
 	genMiner := NewDrainMiner(4, DefaultSimilarityThreshold)
-	genMiner.SetMaxClusterBytes(6)
+	if err := genMiner.SetMaxClusterBytes(6); err != nil {
+		t.Fatalf("SetMaxClusterBytes(6): %v", err)
+	}
 	_, _, g1Ov := genMiner.ExtractTemplate("", "", "x y a b")
 	if g1Ov || genMiner.ClusterBytes() != 6 {
 		t.Fatalf("expected initial cluster to fit in 6 bytes, got ov=%v bytes=%d", g1Ov, genMiner.ClusterBytes())

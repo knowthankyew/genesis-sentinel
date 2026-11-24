@@ -184,6 +184,9 @@ func NewEngine(pack RulePack) (*Engine, error) {
 		if id == "" {
 			return nil, fmt.Errorf("rule missing required id")
 		}
+		if strings.EqualFold(id, "SENT-006") {
+			return nil, fmt.Errorf("rule id %q is reserved for built-in prompt-injection detection", id)
+		}
 		if _, dup := seenIDs[id]; dup {
 			return nil, fmt.Errorf("duplicate enabled rule id %q", id)
 		}
@@ -397,27 +400,40 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 		return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
 	}
 
-	// Build candidate list excluding any individual sample matched by a message-pattern suppression.
-	rawCandidates := make([]string, 0, 1+len(w.AdditionalSamples))
-	if w.SampleLine != "" {
-		rawCandidates = append(rawCandidates, w.SampleLine)
+	type previewSample struct {
+		text      string
+		truncated bool
 	}
-	rawCandidates = append(rawCandidates, w.AdditionalSamples...)
 
-	var activeSamples []string
+	// Build candidate list excluding any individual sample matched by a message-pattern suppression.
+	rawCandidates := make([]previewSample, 0, 1+len(w.AdditionalSamples))
+	if w.SampleLine != "" {
+		rawCandidates = append(rawCandidates, previewSample{text: w.SampleLine, truncated: w.SampleTruncated})
+	}
+	for i, s := range w.AdditionalSamples {
+		trunc := i < len(w.AdditionalSamplesTruncated) && w.AdditionalSamplesTruncated[i]
+		rawCandidates = append(rawCandidates, previewSample{text: s, truncated: trunc})
+	}
+
+	var activeSamples []previewSample
 	for _, cand := range rawCandidates {
-		if !e.isSamplePatternSuppressed(w.Service, w.Template, cand) {
+		if !e.isSamplePatternSuppressed(w.Service, w.Template, cand.text) {
 			activeSamples = append(activeSamples, cand)
 		}
 	}
-	if len(rawCandidates) > 0 && len(activeSamples) == 0 {
+	// In preview-only mode (matchCounts == nil), suppress the window if every retained preview
+	// matched a message-pattern suppression. When exact event-level matchCounts are provided,
+	// unsuppressed events not in the preview cache must still be evaluated via matchCounts.
+	if matchCounts == nil && len(rawCandidates) > 0 && len(activeSamples) == 0 {
 		sanitized, _ := security.SanitizeUntrustedLogText(w.SampleLine, maxPromptBytes)
 		return EvaluationResult{Suppressed: true, SanitizedSample: sanitized}
 	}
 
 	primarySample := w.SampleLine
 	if len(activeSamples) > 0 {
-		primarySample = activeSamples[0]
+		primarySample = activeSamples[0].text
+	} else if len(rawCandidates) > 0 {
+		primarySample = ""
 	}
 	sanitized, _ := security.SanitizeUntrustedLogText(primarySample, maxPromptBytes)
 
@@ -427,7 +443,7 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	)
 	sigSeen := make(map[string]struct{})
 	for _, cand := range activeSamples {
-		cleanCand, candSigs := security.SanitizeUntrustedLogText(cand, maxPromptBytes)
+		cleanCand, candSigs := security.SanitizeUntrustedLogText(cand.text, maxPromptBytes)
 		if len(candSigs) > 0 && injSample == "" {
 			injSample = cleanCand
 		}
@@ -449,7 +465,8 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 		res.SanitizedSample = injSample
 	}
 
-	if res.InjectionSuspected {
+	if res.InjectionSuspected || (matchCounts != nil && matchCounts["SENT-006"] > 0) {
+		res.InjectionSuspected = true
 		res.RuleHits = append(res.RuleHits, model.RuleHit{
 			RuleID:      "SENT-006",
 			Category:    "prompt_injection_probe",
@@ -461,16 +478,22 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	svcLower := strings.ToLower(w.Service)
 	lvlUpper := strings.ToUpper(w.Level)
 	noSuppressedSamples := len(activeSamples) == len(rawCandidates)
+	hasPatternSup := e.hasApplicablePatternSuppression(w.Service, w.Template)
 
 	for _, cr := range e.rules {
-		if len(cr.services) > 0 {
-			if _, ok := cr.services[svcLower]; !ok {
-				continue
+		// In preview-only mode, filter by window display Service/Level selectors.
+		// When exact event-level matchCounts are provided, service/level predicates were
+		// already evaluated per event (allowing global overflow windows with <MIXED> identity).
+		if matchCounts == nil {
+			if len(cr.services) > 0 {
+				if _, ok := cr.services[svcLower]; !ok {
+					continue
+				}
 			}
-		}
-		if len(cr.levels) > 0 {
-			if _, ok := cr.levels[lvlUpper]; !ok {
-				continue
+			if len(cr.levels) > 0 {
+				if _, ok := cr.levels[lvlUpper]; !ok {
+					continue
+				}
 			}
 		}
 
@@ -479,7 +502,41 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 			minReq = 1
 		}
 		hasMsgPredicate := cr.re != nil || cr.rule.MinLength > 0 || cr.rule.MinEntropy > 0
-		matchedSample, matchedCount := matchRuleCandidates(cr, w, activeSamples, primarySample)
+		var (
+			matchedSample string
+			matchedCount  int
+		)
+		if !hasMsgPredicate {
+			matchedSample = primarySample
+			matchedCount = len(activeSamples)
+		} else {
+			for _, cand := range activeSamples {
+				// Exclude clipped previews from confirmed regex matches (e.g. anchored "^status ok$"
+				// must not fire on truncated "status ok" from "status ok later").
+				if cr.re != nil && cand.truncated {
+					continue
+				}
+				if cr.rule.MinLength > 0 && len(cand.text) < cr.rule.MinLength {
+					continue
+				}
+				if cr.rule.MinEntropy > 0 {
+					ent := template.PeakShannonEntropy(cand.text)
+					if cand.text == w.SampleLine && !cand.truncated && w.SampleEntropy > ent {
+						ent = w.SampleEntropy
+					}
+					if ent < cr.rule.MinEntropy {
+						continue
+					}
+				}
+				if cr.re != nil && !cr.re.MatchString(cand.text) {
+					continue
+				}
+				if matchedCount == 0 {
+					matchedSample = cand.text
+				}
+				matchedCount++
+			}
+		}
 
 		var effectiveCount uint64
 		if matchCounts != nil {
@@ -487,7 +544,9 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 			// retained sample matching is used only as optional evidence.
 			effectiveCount = matchCounts[cr.rule.ID]
 		} else if !hasMsgPredicate {
-			if w.Template != "<OVERFLOW>" && noSuppressedSamples {
+			// Use full window Count only when no applicable message-pattern suppression could
+			// have excluded unobserved events in the window.
+			if w.Template != "<OVERFLOW>" && noSuppressedSamples && !hasPatternSup {
 				effectiveCount = w.Count
 			} else {
 				effectiveCount = uint64(len(activeSamples))
@@ -516,40 +575,20 @@ func (e *Engine) EvaluateWithMatchCounts(w model.TemplateWindow, matchCounts map
 	return res
 }
 
-// matchRuleCandidates checks MinLength, MinEntropy, and Pattern on the SAME unsuppressed
-// candidate sample, returning the first matching sample and the total number of matching
-// unsuppressed samples. Message-pattern rules never fall back to matching w.Template.
-func matchRuleCandidates(cr compiledRule, w model.TemplateWindow, activeSamples []string, primarySample string) (string, int) {
-	if cr.re == nil && cr.rule.MinLength <= 0 && cr.rule.MinEntropy <= 0 {
-		return primarySample, len(activeSamples)
-	}
-
-	var (
-		firstMatch string
-		matches    int
-	)
-	for _, cand := range activeSamples {
-		if cr.rule.MinLength > 0 && len(cand) < cr.rule.MinLength {
+func (e *Engine) hasApplicablePatternSuppression(service, tmpl string) bool {
+	for _, cs := range e.suppressions {
+		if cs.re == nil {
 			continue
 		}
-		if cr.rule.MinEntropy > 0 {
-			ent := template.PeakShannonEntropy(cand)
-			if cand == w.SampleLine && w.SampleEntropy > ent {
-				ent = w.SampleEntropy
-			}
-			if ent < cr.rule.MinEntropy {
-				continue
-			}
-		}
-		if cr.re != nil && !cr.re.MatchString(cand) {
+		if cs.supp.Service != "" && !strings.EqualFold(cs.supp.Service, service) {
 			continue
 		}
-		if matches == 0 {
-			firstMatch = cand
+		if cs.supp.Template != "" && cs.supp.Template != tmpl {
+			continue
 		}
-		matches++
+		return true
 	}
-	return firstMatch, matches
+	return false
 }
 
 func (e *Engine) isWindowSuppressed(w model.TemplateWindow) bool {
