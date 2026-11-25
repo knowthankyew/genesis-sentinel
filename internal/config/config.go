@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
@@ -19,6 +20,7 @@ const (
 	DefaultMaxMemMB             = 256
 	DefaultWindowSec            = 10
 	DefaultSurprisalThreshold   = 5.0
+	MinMaxPromptBytes           = 512
 	DefaultMaxPromptBytes       = 2048
 	DefaultMaxTrainingRecords   = 50000
 	DefaultMaxTrainingFileBytes = 25 * 1024 * 1024
@@ -172,8 +174,8 @@ func (c *Config) Validate() error {
 	if c.BaselineWindowSize <= 0 || c.BaselineWindowSize > MaxBaselineWindowSize {
 		return fmt.Errorf("baseline_window_size must be between 1 and %d, got %d", MaxBaselineWindowSize, c.BaselineWindowSize)
 	}
-	if c.MaxPromptByte <= 0 {
-		return fmt.Errorf("max_prompt_bytes must be positive, got %d", c.MaxPromptByte)
+	if c.MaxPromptByte < MinMaxPromptBytes {
+		return fmt.Errorf("max_prompt_bytes must be at least %d to fit required prompt framing, got %d", MinMaxPromptBytes, c.MaxPromptByte)
 	}
 	if c.MaxMemMB <= 0 {
 		return fmt.Errorf("max_mem_mb must be positive, got %d", c.MaxMemMB)
@@ -197,8 +199,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("triage_timeout_sec must be between 5 and 300, got %d", c.TriageTimeoutSec)
 	}
 	if trimmedAdapter := strings.TrimSpace(c.AdapterPath); trimmedAdapter != "" {
+		for _, r := range trimmedAdapter {
+			if unicode.IsControl(r) {
+				return fmt.Errorf("adapter_path %q must not contain control characters", c.AdapterPath)
+			}
+		}
 		if strings.HasPrefix(trimmedAdapter, "/") || strings.ContainsRune(trimmedAdapter, '\\') ||
-			strings.ContainsRune(trimmedAdapter, '\x00') || strings.ContainsAny(trimmedAdapter, "\r\n") ||
 			(len(trimmedAdapter) >= 2 && trimmedAdapter[1] == ':') {
 			return fmt.Errorf("adapter_path %q must be a relative forward-slash path under artifacts/", c.AdapterPath)
 		}

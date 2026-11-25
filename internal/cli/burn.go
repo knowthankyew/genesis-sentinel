@@ -76,12 +76,18 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("DELETE %s/burn did not return a valid completed BurnReport (body: %s)", target, escapeForTerminal(strings.TrimSpace(string(body))))
 		}
 
-		// If the daemon purged a different data_dir than our locally configured cfg.DataDir,
-		// also purge cfg.DataDir so the local directory is never silently left behind.
+		// If the daemon purged a different data_dir than our locally configured cfg.DataDir
+		// (or if a separate custom feedback_dir is configured), also purge local state cleanly.
 		daemonDir := filepath.Clean(daemonRep.DataDir)
 		localDir := filepath.Clean(cfg.DataDir)
-		if cfg.DataDir != "" && daemonDir != localDir {
-			localRep, localErr := pipeline.BurnLocalState(cfg.DataDir)
+		customFeedbackOutsideDaemon := strings.TrimSpace(cfg.FeedbackDir) != "" &&
+			filepath.Clean(cfg.FeedbackDir) != filepath.Clean(filepath.Join(daemonDir, "feedback"))
+		if (cfg.DataDir != "" && daemonDir != localDir) || customFeedbackOutsideDaemon {
+			burnDataDir := cfg.DataDir
+			if daemonDir == localDir {
+				burnDataDir = ""
+			}
+			localRep, localErr := pipeline.BurnLocalStateWithFeedbackDir(burnDataDir, cfg.FeedbackDir)
 			enc := json.NewEncoder(stdout)
 			enc.SetIndent("", "  ")
 			if encErr := enc.Encode(map[string]any{
@@ -98,7 +104,7 @@ func runBurn(args []string, stdout, stderr io.Writer) error {
 		return enc.Encode(daemonRep)
 	}
 
-	rep, err := pipeline.BurnLocalState(cfg.DataDir)
+	rep, err := pipeline.BurnLocalStateWithFeedbackDir(cfg.DataDir, cfg.FeedbackDir)
 	if err != nil {
 		return err
 	}

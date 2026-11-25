@@ -2,6 +2,7 @@ package feedback
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/emit"
@@ -222,11 +224,8 @@ func PrepareRecord(rec model.FeedbackRecord, requireRedaction bool) (model.Feedb
 	rec.Prompt = strings.TrimSpace(rec.Prompt)
 	rec.Completion = strings.TrimSpace(rec.Completion)
 
-	if len(rec.Prompt) < MinPromptChars || len(rec.Completion) < 1 {
-		return model.FeedbackRecord{}, redactedKinds, fmt.Errorf("feedback record has empty or overly short prompt/completion")
-	}
-	if len(rec.Prompt) > MaxFieldChars || len(rec.Completion) > MaxFieldChars {
-		return model.FeedbackRecord{}, redactedKinds, fmt.Errorf("feedback record exceeds FTaaS %d-character per-field limit", MaxFieldChars)
+	if err := validateFieldLengths(rec.Prompt, rec.Completion); err != nil {
+		return model.FeedbackRecord{}, redactedKinds, fmt.Errorf("feedback record %w", err)
 	}
 	if rec.Weight == 0 {
 		rec.Weight = 1.0
@@ -263,6 +262,12 @@ func (s *Store) Append(filename string, recs ...model.FeedbackRecord) (int, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	unlock, err := acquireFileLock(path, true)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
 	existing, err := readFeedbackRecordsLocked(path, s.maxRecords, s.maxFileBytes)
 	if err != nil {
 		return 0, err
@@ -295,6 +300,13 @@ func (s *Store) ReadAll(filename string) ([]model.FeedbackRecord, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	unlock, err := acquireFileLock(path, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	return readFeedbackRecordsLocked(path, s.maxRecords, s.maxFileBytes)
 }
 
@@ -306,6 +318,12 @@ func (s *Store) Stats(filename string) (StoreStats, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	unlock, err := acquireFileLock(path, false)
+	if err != nil {
+		return StoreStats{}, err
+	}
+	defer unlock()
 
 	st := StoreStats{
 		Path:        path,
@@ -352,13 +370,27 @@ func (s *Store) ExportFTaaS(sourceFilename, outPath string, includeSeedPerClass 
 		if err != nil {
 			return ExportSummary{}, err
 		}
-		curated, err := readFeedbackRecordsLocked(srcPath, s.maxRecords, s.maxFileBytes)
+		if sameTargetPath(srcPath, outPath) {
+			return ExportSummary{}, fmt.Errorf("refusing to export FTaaS dataset over curated source queue %q (choose a separate output path)", srcPath)
+		}
+		unlockSrc, err := acquireFileLock(srcPath, false)
 		if err != nil {
 			return ExportSummary{}, err
+		}
+		curated, readErr := readFeedbackRecordsLocked(srcPath, s.maxRecords, s.maxFileBytes)
+		unlockSrc()
+		if readErr != nil {
+			return ExportSummary{}, readErr
 		}
 		all = append(all, curated...)
 	}
 	if includeSeedPerClass > 0 {
+		numClasses := len(triage.AllClasses())
+		remaining := s.maxRecords - len(all)
+		if numClasses == 0 || remaining < 0 || includeSeedPerClass > remaining/numClasses {
+			return ExportSummary{}, fmt.Errorf("export would exceed FTaaS limit of %d records (existing=%d, requested seed=%d/class across %d classes)",
+				s.maxRecords, len(all), includeSeedPerClass, numClasses)
+		}
 		all = append(all, GenerateSeedDataset(includeSeedPerClass, seed)...)
 	}
 	if len(all) == 0 {
@@ -379,6 +411,12 @@ func (s *Store) ExportFTaaS(sourceFilename, outPath string, includeSeedPerClass 
 		classCounts[lbl]++
 		cleaned = append(cleaned, pr)
 	}
+
+	unlockOut, err := acquireFileLock(outPath, true)
+	if err != nil {
+		return ExportSummary{}, err
+	}
+	defer unlockOut()
 
 	sum, err := writeRecordsAtomic(outPath, cleaned, true, s.maxRecords, s.maxFileBytes)
 	if err != nil {
@@ -417,10 +455,16 @@ func WriteFTaaSDataset(outPath string, records []model.FeedbackRecord, requireRe
 
 // ValidateJSONLFile streams and verifies a JSONL file against FTaaS ingestion constraints
 // (25 MB size ceiling, 50,000 record ceiling, required string prompt/completion within
-// 3..10,000 / 1..10,000 chars, positive finite weight, and fail-closed PII/secret scanning
-// when requirePIIScan is true).
+// 3..10,000 / 1..10,000 decoded characters, positive finite weight, and fail-closed PII/secret
+// scanning of both raw JSON lines and decoded fields when requirePIIScan is true).
 func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, error) {
-	fi, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return ValidationSummary{}, fmt.Errorf("open dataset %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
 	if err != nil {
 		return ValidationSummary{}, fmt.Errorf("stat dataset %q: %w", path, err)
 	}
@@ -435,30 +479,80 @@ func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, err
 			path, fi.Size(), config.DefaultMaxTrainingFileBytes)
 	}
 
+	return validateJSONLStream(f, path, requirePIIScan)
+}
+
+// ReadAndValidateJSONLFile reads a size-bounded snapshot of path once from the open file
+// descriptor, validates that exact byte slice against FTaaS schema/size/PII constraints, and
+// returns both the validated snapshot bytes and ValidationSummary so upload callers cannot
+// suffer TOCTOU substitution between validation and multipart upload.
+func ReadAndValidateJSONLFile(path string, requirePIIScan bool) ([]byte, ValidationSummary, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return ValidationSummary{}, fmt.Errorf("open dataset %q: %w", path, err)
+		return nil, ValidationSummary{}, fmt.Errorf("open dataset %q: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, ValidationSummary{}, fmt.Errorf("stat dataset %q: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %q must be a regular file", path)
+	}
+	if fi.Size() <= 0 {
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %q is empty", path)
+	}
+	if fi.Size() > config.DefaultMaxTrainingFileBytes {
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %q (%d bytes) exceeds FTaaS ceiling of %d bytes",
+			path, fi.Size(), config.DefaultMaxTrainingFileBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, config.DefaultMaxTrainingFileBytes+1))
+	if err != nil {
+		return nil, ValidationSummary{}, fmt.Errorf("read dataset %q: %w", path, err)
+	}
+	if len(data) == 0 {
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %q is empty", path)
+	}
+	if int64(len(data)) > config.DefaultMaxTrainingFileBytes {
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %q grew past FTaaS ceiling of %d bytes during read",
+			path, config.DefaultMaxTrainingFileBytes)
+	}
+
+	sum, err := validateJSONLStream(bytes.NewReader(data), path, requirePIIScan)
+	if err != nil {
+		return nil, ValidationSummary{}, err
+	}
+	return data, sum, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (cr *countingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	cr.n += int64(n)
+	return n, err
+}
+
+func validateJSONLStream(r io.Reader, path string, requirePIIScan bool) (ValidationSummary, error) {
 	hasher := sha256.New()
-	limited := io.LimitReader(f, config.DefaultMaxTrainingFileBytes+1)
-	tee := io.TeeReader(limited, hasher)
+	limited := io.LimitReader(r, config.DefaultMaxTrainingFileBytes+1)
+	cr := &countingReader{r: limited}
+	tee := io.TeeReader(cr, hasher)
 	scanner := bufio.NewScanner(tee)
 	scanner.Buffer(make([]byte, 64*1024), 512*1024)
 
-	var (
-		count     int
-		totalRead int64
-	)
+	var count int
 	for scanner.Scan() {
-		lineBytes := scanner.Bytes()
-		totalRead += int64(len(lineBytes)) + 1
-		if totalRead > config.DefaultMaxTrainingFileBytes+1 {
+		if cr.n > config.DefaultMaxTrainingFileBytes {
 			return ValidationSummary{}, fmt.Errorf("dataset %q grew past FTaaS ceiling of %d bytes during read",
 				path, config.DefaultMaxTrainingFileBytes)
 		}
-		line := strings.TrimSpace(string(lineBytes))
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -492,11 +586,18 @@ func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, err
 		}
 		prompt = strings.TrimSpace(prompt)
 		completion = strings.TrimSpace(completion)
-		if len(prompt) < MinPromptChars || len(completion) < 1 {
-			return ValidationSummary{}, fmt.Errorf("dataset %q line %d prompt/completion too short", path, count)
+		if err := validateFieldLengths(prompt, completion); err != nil {
+			return ValidationSummary{}, fmt.Errorf("dataset %q line %d %w", path, count, err)
 		}
-		if len(prompt) > MaxFieldChars || len(completion) > MaxFieldChars {
-			return ValidationSummary{}, fmt.Errorf("dataset %q line %d exceeds %d-character field limit", path, count, MaxFieldChars)
+		if requirePIIScan {
+			if cat, found := ScanForPII(prompt); found {
+				return ValidationSummary{}, fmt.Errorf("dataset %q line %d blocked by pre-upload PII/secret check (decoded prompt): detected %s",
+					path, count, cat)
+			}
+			if cat, found := ScanForPII(completion); found {
+				return ValidationSummary{}, fmt.Errorf("dataset %q line %d blocked by pre-upload PII/secret check (decoded completion): detected %s",
+					path, count, cat)
+			}
 		}
 		if wRaw, hasW := raw["weight"]; hasW && string(wRaw) != "null" {
 			var w float64
@@ -508,16 +609,56 @@ func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, err
 	if err := scanner.Err(); err != nil {
 		return ValidationSummary{}, fmt.Errorf("scan dataset %q: %w", path, err)
 	}
-	if count == 0 {
+	if cr.n > config.DefaultMaxTrainingFileBytes {
+		return ValidationSummary{}, fmt.Errorf("dataset %q grew past FTaaS ceiling of %d bytes during read",
+			path, config.DefaultMaxTrainingFileBytes)
+	}
+	if cr.n == 0 || count == 0 {
 		return ValidationSummary{}, fmt.Errorf("dataset %q contains 0 valid JSONL records", path)
 	}
 
 	return ValidationSummary{
 		Path:        path,
 		RecordCount: count,
-		ByteSize:    fi.Size(),
+		ByteSize:    cr.n,
 		SHA256:      hex.EncodeToString(hasher.Sum(nil)),
 	}, nil
+}
+
+func validateFieldLengths(prompt, completion string) error {
+	pLen := utf8.RuneCountInString(prompt)
+	cLen := utf8.RuneCountInString(completion)
+	if pLen < MinPromptChars || cLen < 1 {
+		return fmt.Errorf("has empty or overly short prompt/completion")
+	}
+	if pLen > MaxFieldChars || cLen > MaxFieldChars {
+		return fmt.Errorf("exceeds FTaaS %d-character per-field limit", MaxFieldChars)
+	}
+	return nil
+}
+
+func sameTargetPath(a, b string) bool {
+	if fiA, errA := os.Stat(a); errA == nil {
+		if fiB, errB := os.Stat(b); errB == nil && os.SameFile(fiA, fiB) {
+			return true
+		}
+	}
+	return canonicalPathForCompare(a) == canonicalPathForCompare(b)
+}
+
+func canonicalPathForCompare(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = filepath.Clean(p)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	dir := filepath.Dir(abs)
+	if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(filepath.Join(resolvedDir, filepath.Base(abs)))
+	}
+	return filepath.Clean(abs)
 }
 
 func readFeedbackRecordsLocked(path string, maxRecords int, maxBytes int64) ([]model.FeedbackRecord, error) {

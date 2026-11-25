@@ -421,6 +421,35 @@ func starterClassSpecs() []seedClassSpec {
 // across all 8 Phase 3 security triage taxonomy classes using diverse multi-service scenarios
 // in the exact Tier 2 prompt format.
 func GenerateSeedDataset(perClass int, seed uint64) []model.FeedbackRecord {
+	return generateSeedSubset(perClass, seed, 0, func(all []seedScenario) []seedScenario {
+		return all
+	})
+}
+
+// GenerateSeedSplit creates strictly disjoint deterministic training and holdout validation
+// splits across all 8 security triage classes. When valPerClass > 0, each class holds out
+// its final scenario exclusively for validation so train and validation have zero scenario
+// (template) and zero example overlap at every supported split size.
+func GenerateSeedSplit(trainPerClass, valPerClass int, seed uint64) ([]model.FeedbackRecord, []model.FeedbackRecord) {
+	if valPerClass <= 0 {
+		return GenerateSeedDataset(trainPerClass, seed), nil
+	}
+	train := generateSeedSubset(trainPerClass, seed, 0, func(all []seedScenario) []seedScenario {
+		if len(all) > 1 {
+			return all[:len(all)-1]
+		}
+		return all
+	})
+	val := generateSeedSubset(valPerClass, seed^0x9e3779b97f4a7c15, 100000, func(all []seedScenario) []seedScenario {
+		if len(all) > 1 {
+			return all[len(all)-1:]
+		}
+		return all
+	})
+	return train, val
+}
+
+func generateSeedSubset(perClass int, seed uint64, indexOffset int, selectScenarios func([]seedScenario) []seedScenario) []model.FeedbackRecord {
 	if perClass <= 0 {
 		return nil
 	}
@@ -430,9 +459,13 @@ func GenerateSeedDataset(perClass int, seed uint64) []model.FeedbackRecord {
 	now := time.Now().UTC()
 
 	for _, spec := range specs {
+		chosen := selectScenarios(spec.scenarios)
+		if len(chosen) == 0 {
+			continue
+		}
 		for i := 0; i < perClass; i++ {
-			sc := spec.scenarios[i%len(spec.scenarios)]
-			sample := sc.sampleFn(rng, i)
+			sc := chosen[i%len(chosen)]
+			sample := sc.sampleFn(rng, indexOffset+i)
 			prompt, _, _ := triage.BuildTriagePrompt(triage.PromptInput{
 				Service:            sc.service,
 				Level:              sc.level,
@@ -465,12 +498,4 @@ func GenerateSeedDataset(perClass int, seed uint64) []model.FeedbackRecord {
 		records[i], records[j] = records[j], records[i]
 	})
 	return records
-}
-
-// GenerateSeedSplit creates disjoint deterministic training and holdout validation splits
-// across all 8 security triage classes.
-func GenerateSeedSplit(trainPerClass, valPerClass int, seed uint64) ([]model.FeedbackRecord, []model.FeedbackRecord) {
-	train := GenerateSeedDataset(trainPerClass, seed)
-	val := GenerateSeedDataset(valPerClass, seed^0x9e3779b97f4a7c15)
-	return train, val
 }

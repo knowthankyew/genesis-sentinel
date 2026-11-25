@@ -22,6 +22,7 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
+	"github.com/knowthankyew/genesis-sentinel/internal/train"
 )
 
 type failingSink struct{}
@@ -911,8 +912,11 @@ func TestPipelineRound5PendingRuleOverflowBlocksLearnAndUnicodeCaseFold(t *testi
 }
 
 func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *testing.T) {
-	// Mock local FTaaS inference server: returns BENIGN-NOISE on prompt-injection test
-	// and AUTH-BRUTEFORCE on SSH brute-force test.
+	// Mock local FTaaS inference server: tracks last received adapterPath, returns BENIGN-NOISE
+	// on prompt-injection test and AUTH-BRUTEFORCE (with an echoed credential to test scrubbing)
+	// on SSH brute-force test.
+	var lastAdapterMu sync.Mutex
+	var lastAdapter string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Prompt      string `json:"prompt"`
@@ -922,19 +926,25 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		lastAdapterMu.Lock()
+		lastAdapter = req.AdapterPath
+		lastAdapterMu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(req.Prompt, "injection_flag=true") {
 			// Simulate tricked model predicting BENIGN-NOISE -> Sentinel must override fail-closed!
 			_, _ = w.Write([]byte(`{"completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=Totally benign.","adapterPath":"` + req.AdapterPath + `"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"completion":"[AUTH-BRUTEFORCE] severity=HIGH mitre=TA0006 confidence=0.95 explanation=Repeated failed SSH logins.","adapterPath":"` + req.AdapterPath + `"}`))
+		_, _ = w.Write([]byte(`{"completion":"[AUTH-BRUTEFORCE] severity=HIGH mitre=TA0006 confidence=0.95 explanation=Repeated failed SSH logins Authorization: Bearer echoed-model-secret-42.","adapterPath":"` + req.AdapterPath + `"}`))
 	}))
 	defer srv.Close()
 
 	dataDir := t.TempDir()
+	customFBDir := t.TempDir()
 	cfg := config.DefaultConfig()
 	cfg.DataDir = dataDir
+	cfg.FeedbackDir = customFBDir
 	cfg.TriageMode = "http"
 	cfg.InferenceAddr = srv.URL
 	cfg.AdapterPath = "artifacts/job-init/model_adapters"
@@ -947,14 +957,14 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 	journal := feedback.NewAlertJournal(dataDir)
 	pipe.AttachAlertJournal(journal)
 
-	// 1. SSH brute-force (6 failures) -> Tier 0 + Tier 2 enrichment!
+	// 1. SSH brute-force (6 failures) containing PII/credentials -> Tier 0 + Tier 2 enrichment, all scrubbed!
 	for i := 0; i < 6; i++ {
 		pipe.IngestEvent(model.LogEvent{
 			ID:        uint64(100 + i),
 			Timestamp: 1763997000,
 			Service:   "sshd",
 			Level:     "WARN",
-			Message:   fmt.Sprintf("Failed password for invalid user root from 198.51.100.%d port 55000 ssh2", 10+i),
+			Message:   fmt.Sprintf("Failed password for invalid user alice@example.com ssn=123-45-6789 Authorization: Bearer src-secret-99 from 198.51.100.%d port 55000 ssh2", 10+i),
 		})
 	}
 	// 2. Hostile prompt-injection log -> Tier 0 SENT-006 + Tier 2 model tricked into BENIGN-NOISE -> MUST fail closed to NEEDS-REVIEW!
@@ -980,6 +990,11 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 			if !strings.Contains(a.Tier, "+tier2") || a.TriageClass != "AUTH-BRUTEFORCE" || a.TriageMitreTactic != "TA0006" || a.TriageAdapter != "artifacts/job-init/model_adapters" {
 				t.Fatalf("unexpected SSH Tier 2 alert: %+v", a)
 			}
+			for _, leaked := range []string{"alice@example.com", "123-45-6789", "src-secret-99", "echoed-model-secret-42"} {
+				if strings.Contains(a.Message, leaked) || strings.Contains(a.SanitizedSample, leaked) || strings.Contains(a.TriageExplanation, leaked) {
+					t.Fatalf("secret %q leaked into emitted alert: %+v", leaked, a)
+				}
+			}
 		}
 		if a.SourceService == "nginx" {
 			gotInj = true
@@ -992,13 +1007,16 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 		t.Fatalf("missing expected alerts: gotSSH=%v gotInj=%v alerts=%+v", gotSSH, gotInj, alerts)
 	}
 
-	// Verify alert journal recorded alerts for `sentinel feedback --alert-id`.
+	// Verify alert journal recorded scrubbed alerts for `sentinel feedback --alert-id`.
 	foundAlert, ok, err := journal.FindByID(sshAlertID)
 	if err != nil || !ok || foundAlert.TriageClass != "AUTH-BRUTEFORCE" {
 		t.Fatalf("expected alert %q in alerts.jsonl journal, got ok=%v err=%v alert=%+v", sshAlertID, ok, err, foundAlert)
 	}
+	if strings.Contains(foundAlert.TriageExplanation, "echoed-model-secret-42") || strings.Contains(foundAlert.SanitizedSample, "src-secret-99") {
+		t.Fatalf("secret leaked into alerts.jsonl: %+v", foundAlert)
+	}
 
-	// Verify POST /adapter hot-swaps active adapter and persists active-adapter.json.
+	// Verify POST /adapter hot-swaps active adapter, persists active-adapter.json, AND propagates to next inference call.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/job-v2/model_adapters"}`))
 	pipe.HandleAdapter(rec, req)
@@ -1009,17 +1027,151 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 		t.Fatalf("unexpected Tier 2 pipeline stats after adapter swap: %+v", st)
 	}
 
-	// Verify Burn removes alerts.jsonl AND active-adapter.json cleanly!
+	// Flush one more eligible alert and confirm inference server receives artifacts/job-v2/model_adapters.
+	pipe.IngestEvent(model.LogEvent{
+		ID: 201, Timestamp: 1763997002, Service: "nginx", Level: "WARN",
+		Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+	})
+	if a2, f2 := pipe.FlushWindow(); len(f2) != 0 || len(a2) != 1 {
+		t.Fatalf("post-swap flush unexpected: alerts=%+v failed=%+v", a2, f2)
+	}
+	lastAdapterMu.Lock()
+	seenPostSwap := lastAdapter
+	lastAdapterMu.Unlock()
+	if seenPostSwap != "artifacts/job-v2/model_adapters" {
+		t.Fatalf("expected next inference call to use artifacts/job-v2/model_adapters, got %q", seenPostSwap)
+	}
+
+	// Seed custom FeedbackDir with one Sentinel-owned file and one unrelated user file.
+	ownedCustom := filepath.Join(customFBDir, "sentinel-feedback.jsonl")
+	userCustom := filepath.Join(customFBDir, "import.jsonl")
+	if err := os.WriteFile(ownedCustom, []byte(`{"prompt":"test","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+		t.Fatalf("write owned custom feedback: %v", err)
+	}
+	if err := os.WriteFile(userCustom, []byte(`{"keep":true}`+"\n"), 0600); err != nil {
+		t.Fatalf("write user custom file: %v", err)
+	}
+
+	// Verify Burn removes alerts.jsonl, active-adapter.json, AND custom FeedbackDir Sentinel files,
+	// preserves unrelated user files, AND deactivates the hot-swapped in-memory adapter!
 	rep, err := pipe.Burn()
 	if err != nil {
 		t.Fatalf("Burn failed: %v", err)
 	}
-	if rep.FilesRemoved < 2 {
-		t.Fatalf("expected Burn to remove alerts.jsonl and active-adapter.json, got %+v", rep)
+	if rep.FilesRemoved < 3 {
+		t.Fatalf("expected Burn to remove alerts.jsonl, active-adapter.json, and custom sentinel-feedback.jsonl, got %+v", rep)
 	}
-	for _, f := range []string{"alerts.jsonl", "active-adapter.json"} {
-		if _, err := os.Stat(filepath.Join(dataDir, f)); !os.IsNotExist(err) {
-			t.Fatalf("%s survived Burn()", f)
+	for _, gone := range []string{
+		filepath.Join(dataDir, "alerts.jsonl"),
+		filepath.Join(dataDir, "active-adapter.json"),
+		ownedCustom,
+	} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("%s survived Burn()", gone)
 		}
+	}
+	if _, err := os.Stat(userCustom); err != nil {
+		t.Fatalf("unrelated user file %s was removed by Burn(): %v", userCustom, err)
+	}
+	if st := pipe.Stats(); st.TriageAdapter != "" {
+		t.Fatalf("expected Burn() to deactivate in-memory adapter, still active: %q", st.TriageAdapter)
+	}
+
+	// Flush once more after Burn() and confirm inference call sends empty adapterPath.
+	pipe.IngestEvent(model.LogEvent{
+		ID: 202, Timestamp: 1763997003, Service: "nginx", Level: "WARN",
+		Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+	})
+	_, _ = pipe.FlushWindow()
+	lastAdapterMu.Lock()
+	seenPostBurn := lastAdapter
+	lastAdapterMu.Unlock()
+	if seenPostBurn != "" {
+		t.Fatalf("expected inference call after Burn() to send empty adapterPath, got %q", seenPostBurn)
+	}
+}
+
+func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
+	}))
+	defer srv.Close()
+
+	// 1. Persistence failure MUST leave adapter A active in live memory.
+	badParent := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(badParent, []byte("file"), 0600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	cfgFail := config.DefaultConfig()
+	cfgFail.DataDir = badParent
+	cfgFail.TriageMode = "http"
+	cfgFail.InferenceAddr = srv.URL
+	cfgFail.AdapterPath = "artifacts/adapter-A/model_adapters"
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+	pipeFail := New(cfgFail, ruleEng, emit.NopSink{}, "file")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
+	pipeFail.HandleAdapter(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when SaveActiveAdapter fails, got %d", rec.Code)
+	}
+	if st := pipeFail.Stats(); st.TriageAdapter != "artifacts/adapter-A/model_adapters" {
+		t.Fatalf("failed persistence mutated live adapter: got %q, want adapter-A", st.TriageAdapter)
+	}
+
+	// 2. Concurrent HandleAdapter activations MUST serialize live and persisted state cleanly.
+	goodDir := t.TempDir()
+	cfgConc := config.DefaultConfig()
+	cfgConc.DataDir = goodDir
+	cfgConc.TriageMode = "http"
+	cfgConc.InferenceAddr = srv.URL
+	pipeConc := New(cfgConc, ruleEng, emit.NopSink{}, "file")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			payload := fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
+				model.ModelSmolLM2135MInstruct, idx)
+			if idx%2 == 1 {
+				payload = fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
+					model.ModelSmolLM2360MInstruct, idx)
+			}
+			rr := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
+			pipeConc.HandleAdapter(rr, r)
+			if rr.Code != http.StatusOK {
+				t.Errorf("concurrent HandleAdapter %d failed: %d %s", idx, rr.Code, rr.Body.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	live := pipeConc.Stats()
+	disk, exists, err := train.LoadActiveAdapter(goodDir)
+	if err != nil || !exists {
+		t.Fatalf("LoadActiveAdapter after concurrent swaps failed: exists=%v err=%v", exists, err)
+	}
+	if live.TriageModel != disk.BaseModel || live.TriageAdapter != disk.AdapterPath {
+		t.Fatalf("live vs persisted adapter diverged after concurrent swaps: live=(%q,%q) disk=(%q,%q)",
+			live.TriageModel, live.TriageAdapter, disk.BaseModel, disk.AdapterPath)
+	}
+
+	// 3. Journal failure reports JournalErrors without failing sink delivery.
+	pipeJournalErr := New(cfgFail, ruleEng, emit.NopSink{}, "file")
+	pipeJournalErr.AttachAlertJournal(feedback.NewAlertJournal(badParent))
+	pipeJournalErr.IngestEvent(model.LogEvent{
+		ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
+		Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+	})
+	emitted, failed := pipeJournalErr.FlushWindow()
+	if len(failed) != 0 || len(emitted) != 1 {
+		t.Fatalf("journal failure should not fail sink delivery: emitted=%d failed=%d", len(emitted), len(failed))
+	}
+	if st := pipeJournalErr.Stats(); st.JournalErrors != 1 || st.SinkErrors != 0 {
+		t.Fatalf("expected JournalErrors=1 SinkErrors=0, got %+v", st)
 	}
 }

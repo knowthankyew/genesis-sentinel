@@ -187,6 +187,10 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	}
 
 	var activatedState *train.ActiveAdapter
+	finalStatus := strings.ToLower(strings.TrimSpace(finalJob.Status))
+	if finalStatus != "succeeded" && finalStatus != "completed" {
+		return fmt.Errorf("FTaaS job %s did not succeed (status=%q)", finalJob.JobID, finalJob.Status)
+	}
 	if *activate && strings.TrimSpace(finalJob.AdapterPath) != "" {
 		state := train.ActiveAdapter{
 			JobID:       finalJob.JobID,

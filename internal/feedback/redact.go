@@ -14,14 +14,17 @@ var (
 	// JWT tokens (3 base64url segments beginning with eyJ).
 	jwtRe = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
 
-	// Authorization Bearer tokens.
-	bearerRe = regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}`)
+	// Authorization Bearer and Basic credentials.
+	authHeaderCredRe = regexp.MustCompile(`(?i)\b((?:Proxy-)?Authorization\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
+	bearerRe         = regexp.MustCompile(`(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
+	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{8,}={0,2})`)
 
 	// Common cloud, VCS, and AI API key prefixes.
 	apiKeyPrefixRe = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 
-	// Credential key=value or key: value assignments (never matching already-redacted placeholders).
-	credKVRe = regexp.MustCompile(`(?i)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)`)
+	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
+	// never matching already-redacted placeholders).
+	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\]]+)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -33,22 +36,24 @@ var (
 	// Contextual SSN candidates preceded by "ssn" or "social security".
 	ssnContextualCandidateRe = regexp.MustCompile(`(?i)\b(ssn|social\s*security(?:\s*number)?)([^\d]{1,10})(\d{3})([- ]?)(\d{2})([- ]?)(\d{4})\b`)
 
-	// Credit/debit card digit candidates (13-19 digits, formatted or contiguous; validated via Luhn).
-	cardCandidateRe = regexp.MustCompile(`\b(?:\d{4}[ -]?){3}\d{4}\b|\b\d{13,19}\b`)
+	// Credit/debit card digit candidates (13-19 digits, contiguous or standard groupings
+	// including 4-4-4-4, 4-6-5 Amex, 4-6-4 Diners, 4-4-4-1..3, and 4-4-4-4-1..3; validated via Luhn).
+	cardCandidateRe = regexp.MustCompile(`\b(?:\d{4}[ -]\d{6}[ -]\d{4,5}|\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}(?:[ -]\d{1,3})?|\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,3}|\d{13,19})\b`)
 )
 
 // RedactText neutralizes chat-template delimiters and scrubs PII/secrets (PEM private keys,
-// JWTs, Bearer tokens, cloud/VCS API keys, credential key=value pairs, emails, SSA-valid SSNs,
-// and Luhn-valid payment cards) before any log text enters an FTaaS JSONL dataset.
+// JWTs, Bearer/Basic authorization credentials, cloud/VCS API keys, unquoted and quoted
+// credential key=value pairs, emails, SSA-valid SSNs, and Luhn-valid payment cards) before
+// any log text enters alerts.jsonl, sinks, or FTaaS JSONL datasets.
 // Returns the scrubbed string and deduplicated list of redacted categories.
 func RedactText(raw string) (string, []string) {
 	if raw == "" {
 		return "", nil
 	}
 
-	// Neutralize chat-template tokens without truncating valid long prompts (length caps
-	// are enforced separately by the dataset store and FTaaS ceilings).
-	s, _ := security.SanitizeUntrustedLogText(raw, len(raw)+64)
+	// Neutralize chat-template tokens without truncating valid long prompts or multi-line PEM
+	// blocks even if invalid UTF-8 bytes expand to 3-byte replacement runes during sanitization.
+	s, _ := security.SanitizeUntrustedLogText(raw, len(raw)*3+64)
 
 	var findings []string
 	seen := make(map[string]struct{}, 4)
@@ -67,25 +72,44 @@ func RedactText(raw string) (string, []string) {
 		s = jwtRe.ReplaceAllString(s, "[REDACTED_JWT]")
 		addFinding("jwt")
 	}
+	if authHeaderCredRe.MatchString(s) {
+		s = authHeaderCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
+		addFinding("auth_credential")
+	}
 	if bearerRe.MatchString(s) {
 		s = bearerRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
 		addFinding("bearer_token")
 	}
+	s = basicTokenRe.ReplaceAllStringFunc(s, func(match string) string {
+		sub := basicTokenRe.FindStringSubmatch(match)
+		if len(sub) < 3 || !looksLikeEncodedBasicCred(sub[2]) {
+			return match
+		}
+		addFinding("basic_auth")
+		return sub[1] + "[REDACTED_TOKEN]"
+	})
 	if apiKeyPrefixRe.MatchString(s) {
 		s = apiKeyPrefixRe.ReplaceAllString(s, "[REDACTED_API_KEY]")
 		addFinding("api_key")
 	}
 	s = credKVRe.ReplaceAllStringFunc(s, func(match string) string {
 		sub := credKVRe.FindStringSubmatch(match)
-		if len(sub) < 4 {
+		if len(sub) < 5 {
 			return match
 		}
-		val := strings.Trim(sub[3], `"'`)
-		if strings.HasPrefix(val, "[REDACTED") || val == "<STR>" || val == "<HEX>" || val == "<NUM>" {
+		rawVal := sub[4]
+		val := strings.Trim(rawVal, `"'`)
+		if val == "" || strings.HasPrefix(val, "[REDACTED") || val == "<STR>" || val == "<HEX>" || val == "<NUM>" {
 			return match
 		}
 		addFinding("credential_value")
-		return sub[1] + sub[2] + "[REDACTED_SECRET]"
+		if len(rawVal) >= 2 && rawVal[0] == '"' && rawVal[len(rawVal)-1] == '"' {
+			return sub[1] + sub[2] + sub[3] + `"[REDACTED_SECRET]"`
+		}
+		if len(rawVal) >= 2 && rawVal[0] == '\'' && rawVal[len(rawVal)-1] == '\'' {
+			return sub[1] + sub[2] + sub[3] + `'[REDACTED_SECRET]'`
+		}
+		return sub[1] + sub[2] + sub[3] + "[REDACTED_SECRET]"
 	})
 	if emailRe.MatchString(s) {
 		s = emailRe.ReplaceAllString(s, "[REDACTED_EMAIL]")
@@ -121,7 +145,8 @@ func RedactText(raw string) (string, []string) {
 
 // ScanForPII performs a fail-closed pre-export compliance scan mirroring FTaaS's
 // DatasetService.ScanForPii (SSA-valid SSNs and Luhn-valid payment cards) plus high-risk
-// unredacted secret patterns (PEM private keys, JWTs, cloud/VCS API key prefixes).
+// unredacted secret patterns (PEM private keys, JWTs, Bearer/Basic authorization credentials,
+// and cloud/VCS API key prefixes).
 func ScanForPII(text string) (string, bool) {
 	if strings.TrimSpace(text) == "" {
 		return "", false
@@ -131,6 +156,17 @@ func ScanForPII(text string) (string, bool) {
 	}
 	if jwtRe.MatchString(text) {
 		return "JWT Bearer Token", true
+	}
+	if authHeaderCredRe.MatchString(text) {
+		return "Authorization Credential", true
+	}
+	if bearerRe.MatchString(text) {
+		return "Bearer Token", true
+	}
+	for _, sub := range basicTokenRe.FindAllStringSubmatch(text, -1) {
+		if len(sub) >= 3 && looksLikeEncodedBasicCred(sub[2]) {
+			return "Basic Auth Credential", true
+		}
 	}
 	if apiKeyPrefixRe.MatchString(text) {
 		return "API Access Key", true
@@ -152,6 +188,29 @@ func ScanForPII(text string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// looksLikeEncodedBasicCred distinguishes standalone Base64 Basic credentials (mixed case,
+// digits, base64 punctuation, or '=' padding) from ordinary English prose such as "Basic authentication".
+func looksLikeEncodedBasicCred(tok string) bool {
+	if len(tok) < 8 {
+		return false
+	}
+	var hasLower, hasUpper, hasDigit, hasB64Sym bool
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			hasLower = true
+		case c >= 'A' && c <= 'Z':
+			hasUpper = true
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '+' || c == '/' || c == '=':
+			hasB64Sym = true
+		}
+	}
+	return hasB64Sym || hasDigit || (hasLower && hasUpper)
 }
 
 // isValidSSAParts enforces US SSA numbering rules matching ml/src/FtaaSService.Api/Services/DatasetService.cs:

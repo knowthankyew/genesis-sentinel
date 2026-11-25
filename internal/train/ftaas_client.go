@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -160,7 +159,7 @@ func NewFTaaSClient(rawURL, apiKey string, timeout time.Duration, allowRemote bo
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil || u.Host == "" {
-		return nil, fmt.Errorf("invalid FTaaS API URL %q", rawURL)
+		return nil, fmt.Errorf("invalid FTaaS API URL: failed to parse host")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported FTaaS API URL scheme %q (expected http or https)", u.Scheme)
@@ -173,6 +172,7 @@ func NewFTaaSClient(rawURL, apiKey string, timeout time.Duration, allowRemote bo
 	}
 
 	u.RawQuery = ""
+	u.ForceQuery = false
 	u.Fragment = ""
 	u.Path = strings.TrimRight(u.Path, "/")
 	fullBase := strings.TrimRight(u.String(), "/")
@@ -206,15 +206,16 @@ func (c *FTaaSClient) AuditDataset(
 	if math.IsNaN(anomalyThreshold) || math.IsInf(anomalyThreshold, 0) || anomalyThreshold < 0 {
 		return DatasetAuditResponse{}, fmt.Errorf("anomalyThreshold must be a non-negative finite float")
 	}
-	if _, err := feedback.ValidateJSONLFile(datasetPath, requireRedaction); err != nil {
+	snapshot, _, err := feedback.ReadAndValidateJSONLFile(datasetPath, requireRedaction)
+	if err != nil {
 		return DatasetAuditResponse{}, err
 	}
 
 	fields := map[string]string{
-		"ablationThreshold": strconv.FormatFloat(ablationThreshold, 'f', 4, 64),
-		"anomalyThreshold":  strconv.FormatFloat(anomalyThreshold, 'f', 4, 64),
+		"ablationThreshold": strconv.FormatFloat(ablationThreshold, 'f', -1, 64),
+		"anomalyThreshold":  strconv.FormatFloat(anomalyThreshold, 'f', -1, 64),
 	}
-	body, contentType, err := buildMultipartUpload(datasetPath, fields)
+	body, contentType, err := buildMultipartUploadFromBytes(filepath.Base(datasetPath), snapshot, fields)
 	if err != nil {
 		return DatasetAuditResponse{}, err
 	}
@@ -256,7 +257,8 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 	if err := req.Hyperparameters.Validate(); err != nil {
 		return SubmitResponse{}, fmt.Errorf("invalid hyperparameters: %w", err)
 	}
-	if _, err := feedback.ValidateJSONLFile(req.DatasetPath, req.RequireRedaction); err != nil {
+	snapshot, _, err := feedback.ReadAndValidateJSONLFile(req.DatasetPath, req.RequireRedaction)
+	if err != nil {
 		return SubmitResponse{}, err
 	}
 
@@ -275,7 +277,7 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 		"enableSurprisalPreflight": strconv.FormatBool(req.EnableSurprisalPreflight),
 		"hyperparameters":          string(hpBytes),
 	}
-	body, contentType, err := buildMultipartUpload(req.DatasetPath, fields)
+	body, contentType, err := buildMultipartUploadFromBytes(filepath.Base(req.DatasetPath), snapshot, fields)
 	if err != nil {
 		return SubmitResponse{}, err
 	}
@@ -289,7 +291,7 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 
 	respBody, statusCode, err := c.doBounded(httpReq)
 	if err != nil {
-		return SubmitResponse{}, fmt.Errorf("POST %s/api/v1/jobs: %w", c.redactedURL, err)
+		return SubmitResponse{}, fmt.Errorf("POST %s/api/v1/jobs (jobName=%q) failed (run `sentinel train list` to verify whether FTaaS already queued this job before retrying): %w", c.redactedURL, jobName, err)
 	}
 	if statusCode != http.StatusAccepted && statusCode != http.StatusOK {
 		return SubmitResponse{}, fmt.Errorf("FTaaS /api/v1/jobs returned HTTP %d: %s", statusCode, compactErrBody(respBody))
@@ -393,12 +395,12 @@ func (c *FTaaSClient) WaitForJob(
 		switch strings.ToLower(strings.TrimSpace(detail.Status)) {
 		case "succeeded", "completed":
 			return detail, nil
-		case "failed", "cancelled", "canceled":
+		case "failed", "cancelled", "canceled", "error", "aborted", "timed_out", "timeout":
 			msg := strings.TrimSpace(detail.ErrorMessage)
 			if msg == "" {
 				msg = "training job terminated with status " + detail.Status
 			}
-			return detail, fmt.Errorf("FTaaS job %s %s: %s", jobID, detail.Status, msg)
+			return detail, fmt.Errorf("FTaaS job %s %s: %s", jobID, detail.Status, compactErrBody([]byte(msg)))
 		}
 		select {
 		case <-ctx.Done():
@@ -432,13 +434,7 @@ func (c *FTaaSClient) doBounded(req *http.Request) ([]byte, int, error) {
 	return body, resp.StatusCode, nil
 }
 
-func buildMultipartUpload(filePath string, fields map[string]string) (*bytes.Buffer, string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, "", fmt.Errorf("open dataset %q: %w", filePath, err)
-	}
-	defer func() { _ = f.Close() }()
-
+func buildMultipartUploadFromBytes(fileName string, content []byte, fields map[string]string) (*bytes.Buffer, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
@@ -447,11 +443,11 @@ func buildMultipartUpload(filePath string, fields map[string]string) (*bytes.Buf
 			return nil, "", err
 		}
 	}
-	part, err := mw.CreateFormFile("file", filepath.Base(filePath))
+	part, err := mw.CreateFormFile("file", fileName)
 	if err != nil {
 		return nil, "", err
 	}
-	if _, err := io.Copy(part, f); err != nil {
+	if _, err := part.Write(content); err != nil {
 		return nil, "", err
 	}
 	if err := mw.Close(); err != nil {
@@ -462,13 +458,19 @@ func buildMultipartUpload(filePath string, fields map[string]string) (*bytes.Buf
 
 func compactErrBody(b []byte) string {
 	s := strings.TrimSpace(string(b))
-	if len(s) > 300 {
-		s = s[:300] + "..."
+	if len(s) > 4096 {
+		s = s[:4096]
 	}
-	return strings.Map(func(r rune) rune {
+	// Redact any echoed Authorization credentials, JWTs, API keys, or PII before error output.
+	s, _ = feedback.RedactText(s)
+	s = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
 			return ' '
 		}
 		return r
 	}, s)
+	if len(s) > 300 {
+		s = s[:300] + "..."
+	}
+	return s
 }

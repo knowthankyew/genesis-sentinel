@@ -51,9 +51,10 @@ func printFeedbackUsage(w io.Writer) {
   sentinel feedback stats [--name <slug>]
   sentinel feedback alerts [--limit 20]
 
-Canonical Classes:
+Canonical Classes (enforced fail-closed by live Tier 2 parser):
   BENIGN-NOISE, RECON-SCAN, AUTH-BRUTEFORCE, INJECTION-ATTEMPT,
-  EXFIL-SUSPECT, PRIV-ESC, POLICY-ANOMALY, NEEDS-REVIEW (or custom [A-Z0-9-])`)
+  EXFIL-SUSPECT, PRIV-ESC, POLICY-ANOMALY, NEEDS-REVIEW
+  (custom [A-Z0-9-] tags are permitted for dataset curation; live Tier 2 defaults unknown tags to NEEDS-REVIEW)`)
 }
 
 func runFeedbackAdd(args []string, stdout, stderr io.Writer) error {
@@ -188,6 +189,15 @@ func runFeedbackSeed(args []string, stdout, stderr io.Writer) error {
 	}
 	if *valPerClass < 0 {
 		return fmt.Errorf("--val-per-class must be >= 0, got %d", *valPerClass)
+	}
+	maxPerClass := config.DefaultMaxTrainingRecords / len(triage.AllClasses())
+	if *perClass > maxPerClass {
+		return fmt.Errorf("--per-class %d exceeds FTaaS %d-record ceiling (%d max per class across %d classes)",
+			*perClass, config.DefaultMaxTrainingRecords, maxPerClass, len(triage.AllClasses()))
+	}
+	if *valPerClass > maxPerClass {
+		return fmt.Errorf("--val-per-class %d exceeds FTaaS %d-record ceiling (%d max per class across %d classes)",
+			*valPerClass, config.DefaultMaxTrainingRecords, maxPerClass, len(triage.AllClasses()))
 	}
 
 	cfg, err := config.LoadConfig(*configPath)

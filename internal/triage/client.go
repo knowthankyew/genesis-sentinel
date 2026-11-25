@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
@@ -90,6 +92,7 @@ type Client struct {
 	maxPromptBytes int
 	cooldown       time.Duration
 	httpClient     *http.Client
+	nowFn          func() time.Time
 
 	mu                 sync.Mutex
 	baseModel          string
@@ -108,8 +111,10 @@ func ValidateAdapterPath(rel string) (string, error) {
 	if trimmed == "" {
 		return "", nil
 	}
-	if strings.ContainsRune(trimmed, '\x00') || strings.ContainsAny(trimmed, "\r\n") {
-		return "", fmt.Errorf("invalid adapter path: contains control characters")
+	for _, r := range trimmed {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("invalid adapter path: contains control characters")
+		}
 	}
 	// Reject Windows drive prefixes or backslashes that could confuse cross-platform path resolution.
 	if strings.ContainsRune(trimmed, '\\') || (len(trimmed) >= 2 && trimmed[1] == ':') {
@@ -154,7 +159,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
-		return nil, fmt.Errorf("invalid inference URL %q", opts.BaseURL)
+		return nil, fmt.Errorf("invalid inference URL: failed to parse host")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported inference URL scheme %q (expected http or https)", u.Scheme)
@@ -192,8 +197,12 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if maxPrompt <= 0 {
 		maxPrompt = config.DefaultMaxPromptBytes
 	}
+	if maxPrompt < MinPromptBytes {
+		return nil, fmt.Errorf("triage max_prompt_bytes %d is too small to fit required prompt framing (minimum %d)", maxPrompt, MinPromptBytes)
+	}
 
 	u.RawQuery = ""
+	u.ForceQuery = false
 	u.Fragment = ""
 	u.Path = strings.TrimRight(u.Path, "/")
 	fullBase := strings.TrimRight(u.String(), "/")
@@ -210,6 +219,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		maxPromptBytes: maxPrompt,
 		cooldown:       cooldown,
 		httpClient:     security.NewLoopbackHTTPClient(timeout, opts.AllowRemote, true),
+		nowFn:          time.Now,
 		baseModel:      baseModel,
 		adapterPath:    adapterPath,
 	}, nil
@@ -256,6 +266,35 @@ func (c *Client) BaseModel() string {
 	return c.baseModel
 }
 
+// SetModelAndAdapter atomically validates and hot-swaps both the active base model and
+// LoRA adapter path under a single lock so concurrent readers never observe a torn pair.
+func (c *Client) SetModelAndAdapter(baseModel, relPath string) error {
+	if _, err := model.ValidateBaseModel(baseModel); err != nil {
+		return err
+	}
+	clean, err := ValidateAdapterPath(relPath)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.baseModel = strings.TrimSpace(baseModel)
+	c.adapterPath = clean
+	c.openUntil = time.Time{}
+	c.circuitGen++
+	c.mu.Unlock()
+	return nil
+}
+
+// ResetAdapter deactivates any hot-swapped LoRA adapter (reverting to base-model-only
+// inference) and clears the circuit breaker. Used by Pipeline.Burn().
+func (c *Client) ResetAdapter() {
+	c.mu.Lock()
+	c.adapterPath = ""
+	c.openUntil = time.Time{}
+	c.circuitGen++
+	c.mu.Unlock()
+}
+
 // ResetCircuit clears the circuit breaker and bumps circuitGen so older in-flight failures
 // cannot re-open a freshly reset breaker.
 func (c *Client) ResetCircuit() {
@@ -263,6 +302,13 @@ func (c *Client) ResetCircuit() {
 	c.openUntil = time.Time{}
 	c.circuitGen++
 	c.mu.Unlock()
+}
+
+func (c *Client) now() time.Time {
+	if c.nowFn != nil {
+		return c.nowFn()
+	}
+	return time.Now()
 }
 
 // Stats returns a thread-safe snapshot of Tier 2 inference counters.
@@ -275,7 +321,7 @@ func (c *Client) Stats() ClientStats {
 		EvaluatedTotal:     c.evaluatedTotal,
 		FallbacksTotal:     c.fallbacksTotal,
 		InjectionOverrides: c.injectionOverrides,
-		CircuitOpen:        !c.openUntil.IsZero() && time.Now().Before(c.openUntil),
+		CircuitOpen:        !c.openUntil.IsZero() && c.now().Before(c.openUntil),
 	}
 }
 
@@ -319,11 +365,12 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	}
 
 	c.mu.Lock()
-	now := time.Now()
+	now := c.now()
 	if !c.openUntil.IsZero() && now.Before(c.openUntil) {
+		until := c.openUntil
 		c.fallbacksTotal++
 		c.mu.Unlock()
-		return model.TriageVerdict{}, false, fmt.Errorf("tier2 inference circuit open until %s", c.openUntil.Format(time.RFC3339))
+		return model.TriageVerdict{}, false, fmt.Errorf("tier2 inference circuit open until %s", until.Format(time.RFC3339))
 	}
 	if ctx.Err() != nil {
 		c.fallbacksTotal++
@@ -383,7 +430,7 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 		// an unhealthy or mismatched local inference server on every alert window.
 		c.recordFailure(circuitGen, resp.StatusCode >= 500 || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity)
 		return model.TriageVerdict{}, false, fmt.Errorf("inference endpoint returned HTTP %d: %s",
-			resp.StatusCode, sanitizeSingleLine(string(respBody), 240))
+			resp.StatusCode, redactErrSnippet(string(respBody)))
 	}
 
 	var genResp generateResponse
@@ -394,6 +441,15 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	if strings.TrimSpace(genResp.Completion) == "" {
 		c.recordFailure(circuitGen, false)
 		return model.TriageVerdict{}, false, fmt.Errorf("inference returned empty completion")
+	}
+	// Fail closed if the server explicitly reports a different runtime model or adapter than requested.
+	if respModel := strings.TrimSpace(genResp.BaseModel); respModel != "" && respModel != baseModel {
+		c.recordFailure(circuitGen, true)
+		return model.TriageVerdict{}, false, fmt.Errorf("inference baseModel mismatch: requested %q, server used %q", baseModel, respModel)
+	}
+	if respAdapter := strings.TrimSpace(genResp.AdapterPath); respAdapter != "" && respAdapter != adapterPath {
+		c.recordFailure(circuitGen, true)
+		return model.TriageVerdict{}, false, fmt.Errorf("inference adapterPath mismatch: requested %q, server used %q", adapterPath, respAdapter)
 	}
 
 	verdict, overridden := ParseCompletion(
@@ -422,8 +478,22 @@ func (c *Client) recordFailure(circuitGen uint64, tripBreaker bool) {
 	c.mu.Lock()
 	c.fallbacksTotal++
 	if tripBreaker && c.circuitGen == circuitGen {
-		c.openUntil = time.Now().Add(c.cooldown)
+		c.openUntil = c.now().Add(c.cooldown)
 		c.circuitGen++
 	}
 	c.mu.Unlock()
+}
+
+var (
+	diagAuthCredRe = regexp.MustCompile(`(?i)\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{6,}`)
+	diagJWTRe      = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+	diagCredKVRe   = regexp.MustCompile(`(?i)(["']?)(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}]+)`)
+)
+
+func redactErrSnippet(raw string) string {
+	s := sanitizeSingleLine(raw, 240)
+	s = diagJWTRe.ReplaceAllString(s, "[REDACTED_JWT]")
+	s = diagAuthCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
+	s = diagCredKVRe.ReplaceAllString(s, "${1}${2}${3}[REDACTED_SECRET]")
+	return s
 }

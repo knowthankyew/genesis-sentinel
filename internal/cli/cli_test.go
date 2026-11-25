@@ -10,7 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/knowthankyew/genesis-sentinel/internal/config"
+	"github.com/knowthankyew/genesis-sentinel/internal/emit"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
+	"github.com/knowthankyew/genesis-sentinel/internal/pipeline"
+	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/surprisal"
 )
 
@@ -502,5 +506,87 @@ func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
 			t.Fatalf("expected %s to be wiped by sentinel burn -y", gone)
 		}
+	}
+}
+
+func TestWatchHTTPHandlerRequiresAuthBeforeAdapterMutation(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.TriageMode = "http"
+	cfg.InferenceAddr = "http://127.0.0.1:8000"
+	cfg.AdapterPath = "artifacts/original/model_adapters"
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	pipe := pipeline.New(cfg, ruleEng, emit.NopSink{}, "file")
+	handler := newWatchHTTPHandler(pipe, "daemon-auth-secret")
+
+	// Unauthenticated POST /adapter must fail with 401 before mutating client or writing active-adapter.json.
+	unauthRec := httptest.NewRecorder()
+	unauthReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/hijack/model_adapters"}`))
+	handler.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated POST /adapter, got %d", unauthRec.Code)
+	}
+	if st := pipe.Stats(); st.TriageAdapter != "artifacts/original/model_adapters" {
+		t.Fatalf("unauthenticated request mutated adapter: %q", st.TriageAdapter)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "active-adapter.json")); !os.IsNotExist(err) {
+		t.Fatal("unauthenticated request wrote active-adapter.json")
+	}
+
+	// Authenticated POST /adapter succeeds and writes active-adapter.json.
+	authRec := httptest.NewRecorder()
+	authReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/verified/model_adapters"}`))
+	authReq.Header.Set("Authorization", "Bearer daemon-auth-secret")
+	handler.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated POST /adapter, got %d: %s", authRec.Code, authRec.Body.String())
+	}
+	if st := pipe.Stats(); st.TriageAdapter != "artifacts/verified/model_adapters" {
+		t.Fatalf("authenticated POST /adapter did not update client: %q", st.TriageAdapter)
+	}
+}
+
+func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
+	dataDir := t.TempDir()
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{"feedback", "seed", "--data-dir", dataDir, "--name", "s", "--per-class", "1"}, &out, &errBuf); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+	seedPath := filepath.Join(dataDir, "feedback", "sentinel-feedback-s.jsonl")
+
+	ftaasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"jobId":"job-fail-1","jobName":"fail-test","status":"Queued","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-fail-1":
+			_, _ = w.Write([]byte(`{"jobId":"job-fail-1","status":"Failed","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job-fail-1/model_adapters","errorMessage":"oom"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ftaasSrv.Close()
+
+	out.Reset()
+	errBuf.Reset()
+	err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--ftaas-http", ftaasSrv.URL,
+		"--dataset", seedPath,
+		"--wait",
+		"--poll-interval", "5ms",
+		"--activate",
+	}, &out, &errBuf)
+	if err == nil {
+		t.Fatal("expected train submit --wait --activate to return error for Failed job")
+	}
+	if _, statErr := os.Stat(filepath.Join(dataDir, "active-adapter.json")); !os.IsNotExist(statErr) {
+		t.Fatal("Failed job with nonempty adapterPath wrote active-adapter.json")
 	}
 }

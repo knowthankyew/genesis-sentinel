@@ -76,6 +76,16 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 		t.Fatal("expected traversal adapter_path to fail validation")
 	}
 	cfg = DefaultConfig()
+	cfg.AdapterPath = "artifacts/job\t1/model_adapters"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected control-character adapter_path to fail validation")
+	}
+	cfg = DefaultConfig()
+	cfg.MaxPromptByte = 64
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected sub-framing max_prompt_bytes to fail validation")
+	}
+	cfg = DefaultConfig()
 	cfg.TriageMaxTokens = 999
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected out-of-range triage_max_tokens to fail validation")

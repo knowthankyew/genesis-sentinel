@@ -200,7 +200,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	pipe.AttachSegReader(segReader)
 	pipe.AttachQueryPoller(queryPoller)
 	if cfg.DataDir != "" {
-		pipe.AttachAlertJournal(feedback.NewAlertJournal(cfg.DataDir))
+		pipe.AttachAlertJournal(feedback.NewAlertJournalWithRedaction(cfg.DataDir, cfg.RequireRedaction))
 	}
 
 	// Hydrate persisted Tier 1 rolling baseline snapshot if present.
@@ -241,14 +241,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, pollInterval)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", pipe.HandleHealthz)
-	mux.HandleFunc("/stats", pipe.HandleStats)
-	mux.HandleFunc("/burn", pipe.HandleBurn)
-	mux.HandleFunc("/adapter", pipe.HandleAdapter)
-
 	httpSrv := &http.Server{
-		Handler:           security.AuthMiddleware(cfg.AuthToken, mux),
+		Handler:           newWatchHTTPHandler(pipe, cfg.AuthToken),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -343,12 +337,21 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			emitted, failed := pipe.FlushWindow()
 			if len(emitted) > 0 || len(failed) > 0 {
 				st := pipe.Stats()
-				logger.Printf("[Tier0+1] Emitted %d alert(s), %d sink failure(s) (total_lines=%d, surprisal_anomalies=%d, baseline=%d)",
-					len(emitted), len(failed), st.LinesRead, st.SurprisalAnomalies, st.SurprisalBaselineCases)
+				logger.Printf("[Tier0+1] Emitted %d alert(s), %d sink failure(s), %d journal error(s) (total_lines=%d, surprisal_anomalies=%d, baseline=%d)",
+					len(emitted), len(failed), st.JournalErrors, st.LinesRead, st.SurprisalAnomalies, st.SurprisalBaselineCases)
 			}
 			if saveErr := pipe.SaveBaseline(baselinePath, false); saveErr != nil {
 				logger.Printf("[Tier1] baseline save error (will retry on next flush): %v", saveErr)
 			}
 		}
 	}
+}
+
+func newWatchHTTPHandler(pipe *pipeline.Pipeline, authToken string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", pipe.HandleHealthz)
+	mux.HandleFunc("/stats", pipe.HandleStats)
+	mux.HandleFunc("/burn", pipe.HandleBurn)
+	mux.HandleFunc("/adapter", pipe.HandleAdapter)
+	return security.AuthMiddleware(authToken, mux)
 }

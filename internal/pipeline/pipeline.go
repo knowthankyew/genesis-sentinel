@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -48,6 +49,7 @@ type Stats struct {
 	RuleBucketsDropped         uint64  `json:"rule_buckets_dropped"`
 	OverflowThresholdSkipped   uint64  `json:"overflow_threshold_skipped"`
 	SinkErrors                 uint64  `json:"sink_errors"`
+	JournalErrors              uint64  `json:"journal_errors"`
 	SurprisalMode              string  `json:"surprisal_mode"`
 	SurprisalThresholdNats     float64 `json:"surprisal_threshold_nats"`
 	SurprisalScored            uint64  `json:"surprisal_scored"`
@@ -160,6 +162,7 @@ type Pipeline struct {
 	ruleBucketsDropped       atomic.Uint64
 	overflowThresholdSkipped atomic.Uint64
 	sinkErrors               atomic.Uint64
+	journalErrors            atomic.Uint64
 	alertSeq                 atomic.Uint64
 }
 
@@ -607,6 +610,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		cleanService := bucket.displayService
 		cleanLevel := bucket.displayLevel
 		cleanTemplate, _ := security.SanitizeUntrustedLogText(tmplStr, p.cfg.MaxPromptByte)
+		if p.cfg.RequireRedaction {
+			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
+			bestSample, _ = feedback.RedactText(bestSample)
+		}
 
 		p.ruleHitsTotal.Add(uint64(len(qualifyingHits)))
 		seq := p.alertSeq.Add(1)
@@ -718,6 +725,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		cleanLevel, lvlSigs := security.SanitizeUntrustedLogText(w.Level, 64)
 		cleanTemplate, _ := security.SanitizeUntrustedLogText(w.Template, p.cfg.MaxPromptByte)
 		cleanSample, msgSigs := security.SanitizeUntrustedLogText(w.SampleLine, p.cfg.MaxPromptByte)
+		if p.cfg.RequireRedaction {
+			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
+			cleanSample, _ = feedback.RedactText(cleanSample)
+		}
 
 		var injSignals []string
 		seenSig := make(map[string]struct{})
@@ -792,7 +803,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 
 	if p.alertJournal != nil && len(emitted) > 0 {
-		_ = p.alertJournal.Record(emitted...)
+		if err := p.alertJournal.Record(emitted...); err != nil {
+			p.journalErrors.Add(1)
+		}
 	}
 
 	return emitted, failed
@@ -821,11 +834,15 @@ func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, a
 	if err != nil {
 		return
 	}
+	explanation := verdict.Explanation
+	if p.cfg.RequireRedaction {
+		explanation, _ = feedback.RedactText(explanation)
+	}
 	alert.Tier = alert.Tier + "+tier2"
 	alert.TriageClass = verdict.Label
 	alert.TriageConfidence = verdict.Confidence
 	alert.TriageMitreTactic = verdict.MitreTactic
-	alert.TriageExplanation = verdict.Explanation
+	alert.TriageExplanation = explanation
 	alert.TriageModel = verdict.ModelID
 	alert.TriageAdapter = verdict.AdapterID
 	alert.TriageOverridden = overridden
@@ -834,7 +851,7 @@ func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, a
 	// hallucination cannot silently downgrade a deterministic CRITICAL/HIGH rule alert.
 	alert.Severity = emit.HigherSeverity(alert.Severity, verdict.Severity)
 	alert.Level = emit.MapSeverityToGenesisLevel(alert.Severity)
-	alert.Message = fmt.Sprintf("%s triage=[%s] %s", alert.Message, verdict.Label, truncateSummary(verdict.Explanation, 160))
+	alert.Message = fmt.Sprintf("%s triage=[%s] %s", alert.Message, verdict.Label, truncateSummary(explanation, 160))
 }
 
 func mapSurprisalSeverity(totalNats, thresholdNats float64, level string) string {
@@ -879,6 +896,7 @@ func (p *Pipeline) Stats() Stats {
 		RuleBucketsDropped:       p.ruleBucketsDropped.Load(),
 		OverflowThresholdSkipped: p.overflowThresholdSkipped.Load(),
 		SinkErrors:               p.sinkErrors.Load(),
+		JournalErrors:            p.journalErrors.Load(),
 		TriageMode:               p.cfg.TriageMode,
 		ActiveSource:             p.activeSource,
 		DataDir:                  p.cfg.DataDir,
@@ -944,7 +962,7 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 		p.surprisalEng.Reset()
 	}
 	if p.triageClient != nil {
-		p.triageClient.ResetCircuit()
+		p.triageClient.ResetAdapter()
 	}
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
@@ -952,11 +970,13 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	if p.queryPoller != nil {
 		p.queryPoller.Reset()
 	}
-	return BurnLocalState(p.cfg.DataDir)
+	return BurnLocalStateWithFeedbackDir(p.cfg.DataDir, p.cfg.FeedbackDir)
 }
 
 // HandleAdapter serves POST /adapter to hot-swap the active Tier 2 LoRA adapter on a running
-// Sentinel sidecar and persist active-adapter.json cleanly under burnMu.
+// Sentinel sidecar and persist active-adapter.json cleanly inside one exclusive activation
+// transaction (holding burnMu.Lock so concurrent activations, FlushWindow, and Burn strictly
+// serialize, and persisting to disk before mutating live in-memory state).
 func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed; use POST"}`, http.StatusMethodNotAllowed)
@@ -993,30 +1013,26 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.burnMu.RLock()
-	defer p.burnMu.RUnlock()
-
-	if p.triageClient != nil {
-		if err := p.triageClient.SetBaseModel(baseModel); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		if err := p.triageClient.SetAdapterPath(cleanAdapter); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
+	p.burnMu.Lock()
+	defer p.burnMu.Unlock()
 
 	state := train.ActiveAdapter{
 		BaseModel:   baseModel,
 		AdapterPath: cleanAdapter,
 		ActivatedAt: time.Now().UTC(),
 	}
+	// Persist before committing to live triageClient so a disk persistence failure leaves
+	// the previously active adapter untouched in both memory and active-adapter.json.
 	if p.cfg.DataDir != "" {
 		if err := train.SaveActiveAdapter(p.cfg.DataDir, state); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if p.triageClient != nil {
+		if err := p.triageClient.SetModelAndAdapter(baseModel, cleanAdapter); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
@@ -1066,39 +1082,25 @@ func (p *Pipeline) HandleBurn(w http.ResponseWriter, r *http.Request) {
 }
 
 // BurnLocalState deletes ONLY known Sentinel-owned regular files inside dataDir
-// (cursor files, baseline snapshots, and Sentinel-named feedback/*.jsonl files),
-// strictly confined via Go 1.24's os.Root (and nested root.OpenRoot("feedback")
-// so enumeration and deletion stay bound to the validated directory handle).
+// (cursor files, baseline snapshots, alerts.jsonl, active-adapter.json, and Sentinel-named
+// feedback/*.jsonl files), strictly confined via Go 1.24's os.Root.
 func BurnLocalState(dataDir string) (BurnReport, error) {
+	return BurnLocalStateWithFeedbackDir(dataDir, "")
+}
+
+// BurnLocalStateWithFeedbackDir purges Sentinel-owned files in dataDir and, when a separate
+// custom feedbackDir is configured outside dataDir/feedback, also purges Sentinel-named
+// feedback files inside feedbackDir using an os.Root-confined directory handle.
+func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, error) {
 	rep := BurnReport{
 		Status:    "burned",
 		DataDir:   dataDir,
 		Timestamp: time.Now().UTC(),
 		Note:      "Sentinel-owned local state purged. Already-trained FTaaS LoRA weights remain in ml/data/artifacts/ and must be removed separately if desired.",
 	}
-	if strings.TrimSpace(dataDir) == "" {
+	if strings.TrimSpace(dataDir) == "" && strings.TrimSpace(feedbackDir) == "" {
 		return rep, nil
 	}
-
-	info, err := os.Stat(dataDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return rep, nil
-		}
-		rep.Status = "failed"
-		return rep, fmt.Errorf("stat data dir %q: %w", dataDir, err)
-	}
-	if !info.IsDir() {
-		rep.Status = "failed"
-		return rep, fmt.Errorf("data dir %q is not a directory", dataDir)
-	}
-
-	root, err := os.OpenRoot(dataDir)
-	if err != nil {
-		rep.Status = "failed"
-		return rep, fmt.Errorf("open root %q: %w", dataDir, err)
-	}
-	defer func() { _ = root.Close() }()
 
 	var errs []error
 	removeOwnedInRoot := func(r *os.Root, rel string) {
@@ -1126,70 +1128,146 @@ func BurnLocalState(dataDir string) (BurnReport, error) {
 		rep.BytesRemoved += sz
 	}
 
-	// 1. Known top-level Sentinel state files and atomic cursor temp files.
-	topDir, err := root.Open(".")
-	if err != nil {
-		rep.Status = "failed"
-		return rep, fmt.Errorf("open root dir %q: %w", dataDir, err)
-	}
-	entries, err := topDir.ReadDir(-1)
-	_ = topDir.Close()
-	if err != nil {
-		rep.Status = "failed"
-		return rep, fmt.Errorf("read data dir %q: %w", dataDir, err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if isOwnedTopLevelFile(entry.Name()) {
-			removeOwnedInRoot(root, entry.Name())
+	var defaultFeedbackStat os.FileInfo
+	if strings.TrimSpace(dataDir) != "" {
+		info, err := os.Stat(dataDir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				rep.Status = "failed"
+				return rep, fmt.Errorf("stat data dir %q: %w", dataDir, err)
+			}
+		} else {
+			if !info.IsDir() {
+				rep.Status = "failed"
+				return rep, fmt.Errorf("data dir %q is not a directory", dataDir)
+			}
+
+			root, err := os.OpenRoot(dataDir)
+			if err != nil {
+				rep.Status = "failed"
+				return rep, fmt.Errorf("open root %q: %w", dataDir, err)
+			}
+			defer func() { _ = root.Close() }()
+
+			// 1. Known top-level Sentinel state files and atomic temp files.
+			topDir, err := root.Open(".")
+			if err != nil {
+				rep.Status = "failed"
+				return rep, fmt.Errorf("open root dir %q: %w", dataDir, err)
+			}
+			entries, err := topDir.ReadDir(-1)
+			_ = topDir.Close()
+			if err != nil {
+				rep.Status = "failed"
+				return rep, fmt.Errorf("read data dir %q: %w", dataDir, err)
+			}
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				if isOwnedTopLevelFile(entry.Name()) {
+					removeOwnedInRoot(root, entry.Name())
+				}
+			}
+
+			// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
+			fbInfo, statErr := root.Lstat("feedback")
+			if statErr == nil {
+				if fbInfo.Mode()&os.ModeSymlink != 0 {
+					errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
+				} else if fbInfo.IsDir() {
+					defaultFeedbackStat = fbInfo
+					fbRoot, openRootErr := root.OpenRoot("feedback")
+					if openRootErr != nil {
+						errs = append(errs, fmt.Errorf("open feedback root: %w", openRootErr))
+					} else {
+						fbStat, fbStatErr := fbRoot.Stat(".")
+						if fbStatErr != nil {
+							errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
+							_ = fbRoot.Close()
+						} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
+							errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
+							_ = fbRoot.Close()
+						} else {
+							fbDir, openErr := fbRoot.Open(".")
+							if openErr != nil {
+								errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+							} else {
+								fbEntries, readErr := fbDir.ReadDir(-1)
+								_ = fbDir.Close()
+								if readErr != nil {
+									errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+								} else {
+									for _, e := range fbEntries {
+										if e.IsDir() {
+											continue
+										}
+										if isOwnedFeedbackFile(e.Name()) {
+											removeOwnedInRoot(fbRoot, e.Name())
+										}
+									}
+								}
+							}
+							_ = fbRoot.Close()
+						}
+					}
+				}
+			} else if !os.IsNotExist(statErr) {
+				errs = append(errs, fmt.Errorf("lstat feedback dir: %w", statErr))
+			}
 		}
 	}
 
-	// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
-	fbInfo, statErr := root.Lstat("feedback")
-	if statErr == nil {
-		if fbInfo.Mode()&os.ModeSymlink != 0 {
-			errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
-		} else if fbInfo.IsDir() {
-			fbRoot, openRootErr := root.OpenRoot("feedback")
-			if openRootErr != nil {
-				errs = append(errs, fmt.Errorf("open feedback root: %w", openRootErr))
-			} else {
-				fbStat, fbStatErr := fbRoot.Stat(".")
-				if fbStatErr != nil {
-					errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
-					_ = fbRoot.Close()
-				} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
-					errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
-					_ = fbRoot.Close()
-				} else {
-					fbDir, openErr := fbRoot.Open(".")
+	// 3. If a separate custom feedbackDir was configured outside dataDir/feedback, purge ONLY
+	// Sentinel-named feedback files there via an os.Root handle as well.
+	if trimmedFB := strings.TrimSpace(feedbackDir); trimmedFB != "" {
+		cleanDefault := ""
+		if strings.TrimSpace(dataDir) != "" {
+			cleanDefault = filepath.Clean(filepath.Join(dataDir, "feedback"))
+		}
+		if filepath.Clean(trimmedFB) != cleanDefault {
+			customInfo, lstatErr := os.Lstat(trimmedFB)
+			if lstatErr == nil {
+				if customInfo.Mode()&os.ModeSymlink != 0 {
+					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", trimmedFB))
+				} else if customInfo.IsDir() && (defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo)) {
+					customRoot, openErr := os.OpenRoot(trimmedFB)
 					if openErr != nil {
-						errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+						errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", trimmedFB, openErr))
 					} else {
-						fbEntries, readErr := fbDir.ReadDir(-1)
-						_ = fbDir.Close()
-						if readErr != nil {
-							errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+						cStat, cStatErr := customRoot.Stat(".")
+						if cStatErr != nil {
+							errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", trimmedFB, cStatErr))
+						} else if !cStat.IsDir() || !os.SameFile(customInfo, cStat) {
+							errs = append(errs, fmt.Errorf("refusing custom feedback cleanup: directory identity changed between Lstat and OpenRoot"))
 						} else {
-							for _, e := range fbEntries {
-								if e.IsDir() {
-									continue
-								}
-								if isOwnedFeedbackFile(e.Name()) {
-									removeOwnedInRoot(fbRoot, e.Name())
+							cDir, dOpenErr := customRoot.Open(".")
+							if dOpenErr != nil {
+								errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", trimmedFB, dOpenErr))
+							} else {
+								cEntries, readErr := cDir.ReadDir(-1)
+								_ = cDir.Close()
+								if readErr != nil {
+									errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", trimmedFB, readErr))
+								} else {
+									for _, e := range cEntries {
+										if e.IsDir() {
+											continue
+										}
+										if isOwnedFeedbackFile(e.Name()) {
+											removeOwnedInRoot(customRoot, e.Name())
+										}
+									}
 								}
 							}
 						}
+						_ = customRoot.Close()
 					}
-					_ = fbRoot.Close()
 				}
+			} else if !os.IsNotExist(lstatErr) {
+				errs = append(errs, fmt.Errorf("lstat custom feedback dir %q: %w", trimmedFB, lstatErr))
 			}
 		}
-	} else if !os.IsNotExist(statErr) {
-		errs = append(errs, fmt.Errorf("lstat feedback dir: %w", statErr))
 	}
 
 	if len(errs) > 0 {

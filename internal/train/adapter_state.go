@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,9 +135,25 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	if !strings.Contains(target, "://") {
 		target = "http://" + target
 	}
-	if !allowRemote && !security.IsLoopbackEndpoint(target) {
-		return fmt.Errorf("refusing non-loopback Sentinel endpoint %q without allow_remote_endpoints=true", target)
+	u, err := url.Parse(target)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid Sentinel HTTP URL: failed to parse host")
 	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported Sentinel HTTP URL scheme %q (expected http or https)", u.Scheme)
+	}
+	if !allowRemote && !security.IsLoopbackEndpoint(target) {
+		return fmt.Errorf("refusing non-loopback Sentinel endpoint %q without allow_remote_endpoints=true", u.Host)
+	}
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.Path = strings.TrimRight(u.Path, "/")
+	fullTarget := strings.TrimRight(u.String(), "/")
+	redactedU := *u
+	redactedU.User = nil
+	redactedTarget := strings.TrimRight(redactedU.String(), "/")
+
 	body, err := json.Marshal(map[string]string{
 		"base_model":   state.BaseModel,
 		"adapter_path": state.AdapterPath,
@@ -144,7 +161,7 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target, "/")+"/adapter", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullTarget+"/adapter", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -156,13 +173,13 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	client := security.NewLoopbackHTTPClient(5*time.Second, allowRemote, true)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s/adapter: %w", target, err)
+		return fmt.Errorf("POST %s/adapter: %w", redactedTarget, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST %s/adapter returned HTTP %d: %s", target, resp.StatusCode, compactErrBody(respBody))
+		return fmt.Errorf("POST %s/adapter returned HTTP %d: %s", redactedTarget, resp.StatusCode, compactErrBody(respBody))
 	}
 	return nil
 }

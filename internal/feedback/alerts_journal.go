@@ -20,23 +20,37 @@ const (
 	MaxAlertJournalRecords = 2000
 	// MaxAlertJournalBytes bounds disk space used by the local alert journal.
 	MaxAlertJournalBytes = 4 * 1024 * 1024 // 4 MiB
+	// MaxAlertRecordBytes caps any single serialized journal record so every written record
+	// remains strictly readable by FindByID and Recent.
+	MaxAlertRecordBytes = 256 * 1024 // 256 KiB
 )
 
 // AlertJournal maintains a bounded local ring of recent emitted alerts on disk so
 // operators can curate feedback by ID (`sentinel feedback --alert-id <ID> --label fp`).
 type AlertJournal struct {
-	mu         sync.Mutex
-	path       string
-	maxRecords int
-	maxBytes   int64
+	mu               sync.Mutex
+	path             string
+	maxRecords       int
+	maxBytes         int64
+	maxRecordBytes   int
+	requireRedaction bool
 }
 
-// NewAlertJournal creates a bounded alert journal backed by filepath.Join(dataDir, "alerts.jsonl").
+// NewAlertJournal creates a bounded alert journal backed by filepath.Join(dataDir, "alerts.jsonl")
+// with mandatory PII/secret redaction enabled by default.
 func NewAlertJournal(dataDir string) *AlertJournal {
+	return NewAlertJournalWithRedaction(dataDir, true)
+}
+
+// NewAlertJournalWithRedaction creates a bounded alert journal backed by
+// filepath.Join(dataDir, "alerts.jsonl") with configurable PII/secret scrubbing on persistence.
+func NewAlertJournalWithRedaction(dataDir string, requireRedaction bool) *AlertJournal {
 	return &AlertJournal{
-		path:       filepath.Join(dataDir, DefaultAlertJournalFilename),
-		maxRecords: MaxAlertJournalRecords,
-		maxBytes:   MaxAlertJournalBytes,
+		path:             filepath.Join(dataDir, DefaultAlertJournalFilename),
+		maxRecords:       MaxAlertJournalRecords,
+		maxBytes:         MaxAlertJournalBytes,
+		maxRecordBytes:   MaxAlertRecordBytes,
+		requireRedaction: requireRedaction,
 	}
 }
 
@@ -47,6 +61,7 @@ func (j *AlertJournal) Path() string {
 
 // Record appends newly emitted alerts into the bounded local journal using an atomic rewrite
 // when trimming oldest records so partial writes never corrupt alerts.jsonl.
+// Existing I/O errors are propagated without overwriting or resetting the journal.
 func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	if j == nil || strings.TrimSpace(j.path) == "" || len(alerts) == 0 {
 		return nil
@@ -54,16 +69,37 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	unlock, err := acquireFileLock(j.path, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	existing, err := j.readAllLocked()
 	if err != nil {
-		// If a pre-existing journal is corrupted, start fresh rather than blocking live alerting.
-		existing = nil
+		return fmt.Errorf("read alert journal %q: %w", j.path, err)
 	}
-	combined := append(existing, alerts...)
+	incoming := make([]emit.Alert, len(alerts))
+	for i, a := range alerts {
+		if j.requireRedaction {
+			a = redactAlertForPersistence(a)
+		}
+		incoming[i] = a
+	}
+
+	combined := append(existing, incoming...)
 	if len(combined) > j.maxRecords {
 		combined = combined[len(combined)-j.maxRecords:]
 	}
 	return j.writeAtomicLocked(combined)
+}
+
+func redactAlertForPersistence(a emit.Alert) emit.Alert {
+	a.Message, _ = RedactText(a.Message)
+	a.Template, _ = RedactText(a.Template)
+	a.SanitizedSample, _ = RedactText(a.SanitizedSample)
+	a.TriageExplanation, _ = RedactText(a.TriageExplanation)
+	return a
 }
 
 // FindByID searches the local alert journal for the most recent alert matching alertID.
@@ -73,6 +109,12 @@ func (j *AlertJournal) FindByID(alertID string) (emit.Alert, bool, error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+
+	unlock, err := acquireFileLock(j.path, false)
+	if err != nil {
+		return emit.Alert{}, false, err
+	}
+	defer unlock()
 
 	all, err := j.readAllLocked()
 	if err != nil {
@@ -95,6 +137,12 @@ func (j *AlertJournal) Recent(limit int) ([]emit.Alert, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	unlock, err := acquireFileLock(j.path, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	all, err := j.readAllLocked()
 	if err != nil {
 		return nil, err
@@ -107,6 +155,17 @@ func (j *AlertJournal) Recent(limit int) ([]emit.Alert, error) {
 		out = append(out, all[i])
 	}
 	return out, nil
+}
+
+func (j *AlertJournal) effectiveMaxRecordBytes() int {
+	recCap := j.maxRecordBytes
+	if recCap <= 0 {
+		recCap = MaxAlertRecordBytes
+	}
+	if j.maxBytes > 0 && int64(recCap) > j.maxBytes {
+		recCap = int(j.maxBytes)
+	}
+	return recCap
 }
 
 func (j *AlertJournal) readAllLocked() ([]emit.Alert, error) {
@@ -130,8 +189,14 @@ func (j *AlertJournal) readAllLocked() ([]emit.Alert, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	// Size scanner token limit strictly above effectiveMaxRecordBytes (and maxBytes) so every
+	// valid written record can always be read back without bufio.ErrTooLong.
+	scanMax := j.effectiveMaxRecordBytes() + 4096
+	if j.maxBytes > 0 && int(j.maxBytes)+4096 > scanMax {
+		scanMax = int(j.maxBytes) + 4096
+	}
 	scanner := bufio.NewScanner(io.LimitReader(f, j.maxBytes*2+1))
-	scanner.Buffer(make([]byte, 64*1024), 512*1024)
+	scanner.Buffer(make([]byte, 64*1024), scanMax)
 	var out []emit.Alert
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -155,24 +220,34 @@ func (j *AlertJournal) writeAtomicLocked(alerts []emit.Alert) error {
 		return err
 	}
 
-	// Pre-serialize and trim oldest records if serialized bytes exceed j.maxBytes.
+	recCap := j.effectiveMaxRecordBytes()
+	// Pre-serialize and validate per-record / total byte ceilings before touching disk.
 	lines := make([][]byte, 0, len(alerts))
 	var totalBytes int64
 	for _, a := range alerts {
 		b, err := json.Marshal(a)
 		if err != nil {
-			continue
+			return fmt.Errorf("marshal alert %q: %w", a.AlertID, err)
 		}
 		b = append(b, '\n')
+		if len(b) > recCap || int64(len(b)) > j.maxBytes {
+			return fmt.Errorf("alert %q serialized size (%d bytes) exceeds journal limit (%d bytes)", a.AlertID, len(b), recCap)
+		}
 		lines = append(lines, b)
 		totalBytes += int64(len(b))
 	}
+	if len(lines) == 0 {
+		return nil
+	}
 	startIdx := 0
-	for startIdx < len(lines)-1 && totalBytes > j.maxBytes {
+	for startIdx < len(lines) && totalBytes > j.maxBytes {
 		totalBytes -= int64(len(lines[startIdx]))
 		startIdx++
 	}
 	lines = lines[startIdx:]
+	if len(lines) == 0 {
+		return fmt.Errorf("no alerts fit within alert journal byte budget (%d bytes)", j.maxBytes)
+	}
 
 	tmp, err := os.CreateTemp(dir, ".alerts-*.tmp")
 	if err != nil {
