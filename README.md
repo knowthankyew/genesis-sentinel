@@ -45,21 +45,21 @@ Project Genesis can ingest over one million lines per second in RAM, while local
 
 ## Empirical Benchmarks (Phase 4)
 
-Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-25-3a237d1.md](docs/benchmarks/2026-11-25-3a237d1.md)).
+Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-25-9603451.md](docs/benchmarks/2026-11-25-9603451.md)).
 
 <!-- BEGIN_EMPIRICAL -->
 | Benchmark Gate | Target | Measured Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->88,098.90 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
+| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->81,198.89 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
 | **Lossless `.seg` Ingestion** | <!-- claim:bench_tier0_dropped_target -->0 dropped<!-- /claim --> | **<!-- claim:bench_tier0_lines_read -->100,000 read<!-- /claim -->** / <!-- claim:bench_tier0_lines_dropped -->0 dropped<!-- /claim --> | <!-- claim:bench_tier0_lossless_status -->PASSED<!-- /claim --> |
-| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 48.368 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 140.877 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
+| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 74.720 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 204.981 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
 | **Synthetic Detection Accuracy (Tier 0+1)** | <!-- claim:bench_detection_f1_target -->F1 >= 0.90<!-- /claim --> | **<!-- claim:bench_detection_f1 -->F1 1.0000<!-- /claim -->** (<!-- claim:bench_detection_tp -->TP=100<!-- /claim -->, <!-- claim:bench_detection_fp -->FP=0<!-- /claim -->) | <!-- claim:bench_detection_f1_status -->PASSED<!-- /claim --> |
-| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,229.62 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,560.42 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
-| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->4.28 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->17.16 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
-| **Adversarial Hostile-Log Self-Checks** | All pass | **<!-- claim:bench_adv_passed -->8<!-- /claim -->/<!-- claim:bench_adv_total -->8<!-- /claim -->** passed | <!-- claim:bench_adv_status -->PASSED<!-- /claim --> |
+| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,757.09 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 4,163.62 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
+| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->4.41 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->17.86 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
+| **Adversarial Hostile-Log Self-Checks** | All pass | **<!-- claim:bench_adv_passed -->9<!-- /claim -->/<!-- claim:bench_adv_total -->9<!-- /claim -->** passed | <!-- claim:bench_adv_status -->PASSED<!-- /claim --> |
 <!-- END_EMPIRICAL -->
 
-**Offline Semantic Embedding Tradeoff (`sentence-transformers/all-MiniLM-L6-v2`):** In our offline Python proxy comparison ([docs/benchmarks/embedding_comparison.json](docs/benchmarks/embedding_comparison.json)) over structural + semantically disguised `200 OK` attack logs, combining `all-MiniLM-L6-v2` with Laplace-LK changed overall F1 from **<!-- claim:embed_pure_lk_f1 -->0.7500<!-- /claim -->** to **<!-- claim:embed_hybrid_minilm_f1 -->1.0000<!-- /claim -->** at a cost of **<!-- claim:embed_slowdown_x -->301.2x<!-- /claim -->** slower median Python proxy latency and **<!-- claim:embed_rss_delta_mb -->+133.63 MB<!-- /claim -->** peak process RSS delta after PyTorch/Transformers imports—supporting our decision to keep pure-Go Laplace-LK on the Tier 1 hot path and reserve neural embeddings for optional sidecar/offline enrichment.
+**Offline Semantic Embedding Tradeoff (`sentence-transformers/all-MiniLM-L6-v2`):** In our offline Python proxy comparison ([docs/benchmarks/embedding_comparison.json](docs/benchmarks/embedding_comparison.json)) over structural + semantically disguised `200 OK` attack logs, combining `all-MiniLM-L6-v2` with Laplace-LK changed overall F1 from **<!-- claim:embed_pure_lk_f1 -->0.7500<!-- /claim -->** to **<!-- claim:embed_hybrid_minilm_f1 -->1.0000<!-- /claim -->** at a cost of **<!-- claim:embed_slowdown_x -->347.6x<!-- /claim -->** slower median Python proxy latency and **<!-- claim:embed_rss_delta_mb -->+133.08 MB<!-- /claim -->** peak process RSS delta after PyTorch/Transformers imports—supporting our decision to keep pure-Go Laplace-LK on the Tier 1 hot path and reserve neural embeddings for optional sidecar/offline enrichment.
 
 ---
 
@@ -129,7 +129,7 @@ make build
 * [Security Policy & Hostile-Log Threat Model](SECURITY.md)
 * [Governance & Third-Party Attribution Notice](NOTICE.md)
 * [Contributing Guidelines](CONTRIBUTING.md)
-* [Empirical Benchmark Report (Phase 4)](docs/benchmarks/2026-11-25-3a237d1.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
+* [Empirical Benchmark Report (Phase 4)](docs/benchmarks/2026-11-25-9603451.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
 * [Semantic Embedding Tradeoff Experiment](docs/benchmarks/embedding_comparison.json)
 * **Operational Service Units:** [macOS `launchd` plist](deploy/launchd/com.knowthankyew.genesis-sentinel.plist) &bull; [Linux `systemd` unit](deploy/systemd/genesis-sentinel.service) &bull; [Docker Compose example](deploy/docker-compose.example.yml) &bull; [Dockerfile](Dockerfile)
 * [Changelog](CHANGELOG.md)
