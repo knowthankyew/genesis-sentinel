@@ -275,14 +275,14 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok3)
             self.assertTrue(any("f1_score mismatch" in e.lower() for e in errs3), errs3)
 
-            # 4. Leaked /Users/ path in JSON
+            # 4. Leaked personal host path in JSON
             bad_path = json.loads(json.dumps(base_data))
             bad_path["metadata"]["cpu"] = "/Users/alice/cpu"
             p4 = tmp_root / "bad_path.json"
             p4.write_text(json.dumps(bad_path), encoding="utf-8")
             ok4, errs4 = sync_docs.independent_recompute_metrics(p4, repo_root=tmp_root)
             self.assertFalse(ok4)
-            self.assertTrue(any("/Users/" in e for e in errs4), errs4)
+            self.assertTrue(any("personal host path" in e for e in errs4), errs4)
 
             # 5. Tampered embedding comparison F1 delta & subgroup recall
             emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"

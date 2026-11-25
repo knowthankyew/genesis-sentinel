@@ -45,21 +45,21 @@ Project Genesis can ingest over one million lines per second in RAM, while local
 
 ## Empirical Benchmarks (Phase 4)
 
-Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-25-659d73c.md](docs/benchmarks/2026-11-25-659d73c.md)).
+Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-25-44eb0f5.md](docs/benchmarks/2026-11-25-44eb0f5.md)).
 
 <!-- BEGIN_EMPIRICAL -->
 | Benchmark Gate | Target | Measured Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->101,492.96 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
+| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->93,784.96 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
 | **Lossless `.seg` Ingestion** | <!-- claim:bench_tier0_dropped_target -->0 dropped<!-- /claim --> | **<!-- claim:bench_tier0_lines_read -->100,000 read<!-- /claim -->** / <!-- claim:bench_tier0_lines_dropped -->0 dropped<!-- /claim --> | <!-- claim:bench_tier0_lossless_status -->PASSED<!-- /claim --> |
-| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 46.381 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 90.499 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
+| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 46.947 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 66.570 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
 | **Synthetic Detection Accuracy (Tier 0+1)** | <!-- claim:bench_detection_f1_target -->F1 >= 0.90<!-- /claim --> | **<!-- claim:bench_detection_f1 -->F1 1.0000<!-- /claim -->** (<!-- claim:bench_detection_tp -->TP=100<!-- /claim -->, <!-- claim:bench_detection_fp -->FP=0<!-- /claim -->) | <!-- claim:bench_detection_f1_status -->PASSED<!-- /claim --> |
-| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,068.18 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,335.55 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
-| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->4.42 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->16.93 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
+| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,055.87 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,119.05 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
+| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->5.03 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->17.59 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
 | **Adversarial Hostile-Log Self-Checks** | All pass | **<!-- claim:bench_adv_passed -->8<!-- /claim -->/<!-- claim:bench_adv_total -->8<!-- /claim -->** passed | <!-- claim:bench_adv_status -->PASSED<!-- /claim --> |
 <!-- END_EMPIRICAL -->
 
-**Offline Semantic Embedding Tradeoff (`sentence-transformers/all-MiniLM-L6-v2`):** In our offline comparison ([docs/benchmarks/embedding_comparison.json](docs/benchmarks/embedding_comparison.json)) over structural + semantically disguised `200 OK` attack logs, combining `all-MiniLM-L6-v2` with Laplace-LK raised overall F1 from **<!-- claim:embed_pure_lk_f1 -->0.7500<!-- /claim -->** to **<!-- claim:embed_hybrid_minilm_f1 -->1.0000<!-- /claim -->** at a cost of **<!-- claim:embed_slowdown_x -->144.3x<!-- /claim -->** slower median latency and **<!-- claim:embed_rss_delta_mb -->+133.36 MB<!-- /claim -->** RSS—supporting our decision to keep pure-Go Laplace-LK on the Tier 1 hot path and reserve neural embeddings for optional sidecar/offline enrichment.
+**Offline Semantic Embedding Tradeoff (`sentence-transformers/all-MiniLM-L6-v2`):** In our offline comparison ([docs/benchmarks/embedding_comparison.json](docs/benchmarks/embedding_comparison.json)) over structural + semantically disguised `200 OK` attack logs, combining `all-MiniLM-L6-v2` with Laplace-LK raised overall F1 from **<!-- claim:embed_pure_lk_f1 -->0.7500<!-- /claim -->** to **<!-- claim:embed_hybrid_minilm_f1 -->1.0000<!-- /claim -->** at a cost of **<!-- claim:embed_slowdown_x -->255.7x<!-- /claim -->** slower median latency and **<!-- claim:embed_rss_delta_mb -->+133.68 MB<!-- /claim -->** RSS—supporting our decision to keep pure-Go Laplace-LK on the Tier 1 hot path and reserve neural embeddings for optional sidecar/offline enrichment.
 
 ---
 
@@ -129,7 +129,7 @@ make build
 * [Security Policy & Hostile-Log Threat Model](SECURITY.md)
 * [Governance & Third-Party Attribution Notice](NOTICE.md)
 * [Contributing Guidelines](CONTRIBUTING.md)
-* [Empirical Benchmark Report (Phase 4)](docs/benchmarks/2026-11-25-659d73c.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
+* [Empirical Benchmark Report (Phase 4)](docs/benchmarks/2026-11-25-44eb0f5.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
 * [Semantic Embedding Tradeoff Experiment](docs/benchmarks/embedding_comparison.json)
 * **Operational Service Units:** [macOS `launchd` plist](deploy/launchd/com.knowthankyew.genesis-sentinel.plist) &bull; [Linux `systemd` unit](deploy/systemd/genesis-sentinel.service) &bull; [Docker Compose example](deploy/docker-compose.example.yml) &bull; [Dockerfile](Dockerfile)
 * [Changelog](CHANGELOG.md)
