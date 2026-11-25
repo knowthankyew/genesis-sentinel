@@ -1,6 +1,6 @@
 <!-- diagram-meta
 last-validated: 2026-11-24
-validated-commit: b0379e9
+validated-commit: 7a74232
 covers: [cmd/, internal/]
 -->
 
@@ -81,7 +81,7 @@ flowchart TD
    - Extracts 8 log-domain continuous features (log token count, log byte length, peak Shannon entropy, scaled symbol/digit/uppercase ratios, log burst count, log inter-arrival ms) and 4 structural nominal features (`service`, `level`, `template_class`, HTTP status family / syslog `<PRI>` facility).
    - Enforces baseline poisoning protection (never absorbs Tier 0 rule hits, prompt-injection events, overflow buckets, or post-warmup anomalies into the rolling baseline), persists atomic `baseline.json` snapshots cleanly wiped by `sentinel burn`, and supports optional loopback `:5200` HTTP/hybrid parity checks.
 7. **Tier 2 Local LoRA Triage, Redacted Feedback & FTaaS Training Loop (`internal/triage/taxonomy.go`, `internal/triage/client.go`, `internal/feedback/redact.go`, `internal/feedback/seed.go`, `internal/feedback/store.go`, `internal/feedback/alerts_journal.go`, `internal/train/ftaas_client.go`, `internal/train/adapter_state.go`):**
-   - Frames sanitized Tier 0/1 alerts inside explicit `BEGIN_UNTRUSTED_LOG_TELEMETRY` / `END_UNTRUSTED_LOG_TELEMETRY` boundaries and queries local `ml/src/FtaaSService.Inference` (`POST /api/v1/inference/generate`, `DefaultTriageMaxTokens = <!-- claim:triage_default_max_tokens -->64 tokens<!-- /claim -->`) over dial-time loopback HTTP with a generation-tracked circuit breaker and zero-downtime `POST /adapter` hot-swapping.
+   - Frames sanitized Tier 0/1 alerts inside explicit `BEGIN_UNTRUSTED_LOG_TELEMETRY` / `END_UNTRUSTED_LOG_TELEMETRY` boundaries and queries local `ml/src/FtaaSService.Inference` (`POST /api/v1/inference/generate`, `DefaultTriageMaxTokens = <!-- claim:triage_default_max_tokens -->64 tokens<!-- /claim -->`) over dial-time loopback HTTP with a generation-tracked circuit breaker, stale-runtime verdict discard (`ErrStaleRuntime`), and atomic `POST /adapter` hot-swapping. Live `watch` mode runs Tier 2 asynchronously so deterministic Tier 0/1 alerts emit immediately and follow-up enrichments correlate by `AlertID`/`TraceID` (upserting `alerts.jsonl`), while offline `scan` enriches synchronously in one pass.
    - Parses structured bracketed verdicts across the 8 starter security classes (`[BENIGN-NOISE]`, `[RECON-SCAN]`, `[AUTH-BRUTEFORCE]`, `[INJECTION-ATTEMPT]`, `[EXFIL-SUSPECT]`, `[PRIV-ESC]`, `[POLICY-ANOMALY]`, `[NEEDS-REVIEW]`), failing closed to `[NEEDS-REVIEW]` on unstructured outputs and overriding `[BENIGN-NOISE]` back to `[NEEDS-REVIEW]` (`HIGH`) whenever prompt-injection signals were detected on the input log.
    - Records up to `MaxAlertJournalRecords = <!-- claim:feedback_max_alert_journal_records -->2,000<!-- /claim -->` recent alerts in `~/.genesis-sentinel/alerts.jsonl` so `sentinel feedback --alert-id` can curate operator labels (`tp`/`fp`/custom class), scrub PII/secrets (PEM keys, JWTs, Bearer tokens, API keys, credentials, emails, SSA-valid SSNs, Luhn-valid payment cards), generate deterministic synthetic seed splits (`sentinel feedback seed`), and submit audited JSONL jobs to local FTaaS (`POST /api/v1/jobs`, `POST /api/v1/jobs/audit`) via `sentinel train`.
 
