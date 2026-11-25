@@ -138,8 +138,8 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for mock audit handler to receive upload")
 	}
-	if gotAudit.ablation != "0.00001" || !bytes.Equal(gotAudit.fileBytes, dsBytes) {
-		t.Fatalf("AuditDataset mismatch: ablation=%q fileLen=%d wantLen=%d", gotAudit.ablation, len(gotAudit.fileBytes), len(dsBytes))
+	if gotAudit.ablation != "0.00001" || gotAudit.anomaly != "5" || !bytes.Equal(gotAudit.fileBytes, dsBytes) {
+		t.Fatalf("AuditDataset mismatch: ablation=%q anomaly=%q fileLen=%d wantLen=%d", gotAudit.ablation, gotAudit.anomaly, len(gotAudit.fileBytes), len(dsBytes))
 	}
 
 	subRes, err := client.SubmitJob(context.Background(), SubmitRequest{
@@ -197,8 +197,8 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatalf("SaveActiveAdapter: %v", err)
 	}
 	loaded, exists, err := LoadActiveAdapter(tmp)
-	if err != nil || !exists || loaded.AdapterPath != state.AdapterPath {
-		t.Fatalf("LoadActiveAdapter: %+v exists=%v err=%v", loaded, exists, err)
+	if err != nil || !exists || loaded.JobID != state.JobID || loaded.BaseModel != state.BaseModel || loaded.AdapterPath != state.AdapterPath || loaded.DatasetHash != state.DatasetHash {
+		t.Fatalf("LoadActiveAdapter: got=%+v want=%+v exists=%v err=%v", loaded, state, exists, err)
 	}
 
 	// Reject an existing manifest with an empty adapter_path while preserving exists=true.

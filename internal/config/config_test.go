@@ -81,6 +81,14 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 		t.Fatal("expected control-character adapter_path to fail validation")
 	}
 	cfg = DefaultConfig()
+	cfg.AdapterPath = "  artifacts/job-1/model_adapters\n"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected leading/trailing whitespace around adapter_path to normalize cleanly, got %v", err)
+	}
+	if cfg.AdapterPath != "artifacts/job-1/model_adapters" {
+		t.Fatalf("expected Validate() to normalize AdapterPath, got %q", cfg.AdapterPath)
+	}
+	cfg = DefaultConfig()
 	cfg.MaxPromptByte = 64
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected sub-framing max_prompt_bytes to fail validation")

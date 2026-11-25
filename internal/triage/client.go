@@ -459,15 +459,10 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	var genResp generateResponse
 	if err := json.Unmarshal(respBody, &genResp); err != nil {
 		c.recordFailure(circuitGen, true)
-		return model.TriageVerdict{}, false, fmt.Errorf("decode inference response: %w", err)
+		return model.TriageVerdict{}, false, fmt.Errorf("decode inference response: invalid JSON payload")
 	}
-	if strings.TrimSpace(genResp.Completion) == "" {
-		c.recordFailure(circuitGen, false)
-		return model.TriageVerdict{}, false, fmt.Errorf("inference returned empty completion")
-	}
-	// Fail closed if the server explicitly reports a different, empty, or null runtime
-	// model/adapter than requested, while keeping omitted optional response fields compatible
-	// (and accepting adapterPath: null/"" when base-only inference was requested).
+	// Fail closed on runtime identity mismatch BEFORE checking completion emptiness so a
+	// mismatched inference server returning an empty completion still trips the circuit breaker.
 	if genResp.BaseModel.Set {
 		if genResp.BaseModel.Null || strings.TrimSpace(genResp.BaseModel.Value) != baseModel {
 			c.recordFailure(circuitGen, true)
@@ -484,6 +479,10 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 			c.recordFailure(circuitGen, true)
 			return model.TriageVerdict{}, false, fmt.Errorf("inference response reported an unexpected adapterPath for base-only request")
 		}
+	}
+	if strings.TrimSpace(genResp.Completion) == "" {
+		c.recordFailure(circuitGen, false)
+		return model.TriageVerdict{}, false, fmt.Errorf("inference returned empty completion")
 	}
 
 	verdict, overridden := ParseCompletion(
@@ -532,9 +531,9 @@ func redactErrSnippet(raw string, secrets ...string) string {
 			return "[response body omitted: short API key configured]"
 		}
 	}
-	// Sanitize and redact secrets/JWTs across the bounded response BEFORE truncating to 240 bytes
-	// so long JWTs are never sliced mid-token before diagJWTRe can match them.
-	s := sanitizeSingleLine(raw, 4096)
+	// Sanitize and redact secrets/JWTs across the ENTIRE bounded response (capped at 256 KiB
+	// by the reader) BEFORE truncating to 240 bytes so even oversized JWTs are never sliced.
+	s := sanitizeSingleLine(raw, 0)
 	for _, sec := range secrets {
 		if len(sec) >= 4 {
 			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")

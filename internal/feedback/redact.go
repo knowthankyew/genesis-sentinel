@@ -31,7 +31,7 @@ var (
 
 	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
 	// escape-aware for quoted strings, and bracket-aware for exact [REDACTED_*] placeholders).
-	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
+	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -425,11 +425,17 @@ func looksLikeEncodedBasicCred(tok string) bool {
 	if colon < 0 || (colon == 0 && len(decoded) < 2) {
 		return false
 	}
-	if !utf8.Valid(decoded) {
-		return false
+	if utf8.Valid(decoded) {
+		for _, r := range string(decoded) {
+			if unicode.IsControl(r) {
+				return false
+			}
+		}
+		return true
 	}
-	for _, r := range string(decoded) {
-		if unicode.IsControl(r) {
+	// RFC 7617 also permits legacy ISO-8859-1 / Latin-1 credential bytes (0x20..0x7e and 0xa0..0xff).
+	for _, b := range decoded {
+		if b < 0x20 || (b >= 0x7f && b <= 0x9f) {
 			return false
 		}
 	}

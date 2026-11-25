@@ -275,6 +275,20 @@ func TestSanitizeURLErrorStripsCauseQuerySecrets(t *testing.T) {
 	if !errors.Is(sanitized, context.Canceled) {
 		t.Fatalf("SanitizeURLError broke errors.Is(context.Canceled): %v", sanitized)
 	}
+	var urlErr *url.Error
+	if !errors.As(sanitized, &urlErr) || urlErr.Op != "Post" {
+		t.Fatalf("SanitizeURLError broke errors.As(*url.Error): %T %v", sanitized, sanitized)
+	}
+
+	// Whitespace inside an unescaped query value in an embedded URL must not leak trailing secret tokens.
+	wsQueryErr := &url.Error{
+		Op:  "Get",
+		URL: "http://127.0.0.1:5100/jobs",
+		Err: fmt.Errorf("redirect to http://127.0.0.1:5100/a?q=hello secretword failed"),
+	}
+	if strings.Contains(SanitizeURLError(wsQueryErr).Error(), "secretword") {
+		t.Fatalf("SanitizeURLError leaked whitespace-split URL query token: %v", SanitizeURLError(wsQueryErr))
+	}
 
 	// Uppercase HTTPS:// scheme with fragment and malformed relative redirect Location with fragment.
 	upperErr := &url.Error{

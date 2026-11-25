@@ -132,8 +132,12 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 
 	// Auto-load persisted active LoRA adapter manifest only when --adapter-path was omitted
 	// and no adapter_path is configured (explicit `--adapter-path=` disables auto-load).
+	var adapterManifestLoadErr error
 	if !adapterPathExplicit && cfg.AdapterPath == "" && cfg.DataDir != "" {
-		if active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir); loadErr == nil && exists {
+		active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir)
+		if loadErr != nil {
+			adapterManifestLoadErr = loadErr
+		} else if exists {
 			cfg.AdapterPath = active.AdapterPath
 			if !baseModelExplicit && active.BaseModel != "" {
 				cfg.BaseModel = active.BaseModel
@@ -212,6 +216,10 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	baselinePath := filepath.Join(cfg.DataDir, "baseline.json")
 	loadedBaseline := 0
 	logger := log.New(stderr, "", log.LstdFlags)
+	if adapterManifestLoadErr != nil {
+		logger.Printf("[Tier2] Warning: ignoring unreadable active adapter manifest %s: %v",
+			filepath.Join(cfg.DataDir, train.ActiveAdapterFilename), adapterManifestLoadErr)
+	}
 	if surpEng := pipe.SurprisalEngine(); surpEng != nil {
 		n, loadErr := surpEng.LoadFromFile(baselinePath)
 		if loadErr != nil {

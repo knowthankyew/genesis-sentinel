@@ -199,7 +199,8 @@ func (c *Config) Validate() error {
 	if c.TriageTimeoutSec < 5 || c.TriageTimeoutSec > 300 {
 		return fmt.Errorf("triage_timeout_sec must be between 5 and 300, got %d", c.TriageTimeoutSec)
 	}
-	if trimmedAdapter := strings.TrimSpace(c.AdapterPath); trimmedAdapter != "" {
+	c.AdapterPath = strings.TrimSpace(c.AdapterPath)
+	if trimmedAdapter := c.AdapterPath; trimmedAdapter != "" {
 		for _, r := range trimmedAdapter {
 			if unicode.IsControl(r) {
 				return fmt.Errorf("adapter_path %q must not contain control characters", c.AdapterPath)

@@ -41,7 +41,9 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		"Basic YTo/",
 		"Basic YTo+",
 		"Basic dGVzdDoxMjPCow==",
+		"Basic YTqj",
 		`{"Authorization": "Basic YTpi"}`,
+		`{"token": "opaque_tok_value_99"}`,
 		`DOCKER_AUTH_CONFIG={"auths":{"reg.local":{"auth":"cmVnOnNlY3JldA=="}}}`,
 		"DOCKER_AUTH_CONFIG={\n  \"auths\": {\n    \"reg.local\": {\"auth\": \"cmVnOnNlY3JldA==\"}\n  }\n}",
 		`DOCKER_AUTH_CONFIG={"padding":"` + strings.Repeat("A", 17000) + `","auth":"c2VjcmV0"}`,
@@ -73,12 +75,15 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 			t.Fatalf("oversized DOCKER_AUTH_CONFIG leaked trailing auth field: %q", redBig)
 		}
 	}
-	// Verify Basic tokens ending in '/' or '+' and UTF-8 RFC 7617 credentials are scrubbed.
-	basicEdge, _ := RedactText("Basic YTo/ Basic YTo+ Basic dGVzdDoxMjPCow==")
-	for _, tok := range []string{"YTo/", "YTo+", "dGVzdDoxMjPCow=="} {
+	// Verify Basic tokens ending in '/' or '+' plus UTF-8 & Latin-1 RFC 7617 credentials and token KV assignments are scrubbed.
+	basicEdge, _ := RedactText(`Basic YTo/ Basic YTo+ Basic dGVzdDoxMjPCow== Basic YTqj {"token":"opaque_tok_value_99"}`)
+	for _, tok := range []string{"YTo/", "YTo+", "dGVzdDoxMjPCow==", "YTqj", "opaque_tok_value_99"} {
 		if strings.Contains(basicEdge, tok) {
-			t.Fatalf("Basic token %q survived RedactText: %q", tok, basicEdge)
+			t.Fatalf("sensitive token %q survived RedactText: %q", tok, basicEdge)
 		}
+	}
+	if cat, found := ScanForPII(basicEdge); found {
+		t.Fatalf("re-scan of scrubbed basicEdge flagged %q in %q", cat, basicEdge)
 	}
 	mlDocker, _ := RedactText("DOCKER_AUTH_CONFIG={\n  \"auths\": {\"reg\": {\"auth\": \"cmVnOnNlY3JldA==\"}}\n}")
 	if strings.Contains(mlDocker, "cmVnOnNlY3JldA==") || strings.Contains(mlDocker, "auths") {

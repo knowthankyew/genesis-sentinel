@@ -205,7 +205,13 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxActiveAdapterBytes+1))
+	if readErr != nil {
+		return "", fmt.Errorf("POST %s/adapter response could not be confirmed (daemon may already have applied the adapter): %w", redactedTarget, readErr)
+	}
+	if len(respBody) > maxActiveAdapterBytes {
+		return "", fmt.Errorf("POST %s/adapter response exceeded %d-byte limit (daemon may already have applied the adapter)", redactedTarget, maxActiveAdapterBytes)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("POST %s/adapter returned HTTP %d: %s", redactedTarget, resp.StatusCode, compactErrBody(respBody, authToken))
 	}
@@ -214,7 +220,7 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 		DataDir string `json:"data_dir"`
 	}
 	if err := json.Unmarshal(respBody, &ack); err != nil || ack.Status != "activated" {
-		return "", fmt.Errorf("POST %s/adapter returned incomplete or invalid activation acknowledgement", redactedTarget)
+		return "", fmt.Errorf("POST %s/adapter returned incomplete or invalid activation acknowledgement (daemon may already have applied the adapter)", redactedTarget)
 	}
 	return strings.TrimSpace(ack.DataDir), nil
 }

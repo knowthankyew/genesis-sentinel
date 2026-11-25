@@ -302,7 +302,7 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 		return SubmitResponse{}, fmt.Errorf("decode FTaaS submit response for jobName=%q (FTaaS accepted HTTP %d; run `sentinel train list` to locate the queued job before retrying): %w", jobName, statusCode, err)
 	}
 	if !validJobIDRe.MatchString(out.JobID) {
-		return SubmitResponse{}, fmt.Errorf("FTaaS returned invalid jobId %q for jobName=%q (FTaaS accepted HTTP %d; run `sentinel train list` to locate the queued job before retrying)", out.JobID, jobName, statusCode)
+		return SubmitResponse{}, fmt.Errorf("FTaaS returned an invalid jobId for jobName=%q (FTaaS accepted HTTP %d; run `sentinel train list` to locate the queued job before retrying)", jobName, statusCode)
 	}
 	return out, nil
 }
@@ -334,7 +334,7 @@ func (c *FTaaSClient) GetJob(ctx context.Context, jobID string) (JobDetail, erro
 		return JobDetail{}, fmt.Errorf("decode FTaaS job detail: %w", err)
 	}
 	if strings.TrimSpace(detail.JobID) == "" || strings.TrimSpace(detail.JobID) != jobID {
-		return JobDetail{}, fmt.Errorf("FTaaS job detail mismatch: requested jobId %q, received %q", jobID, detail.JobID)
+		return JobDetail{}, fmt.Errorf("FTaaS job detail response did not match requested jobId %q", jobID)
 	}
 	return detail, nil
 }
@@ -465,7 +465,8 @@ func buildMultipartUploadFromBytes(fileName string, content []byte, fields map[s
 			return nil, "", err
 		}
 	}
-	part, err := mw.CreateFormFile("file", fileName)
+	safeName := sanitizeMultipartFilename(fileName)
+	part, err := mw.CreateFormFile("file", safeName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -476,6 +477,19 @@ func buildMultipartUploadFromBytes(fileName string, content []byte, fields map[s
 		return nil, "", err
 	}
 	return &buf, mw.FormDataContentType(), nil
+}
+
+func sanitizeMultipartFilename(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	if base == "" || base == "." || base == ".." {
+		return "dataset.jsonl"
+	}
+	for _, r := range base {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == '"' || r == '\\' {
+			return "dataset.jsonl"
+		}
+	}
+	return base
 }
 
 func compactErrBody(b []byte, secrets ...string) string {

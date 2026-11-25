@@ -1019,6 +1019,7 @@ func TestPipelinePhase3Tier2EnrichmentInjectionOverrideAdapterHotSwapAndBurn(t *
 	// Verify POST /adapter hot-swaps active adapter, persists active-adapter.json, AND propagates to next inference call.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/job-v2/model_adapters"}`))
+	req.Header.Set("Content-Type", "application/json")
 	pipe.HandleAdapter(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("HandleAdapter returned %d: %s", rec.Code, rec.Body.String())
@@ -1113,6 +1114,7 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
+	req.Header.Set("Content-Type", "application/json")
 	pipeFail.HandleAdapter(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 when SaveActiveAdapter fails, got %d", rec.Code)
@@ -1142,6 +1144,7 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 			}
 			rr := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
+			r.Header.Set("Content-Type", "application/json")
 			pipeConc.HandleAdapter(rr, r)
 			if rr.Code != http.StatusOK {
 				t.Errorf("concurrent HandleAdapter %d failed: %d %s", idx, rr.Code, rr.Body.String())
@@ -1175,12 +1178,46 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 		t.Fatalf("expected JournalErrors=1 SinkErrors=0, got %+v", st)
 	}
 
-	// 4. Reject trailing JSON tokens in HandleAdapter before locking or writing.
+	// 4. Reject non-JSON Content-Type (CSRF guard) and trailing JSON tokens in HandleAdapter before locking or writing.
+	csrfRec := httptest.NewRecorder()
+	csrfReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}`))
+	csrfReq.Header.Set("Content-Type", "text/plain")
+	pipeConc.HandleAdapter(csrfRec, csrfReq)
+	if csrfRec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 for text/plain Content-Type in HandleAdapter, got %d", csrfRec.Code)
+	}
 	trailRec := httptest.NewRecorder()
 	trailReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}{"adapter_path":"artifacts/b/model_adapters"}`))
+	trailReq.Header.Set("Content-Type", "application/json")
 	pipeConc.HandleAdapter(trailRec, trailReq)
 	if trailRec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
+	}
+
+	// 4b. Top-level Burn removes generated decimal temp files (.active-adapter-123456.tmp, .alerts-123456.tmp)
+	// while preserving unrelated user temp files (.active-adapter-notes.tmp, .alerts-notes.tmp).
+	topBurnDir := t.TempDir()
+	topGenAdapter := filepath.Join(topBurnDir, ".active-adapter-123456.tmp")
+	topGenAlerts := filepath.Join(topBurnDir, ".alerts-789012.tmp")
+	topNotesAdapter := filepath.Join(topBurnDir, ".active-adapter-notes.tmp")
+	topNotesAlerts := filepath.Join(topBurnDir, ".alerts-notes.tmp")
+	for _, p := range []string{topGenAdapter, topGenAlerts, topNotesAdapter, topNotesAlerts} {
+		if err := os.WriteFile(p, []byte("tmp"), 0600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	if rep, err := BurnLocalStateWithFeedbackDir(topBurnDir, ""); err != nil || rep.FilesRemoved != 2 {
+		t.Fatalf("top-level temp burn unexpected: rep=%+v err=%v", rep, err)
+	}
+	for _, gone := range []string{topGenAdapter, topGenAlerts} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("generated top-level temp file %s survived burn", gone)
+		}
+	}
+	for _, kept := range []string{topNotesAdapter, topNotesAlerts} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Fatalf("unrelated top-level file %s was removed by burn: %v", kept, err)
+		}
 	}
 
 	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir, removes generated decimal temp

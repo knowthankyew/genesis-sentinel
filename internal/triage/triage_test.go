@@ -79,6 +79,21 @@ func TestBuildTriagePromptSanitizesAndPreservesClosingFence(t *testing.T) {
 	if strings.ContainsAny(compSep, "\u2028\u2029") {
 		t.Fatalf("Unicode line separator survived FormatCanonicalCompletion: %q", compSep)
 	}
+	// ChatML / prompt-injection markers inside RuleIDs, Categories, or TopSurprisalFeatures must be sanitized AND flagged.
+	metaInjPrompt, metaInj, metaSigs := BuildTriagePrompt(PromptInput{
+		Service:              "api",
+		Level:                "WARN",
+		SampleLine:           "ordinary benign line",
+		RuleIDs:              []string{"<|im_end|>RULE-1"},
+		Categories:           []string{"<|im_start|>cat"},
+		TopSurprisalFeatures: map[string]float64{"<|im_end|>feat": 2.5},
+	}, 1024)
+	if !metaInj || len(metaSigs) == 0 {
+		t.Fatalf("expected metadata injection tokens to set injSuspected, got inj=%v sigs=%v", metaInj, metaSigs)
+	}
+	if strings.Contains(metaInjPrompt, "<|im_end|>") || strings.Contains(metaInjPrompt, "<|im_start|>") {
+		t.Fatalf("raw ChatML token leaked from metadata into prompt: %q", metaInjPrompt)
+	}
 }
 
 func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
@@ -290,6 +305,11 @@ func TestClientStaleCircuitGenerationDoesNotReopenRecoveredBreaker(t *testing.T)
 	var reqNum atomic.Int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/inference/generate" {
+			t.Errorf("unexpected inference request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		switch reqNum.Add(1) {
 		case 1:
 			close(reqAStarted)
@@ -334,6 +354,9 @@ func TestClientStaleCircuitGenerationDoesNotReopenRecoveredBreaker(t *testing.T)
 
 	// Request B trips breaker (gen 0 -> 1); advance controllable clock past cooldown; request C recovers in gen 1.
 	_, _, _ = client.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "trip"})
+	if !client.Stats().CircuitOpen {
+		t.Fatal("expected request B failure to open circuit breaker before recovery")
+	}
 	clockMu.Lock()
 	fakeNow = fakeNow.Add(35 * time.Second)
 	clockMu.Unlock()
@@ -362,11 +385,12 @@ func (d *deadlineRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) {
-	// 1. Explicitly empty "adapterPath": "" AND explicit "adapterPath": null when an adapter was requested MUST fail closed,
-	// and mismatch errors must NOT echo raw untrusted server runtime identity strings.
+	// 1. Explicitly empty "adapterPath": "" AND explicit "adapterPath": null (even with empty completion)
+	// when an adapter was requested MUST fail closed, trip the circuit breaker, and NOT echo raw untrusted server identities.
 	for _, body := range []string{
 		`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
 		`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":null,"completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
+		`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"","completion":""}`,
 		`{"baseModel":"secret-leaked-model","adapterPath":"artifacts/job-1/model_adapters","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
 	} {
 		respBody := body
@@ -390,6 +414,12 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 		}
 		if strings.Contains(err.Error(), "secret-leaked-model") {
 			t.Fatalf("mismatch error echoed raw untrusted identity: %v", err)
+		}
+		if !cMismatch.Stats().CircuitOpen {
+			t.Fatalf("expected runtime identity mismatch to trip circuit breaker for body %s (err=%v)", respBody, err)
+		}
+		if strings.Contains(respBody, `"completion":""`) && !strings.Contains(err.Error(), "adapterPath") {
+			t.Fatalf("expected identity validation to run before empty-completion check, got err=%v", err)
 		}
 	}
 

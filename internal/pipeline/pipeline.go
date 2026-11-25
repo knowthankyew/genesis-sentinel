@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -1058,6 +1060,14 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// Require application/json Content-Type so cross-origin browser simple POSTs (text/plain,
+	// form-urlencoded) cannot trigger state mutation even when loopback auth_token is unset.
+	mediaType, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mtErr != nil || mediaType != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Content-Type must be application/json"})
+		return
+	}
 	var req struct {
 		BaseModel   string `json:"base_model"`
 		AdapterPath string `json:"adapter_path"`
@@ -1311,41 +1321,42 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 
 	// 3. If a separate custom feedbackDir was configured outside dataDir/feedback, purge ONLY
 	// Sentinel-named feedback files there via an os.Root handle and shared directory lock.
-	if trimmedFB := strings.TrimSpace(feedbackDir); trimmedFB != "" {
+	// Use trimming only to detect a blank value; preserve the exact configured path (including spaces).
+	if strings.TrimSpace(feedbackDir) != "" {
 		cleanDefault := ""
 		if strings.TrimSpace(dataDir) != "" {
 			cleanDefault = filepath.Clean(filepath.Join(dataDir, "feedback"))
 		}
-		if filepath.Clean(trimmedFB) != cleanDefault {
-			customInfo, lstatErr := os.Lstat(trimmedFB)
+		if filepath.Clean(feedbackDir) != cleanDefault {
+			customInfo, lstatErr := os.Lstat(feedbackDir)
 			if lstatErr == nil {
 				if customInfo.Mode()&os.ModeSymlink != 0 {
-					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", trimmedFB))
+					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", feedbackDir))
 				} else if !customInfo.IsDir() {
-					errs = append(errs, fmt.Errorf("custom feedback dir %q is not a directory", trimmedFB))
+					errs = append(errs, fmt.Errorf("custom feedback dir %q is not a directory", feedbackDir))
 				} else if defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo) {
-					unlockCustom, cLockErr := feedback.AcquireDirLock(trimmedFB)
+					unlockCustom, cLockErr := feedback.AcquireDirLock(feedbackDir)
 					if cLockErr != nil {
-						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", trimmedFB, cLockErr))
+						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", feedbackDir, cLockErr))
 					} else {
-						customRoot, openErr := os.OpenRoot(trimmedFB)
+						customRoot, openErr := os.OpenRoot(feedbackDir)
 						if openErr != nil {
-							errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", trimmedFB, openErr))
+							errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", feedbackDir, openErr))
 						} else {
 							cStat, cStatErr := customRoot.Stat(".")
 							if cStatErr != nil {
-								errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", trimmedFB, cStatErr))
+								errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", feedbackDir, cStatErr))
 							} else if !cStat.IsDir() || !os.SameFile(customInfo, cStat) {
 								errs = append(errs, fmt.Errorf("refusing custom feedback cleanup: directory identity changed between Lstat and OpenRoot"))
 							} else {
 								cDir, dOpenErr := customRoot.Open(".")
 								if dOpenErr != nil {
-									errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", trimmedFB, dOpenErr))
+									errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", feedbackDir, dOpenErr))
 								} else {
 									cEntries, readErr := cDir.ReadDir(-1)
 									_ = cDir.Close()
 									if readErr != nil {
-										errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", trimmedFB, readErr))
+										errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", feedbackDir, readErr))
 									} else {
 										for _, e := range cEntries {
 											if e.IsDir() {
@@ -1364,7 +1375,7 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 					}
 				}
 			} else if !os.IsNotExist(lstatErr) {
-				errs = append(errs, fmt.Errorf("lstat custom feedback dir %q: %w", trimmedFB, lstatErr))
+				errs = append(errs, fmt.Errorf("lstat custom feedback dir %q: %w", feedbackDir, lstatErr))
 			}
 		}
 	}
@@ -1380,6 +1391,8 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 	return rep, nil
 }
 
+var ownedTopLevelTempRe = regexp.MustCompile(`^\.(?:cursor|baseline|alerts|active-adapter)-[0-9]+\.tmp$`)
+
 func isOwnedTopLevelFile(name string) bool {
 	switch name {
 	case "cursor.json", "cursor.json.tmp",
@@ -1388,10 +1401,7 @@ func isOwnedTopLevelFile(name string) bool {
 		"active-adapter.json", "active-adapter.json.tmp":
 		return true
 	}
-	return (strings.HasPrefix(name, ".cursor-") && strings.HasSuffix(name, ".tmp")) ||
-		(strings.HasPrefix(name, ".baseline-") && strings.HasSuffix(name, ".tmp")) ||
-		(strings.HasPrefix(name, ".alerts-") && strings.HasSuffix(name, ".tmp")) ||
-		(strings.HasPrefix(name, ".active-adapter-") && strings.HasSuffix(name, ".tmp"))
+	return ownedTopLevelTempRe.MatchString(name)
 }
 
 // normalizeAlertTimestamp enforces the Unix-seconds alert timestamp contract expected by

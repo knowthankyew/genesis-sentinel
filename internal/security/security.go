@@ -338,25 +338,23 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	return b.String(), signals
 }
 
-type sanitizedURLError struct {
-	op   string
-	url  string
+type sanitizedCauseError struct {
 	msg  string
 	orig error
 }
 
-func (e *sanitizedURLError) Error() string {
-	return fmt.Sprintf("%s %q: %s", e.op, e.url, e.msg)
+func (e *sanitizedCauseError) Error() string {
+	return e.msg
 }
 
-func (e *sanitizedURLError) Unwrap() error {
+func (e *sanitizedCauseError) Unwrap() error {
 	return e.orig
 }
 
 // SanitizeURLError strips userinfo, query parameters, and fragments from wrapped *url.Error
 // transport errors — including any unsanitized redirect URLs embedded inside url.Error.Err —
-// while preserving Unwrap() for errors.Is / errors.As checks (such as context.Canceled and
-// context.DeadlineExceeded).
+// while returning a *url.Error so both errors.As(err, &urlErr) and errors.Is(err, context.Canceled)
+// continue to work cleanly.
 func SanitizeURLError(err error) error {
 	if err == nil {
 		return nil
@@ -370,11 +368,13 @@ func SanitizeURLError(err error) error {
 	if ue.Err != nil {
 		cleanCause = sanitizeErrMessage(ue.Err.Error())
 	}
-	return &sanitizedURLError{
-		op:   ue.Op,
-		url:  cleanURL,
-		msg:  cleanCause,
-		orig: ue.Err,
+	return &url.Error{
+		Op:  ue.Op,
+		URL: cleanURL,
+		Err: &sanitizedCauseError{
+			msg:  cleanCause,
+			orig: ue.Err,
+		},
 	}
 }
 
@@ -391,25 +391,23 @@ func sanitizeSingleURLString(raw string) string {
 }
 
 func sanitizeErrMessage(msg string) string {
+	lower := strings.ToLower(msg)
 	// Go's net/http embeds raw Location header values (including malformed relative URLs with
 	// sensitive fragments or query params) before CheckRedirect runs; replace with a safe message.
-	if strings.Contains(strings.ToLower(msg), "location header") {
-		return "invalid redirect Location header"
+	if strings.Contains(lower, "location header") || strings.Contains(lower, "redirect") && strings.ContainsAny(msg, "?#@") {
+		return "invalid or blocked redirect URL"
+	}
+	// If an embedded URL carries a query or fragment (where whitespace could split a query
+	// value across tokens), replace the whole diagnostic safely rather than retaining fragments.
+	if embeddedURLRe.MatchString(msg) && strings.ContainsAny(msg, "?#@") {
+		return "sanitized HTTP transport error"
 	}
 	s := embeddedURLRe.ReplaceAllStringFunc(msg, func(m string) string {
 		return sanitizeSingleURLString(m)
 	})
 	s = diagAuthCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
-	// Scrub bare malformed URL fragments that contain query strings (?...), fragments (#...), or userinfo (@).
 	if strings.ContainsAny(s, "?#@") {
-		fields := strings.Fields(s)
-		for i, f := range fields {
-			trimmed := strings.Trim(f, `"'(),;`)
-			if strings.ContainsAny(trimmed, "?#") || (strings.Contains(trimmed, "@") && strings.Contains(trimmed, "://")) {
-				fields[i] = "<redacted-url>"
-			}
-		}
-		s = strings.Join(fields, " ")
+		return "sanitized HTTP transport error"
 	}
 	return s
 }

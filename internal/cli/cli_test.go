@@ -17,6 +17,7 @@ import (
 	"github.com/knowthankyew/genesis-sentinel/internal/pipeline"
 	"github.com/knowthankyew/genesis-sentinel/internal/rules"
 	"github.com/knowthankyew/genesis-sentinel/internal/surprisal"
+	"github.com/knowthankyew/genesis-sentinel/internal/train"
 )
 
 func TestExecuteVersionAndHelp(t *testing.T) {
@@ -541,6 +542,7 @@ func TestWatchHTTPHandlerRequiresAuthBeforeAdapterMutation(t *testing.T) {
 	// Unauthenticated POST /adapter must fail with 401 before mutating client or writing active-adapter.json.
 	unauthRec := httptest.NewRecorder()
 	unauthReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/hijack/model_adapters"}`))
+	unauthReq.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(unauthRec, unauthReq)
 	if unauthRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated POST /adapter, got %d", unauthRec.Code)
@@ -556,12 +558,17 @@ func TestWatchHTTPHandlerRequiresAuthBeforeAdapterMutation(t *testing.T) {
 	authRec := httptest.NewRecorder()
 	authReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/verified/model_adapters"}`))
 	authReq.Header.Set("Authorization", "Bearer daemon-auth-secret")
+	authReq.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(authRec, authReq)
 	if authRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for authenticated POST /adapter, got %d: %s", authRec.Code, authRec.Body.String())
 	}
 	if st := pipe.Stats(); st.TriageAdapter != "artifacts/verified/model_adapters" {
 		t.Fatalf("authenticated POST /adapter did not update client: %q", st.TriageAdapter)
+	}
+	disk, exists, err := train.LoadActiveAdapter(dataDir)
+	if err != nil || !exists || disk.AdapterPath != "artifacts/verified/model_adapters" {
+		t.Fatalf("expected persisted active-adapter.json after authenticated POST /adapter, got disk=%+v exists=%v err=%v", disk, exists, err)
 	}
 }
 

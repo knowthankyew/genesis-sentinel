@@ -263,9 +263,8 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	cleanTmpl, sigTmpl := security.SanitizeUntrustedLogText(in.Template, maxPromptBytes)
 	cleanSample, sigSample := security.SanitizeUntrustedLogText(in.SampleLine, maxPromptBytes)
 
-	// Merge and deduplicate injection signals from caller + fresh sanitization.
-	signals := mergeSignals(in.InjectionSignals, sigSvc, sigLvl, sigTmpl, sigSample)
-	injSuspected := in.InjectionSuspected || len(signals) > 0
+	// Merge and deduplicate injection signals from caller + fresh sanitization across all fields.
+	var metaSignals []string
 
 	// Neutralize any attempt inside log text to spoof our own data-fence markers.
 	cleanSvc = defangFenceMarkers(sanitizeSingleLine(cleanSvc, 128))
@@ -277,7 +276,9 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	if len(in.RuleIDs) > 0 {
 		cleanRules := make([]string, 0, len(in.RuleIDs))
 		for _, r := range in.RuleIDs {
-			if c := defangFenceMarkers(sanitizeSingleLine(r, 48)); c != "" {
+			sr, rSigs := security.SanitizeUntrustedLogText(r, 96)
+			metaSignals = append(metaSignals, rSigs...)
+			if c := defangFenceMarkers(sanitizeSingleLine(sr, 48)); c != "" {
 				cleanRules = append(cleanRules, c)
 			}
 		}
@@ -289,7 +290,9 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	if len(in.Categories) > 0 {
 		cleanCats := make([]string, 0, len(in.Categories))
 		for _, c := range in.Categories {
-			if cc := defangFenceMarkers(sanitizeSingleLine(c, 48)); cc != "" {
+			sc, cSigs := security.SanitizeUntrustedLogText(c, 96)
+			metaSignals = append(metaSignals, cSigs...)
+			if cc := defangFenceMarkers(sanitizeSingleLine(sc, 48)); cc != "" {
 				cleanCats = append(cleanCats, cc)
 			}
 		}
@@ -298,7 +301,10 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 		}
 	}
 
-	topFeatStr := formatTopFeatures(in.TopSurprisalFeatures)
+	topFeatStr, featSigs := formatTopFeatures(in.TopSurprisalFeatures)
+	metaSignals = append(metaSignals, featSigs...)
+	signals := mergeSignals(in.InjectionSignals, sigSvc, sigLvl, sigTmpl, sigSample, metaSignals)
+	injSuspected := in.InjectionSuspected || len(signals) > 0
 	metaLine := fmt.Sprintf("service=%s level=%s count=%d entropy=%.2f surprisal=%.2f/%.2f rules=%s categories=%s",
 		cleanSvc, cleanLvl, in.Count, clampFinite(in.SampleEntropy),
 		clampFinite(in.SurprisalNats), clampFinite(in.SurprisalThreshold),
@@ -510,9 +516,9 @@ func truncateUTF8(s string, maxBytes int) string {
 	return strings.Clone(s[:cut])
 }
 
-func formatTopFeatures(feats map[string]float64) string {
+func formatTopFeatures(feats map[string]float64) (string, []string) {
 	if len(feats) == 0 {
-		return ""
+		return "", nil
 	}
 	keys := make([]string, 0, len(feats))
 	for k := range feats {
@@ -520,11 +526,14 @@ func formatTopFeatures(feats map[string]float64) string {
 	}
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
+	var sigs []string
 	for _, k := range keys {
+		sk, kSigs := security.SanitizeUntrustedLogText(k, 96)
+		sigs = append(sigs, kSigs...)
 		v := clampFinite(feats[k])
-		parts = append(parts, fmt.Sprintf("%s:%.2f", defangFenceMarkers(sanitizeSingleLine(k, 32)), v))
+		parts = append(parts, fmt.Sprintf("%s:%.2f", defangFenceMarkers(sanitizeSingleLine(sk, 32)), v))
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(parts, ","), sigs
 }
 
 func clampFinite(v float64) float64 {
