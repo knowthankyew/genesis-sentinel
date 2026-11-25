@@ -275,4 +275,23 @@ func TestSanitizeURLErrorStripsCauseQuerySecrets(t *testing.T) {
 	if !errors.Is(sanitized, context.Canceled) {
 		t.Fatalf("SanitizeURLError broke errors.Is(context.Canceled): %v", sanitized)
 	}
+
+	// Uppercase HTTPS:// scheme with fragment and malformed relative redirect Location with fragment.
+	upperErr := &url.Error{
+		Op:  "Get",
+		URL: "http://127.0.0.1:5100/jobs",
+		Err: fmt.Errorf("redirect to HTTPS://127.0.0.1:5100/other#fragsecret1 blocked"),
+	}
+	if strings.Contains(SanitizeURLError(upperErr).Error(), "fragsecret1") {
+		t.Fatalf("SanitizeURLError leaked uppercase-scheme fragment: %v", SanitizeURLError(upperErr))
+	}
+	malformedLocErr := &url.Error{
+		Op:  "Get",
+		URL: "http://127.0.0.1:5100/jobs",
+		Err: fmt.Errorf("failed to parse Location header %q: %w", "/bad%ZZ#fragsecret2", context.DeadlineExceeded),
+	}
+	sanLoc := SanitizeURLError(malformedLocErr)
+	if strings.Contains(sanLoc.Error(), "fragsecret2") || !errors.Is(sanLoc, context.DeadlineExceeded) {
+		t.Fatalf("SanitizeURLError failed malformed Location handling: %v", sanLoc)
+	}
 }

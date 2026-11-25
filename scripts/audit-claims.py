@@ -319,7 +319,9 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
                 "TestValidateBaseModel|TestDefaultConfigValidates|TestConfigRejectsBitNetAndNonLoopback|"
                 "TestExecuteConfigRedactsTokens|TestExecuteDataSubcommands|"
                 "TestBurnLocalStateRejectsFeedbackSymlinkEscape|TestPipelineCountsOnlySuccessfulSinkEmissions|"
-                "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials|TestParseCompletionFailClosedAndInjectionOverride|"
+                "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials|"
+                "TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline|"
+                "TestParseCompletionFailClosedAndInjectionOverride|"
                 "TestRedactTextAndScanForPII|TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload)$"
             ),
         ],

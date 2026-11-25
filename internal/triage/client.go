@@ -73,11 +73,28 @@ type generateRequest struct {
 	ApplyChatTemplate bool    `json:"applyChatTemplate"`
 }
 
+type optionalJSONString struct {
+	Set   bool
+	Null  bool
+	Value string
+}
+
+func (o *optionalJSONString) UnmarshalJSON(data []byte) error {
+	o.Set = true
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		o.Null = true
+		o.Value = ""
+		return nil
+	}
+	o.Null = false
+	return json.Unmarshal(data, &o.Value)
+}
+
 type generateResponse struct {
-	BaseModel   *string `json:"baseModel"`
-	AdapterPath *string `json:"adapterPath"`
-	Completion  string  `json:"completion"`
-	LatencyMs   float64 `json:"latencyMs"`
+	BaseModel   optionalJSONString `json:"baseModel"`
+	AdapterPath optionalJSONString `json:"adapterPath"`
+	Completion  string             `json:"completion"`
+	LatencyMs   float64            `json:"latencyMs"`
 }
 
 // Client invokes the local FTaaS PyTorch/PEFT inference server over loopback HTTP,
@@ -382,7 +399,10 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	circuitGen := c.circuitGen
 	c.mu.Unlock()
 
-	prompt, injSuspected, injSignals := BuildTriagePrompt(in, c.maxPromptBytes)
+	prompt, injSuspected, injSignals, err := BuildTriagePromptChecked(in, c.maxPromptBytes)
+	if err != nil {
+		return model.TriageVerdict{}, false, err
+	}
 
 	payload := generateRequest{
 		BaseModel:         baseModel,
@@ -445,18 +465,24 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 		c.recordFailure(circuitGen, false)
 		return model.TriageVerdict{}, false, fmt.Errorf("inference returned empty completion")
 	}
-	// Fail closed if the server explicitly reports a different (or explicitly empty) runtime
-	// model or adapter than requested, while keeping omitted optional response fields compatible.
-	if genResp.BaseModel != nil {
-		if respModel := strings.TrimSpace(*genResp.BaseModel); respModel != baseModel {
+	// Fail closed if the server explicitly reports a different, empty, or null runtime
+	// model/adapter than requested, while keeping omitted optional response fields compatible
+	// (and accepting adapterPath: null/"" when base-only inference was requested).
+	if genResp.BaseModel.Set {
+		if genResp.BaseModel.Null || strings.TrimSpace(genResp.BaseModel.Value) != baseModel {
 			c.recordFailure(circuitGen, true)
-			return model.TriageVerdict{}, false, fmt.Errorf("inference baseModel mismatch: requested %q, server used %q", baseModel, respModel)
+			return model.TriageVerdict{}, false, fmt.Errorf("inference response reported a mismatched baseModel")
 		}
 	}
-	if genResp.AdapterPath != nil {
-		if respAdapter := strings.TrimSpace(*genResp.AdapterPath); respAdapter != adapterPath {
+	if genResp.AdapterPath.Set {
+		if adapterPath != "" {
+			if genResp.AdapterPath.Null || strings.TrimSpace(genResp.AdapterPath.Value) != adapterPath {
+				c.recordFailure(circuitGen, true)
+				return model.TriageVerdict{}, false, fmt.Errorf("inference response reported a mismatched adapterPath")
+			}
+		} else if !genResp.AdapterPath.Null && strings.TrimSpace(genResp.AdapterPath.Value) != "" {
 			c.recordFailure(circuitGen, true)
-			return model.TriageVerdict{}, false, fmt.Errorf("inference adapterPath mismatch: requested %q, server used %q", adapterPath, respAdapter)
+			return model.TriageVerdict{}, false, fmt.Errorf("inference response reported an unexpected adapterPath for base-only request")
 		}
 	}
 
@@ -499,6 +525,13 @@ var (
 )
 
 func redactErrSnippet(raw string, secrets ...string) string {
+	// If any configured secret is nonempty but shorter than 4 bytes, omit the untrusted error
+	// body entirely so short keys can never leak without mangling diagnostic prose.
+	for _, sec := range secrets {
+		if len(sec) > 0 && len(sec) < 4 {
+			return "[response body omitted: short API key configured]"
+		}
+	}
 	// Sanitize and redact secrets/JWTs across the bounded response BEFORE truncating to 240 bytes
 	// so long JWTs are never sliced mid-token before diagJWTRe can match them.
 	s := sanitizeSingleLine(raw, 4096)

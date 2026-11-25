@@ -246,11 +246,17 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, pollInterval)
 
+	writeTimeout := 15 * time.Second
+	if cfg.TriageMode == "http" && cfg.TriageTimeoutSec > 0 {
+		if want := time.Duration(cfg.TriageTimeoutSec+5) * time.Second; want > writeTimeout {
+			writeTimeout = want
+		}
+	}
 	httpSrv := &http.Server{
 		Handler:           newWatchHTTPHandler(pipe, cfg.AuthToken),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 

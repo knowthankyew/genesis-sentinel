@@ -233,11 +233,23 @@ const (
 )
 
 // BuildTriagePrompt constructs a bounded, prompt-injection-resistant Tier 2 prompt.
-// All untrusted fields pass through security.SanitizeUntrustedLogText before framing,
-// and the untrusted template/sample budget is trimmed so the closing data fence is never clipped.
+// If maxPromptBytes is positive but smaller than MinPromptBytes, BuildTriagePrompt returns an
+// empty string rather than exceeding the caller's byte budget (callers needing an error
+// diagnostic should use BuildTriagePromptChecked).
 func BuildTriagePrompt(in PromptInput, maxPromptBytes int) (string, bool, []string) {
+	prompt, inj, sigs, _ := BuildTriagePromptChecked(in, maxPromptBytes)
+	return prompt, inj, sigs
+}
+
+// BuildTriagePromptChecked constructs a bounded, prompt-injection-resistant Tier 2 prompt and
+// explicitly rejects positive byte limits below MinPromptBytes that cannot fit the required
+// prompt header and closing telemetry fence.
+func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool, []string, error) {
 	if maxPromptBytes <= 0 {
 		maxPromptBytes = config.DefaultMaxPromptBytes
+	}
+	if maxPromptBytes < MinPromptBytes {
+		return "", in.InjectionSuspected, mergeSignals(in.InjectionSignals), fmt.Errorf("max_prompt_bytes %d is too small to fit required prompt framing (minimum %d)", maxPromptBytes, MinPromptBytes)
 	}
 
 	cleanSvc, sigSvc := security.SanitizeUntrustedLogText(in.Service, 128)
@@ -302,11 +314,6 @@ func BuildTriagePrompt(in PromptInput, maxPromptBytes int) (string, bool, []stri
 	// is never truncated even when metadata (e.g. many rule IDs) exceeds the prompt budget.
 	framingLen := len(promptHeader) + len(promptFooter)
 	bodyBudget := maxPromptBytes - framingLen
-	if bodyBudget <= 0 {
-		// Defensive fallback if a direct caller passes a sub-framing budget (NewClient and
-		// config.Validate reject budgets below MinPromptBytes upfront).
-		return promptHeader + promptFooter, injSuspected, signals
-	}
 
 	const fieldLabelsLen = len("\ntemplate=\nsample=")
 	avail := bodyBudget - len(metaLine) - fieldLabelsLen
@@ -315,7 +322,7 @@ func BuildTriagePrompt(in PromptInput, maxPromptBytes int) (string, bool, []stri
 		if len(metaLine) > bodyBudget {
 			metaLine = truncateUTF8(metaLine, bodyBudget)
 		}
-		return promptHeader + metaLine + promptFooter, injSuspected, signals
+		return promptHeader + metaLine + promptFooter, injSuspected, signals, nil
 	}
 
 	tmplBudget := avail / 3
@@ -331,7 +338,7 @@ func BuildTriagePrompt(in PromptInput, maxPromptBytes int) (string, bool, []stri
 	}
 
 	prompt := promptHeader + metaLine + "\ntemplate=" + cleanTmpl + "\nsample=" + cleanSample + promptFooter
-	return prompt, injSuspected, signals
+	return prompt, injSuspected, signals, nil
 }
 
 // ParseCompletion extracts a structured, fail-closed model.TriageVerdict from raw Tier 2
@@ -470,7 +477,7 @@ func sanitizeSingleLine(s string, maxBytes int) string {
 	}
 	prevSpace := false
 	for _, r := range s {
-		if r == '\n' || r == '\r' || r == '\t' {
+		if r == '\n' || r == '\r' || r == '\t' || r == '\u2028' || r == '\u2029' {
 			r = ' '
 		} else if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
 			continue

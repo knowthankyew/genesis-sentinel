@@ -67,6 +67,18 @@ func TestBuildTriagePromptSanitizesAndPreservesClosingFence(t *testing.T) {
 	if !strings.HasSuffix(metaOverflow, "\nEND_UNTRUSTED_LOG_TELEMETRY") {
 		t.Fatalf("oversized-metadata prompt clipped closing fence: %q", metaOverflow[max(0, len(metaOverflow)-80):])
 	}
+	// Sub-framing budget must be rejected explicitly by BuildTriagePromptChecked and never overflow BuildTriagePrompt.
+	if _, _, _, err := BuildTriagePromptChecked(PromptInput{Service: "api", SampleLine: "x"}, 64); err == nil {
+		t.Fatal("expected BuildTriagePromptChecked to reject 64-byte budget")
+	}
+	if pSmall, _, _ := BuildTriagePrompt(PromptInput{Service: "api", SampleLine: "x"}, 64); len(pSmall) > 64 {
+		t.Fatalf("BuildTriagePrompt exceeded 64-byte budget: got %d", len(pSmall))
+	}
+	// Unicode line separators U+2028 / U+2029 must be normalized to spaces in single-line completions.
+	compSep := FormatCanonicalCompletion(ClassBenignNoise, "LOW", "NONE", "first\u2028second\u2029third")
+	if strings.ContainsAny(compSep, "\u2028\u2029") {
+		t.Fatalf("Unicode line separator survived FormatCanonicalCompletion: %q", compSep)
+	}
 }
 
 func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
@@ -340,59 +352,72 @@ func TestClientStaleCircuitGenerationDoesNotReopenRecoveredBreaker(t *testing.T)
 	}
 }
 
+type deadlineRoundTripper struct {
+	dispatched atomic.Int32
+}
+
+func (d *deadlineRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	d.dispatched.Add(1)
+	return nil, context.DeadlineExceeded
+}
+
 func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) {
-	// 1. Explicitly empty "adapterPath": "" when an adapter was requested MUST fail closed.
-	mismatchSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
-	}))
-	defer mismatchSrv.Close()
-
-	cMismatch, err := NewClient(ClientOptions{
-		BaseURL:     mismatchSrv.URL,
-		BaseModel:   model.ModelSmolLM2135MInstruct,
-		AdapterPath: "artifacts/job-1/model_adapters",
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	if _, _, err := cMismatch.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "x"}); err == nil {
-		t.Fatal("expected explicit empty adapterPath response to fail closed when adapter was requested")
-	}
-
-	// 2. Dispatched request exhausting caller deadline (e.g. TriageTimeoutSec=5) MUST trip circuit breaker.
-	releaseHang := make(chan struct{})
-	hangSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-releaseHang:
-		case <-r.Context().Done():
+	// 1. Explicitly empty "adapterPath": "" AND explicit "adapterPath": null when an adapter was requested MUST fail closed,
+	// and mismatch errors must NOT echo raw untrusted server runtime identity strings.
+	for _, body := range []string{
+		`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
+		`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":null,"completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
+		`{"baseModel":"secret-leaked-model","adapterPath":"artifacts/job-1/model_adapters","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`,
+	} {
+		respBody := body
+		mismatchSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(respBody))
+		}))
+		cMismatch, err := NewClient(ClientOptions{
+			BaseURL:     mismatchSrv.URL,
+			BaseModel:   model.ModelSmolLM2135MInstruct,
+			AdapterPath: "artifacts/job-1/model_adapters",
+		})
+		if err != nil {
+			mismatchSrv.Close()
+			t.Fatalf("NewClient: %v", err)
 		}
-	}))
-	defer func() {
-		close(releaseHang)
-		hangSrv.Close()
-	}()
+		_, _, err = cMismatch.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "x"})
+		mismatchSrv.Close()
+		if err == nil {
+			t.Fatalf("expected mismatch error for body %s", respBody)
+		}
+		if strings.Contains(err.Error(), "secret-leaked-model") {
+			t.Fatalf("mismatch error echoed raw untrusted identity: %v", err)
+		}
+	}
 
-	cHang, err := NewClient(ClientOptions{BaseURL: hangSrv.URL, Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
+	// 2. Deterministically verify a dispatched request returning context.DeadlineExceeded trips the circuit breaker.
+	dt := &deadlineRoundTripper{}
+	cHang, err := NewClient(ClientOptions{BaseURL: "http://127.0.0.1:8000", Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("NewClient hang: %v", err)
 	}
-	deadlineCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
-	if _, _, err := cHang.TriageWindow(deadlineCtx, PromptInput{Service: "api", SampleLine: "hang"}); err == nil {
-		t.Fatal("expected deadline error on hung server")
+	cHang.httpClient = &http.Client{Transport: dt}
+	if _, _, err := cHang.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "hang"}); err == nil {
+		t.Fatal("expected deadline error from deterministic transport")
+	}
+	if dt.dispatched.Load() != 1 {
+		t.Fatalf("expected exactly 1 dispatched request, got %d", dt.dispatched.Load())
 	}
 	if !cHang.Stats().CircuitOpen {
-		t.Fatal("expected circuit breaker to trip when dispatched request exhausts flush deadline")
+		t.Fatal("expected circuit breaker to trip when dispatched request hits deadline")
 	}
 
-	// 3. Long JWT (>240 bytes) and unlabeled API key in HTTP 500 body MUST be redacted before truncation.
-	longJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
-		"eyJzdWIiOiJ1c2VyMTIzNDU2Nzg5MCIsIm5hbWUiOiJTZWNyZXRQYXlsb2FkIiwiZGF0YSI6\"" + strings.Repeat("A", 240) + "\"}.sig1234567890"
-	_ = longJWT
+	// 3. Long JWT (>240 bytes), unlabeled API key, and short (<4-byte) API keys MUST be redacted before truncation.
 	validLongJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJTZWNyZXRQYXlsb2Fk" + strings.Repeat("B", 230) + ".sig1234567890"
 	red := redactErrSnippet(`{"detail":"bad token `+validLongJWT+` rawKey=opaqueAPIKey99"}`, "opaqueAPIKey99")
 	if strings.Contains(red, "SecretPayload") || strings.Contains(red, "eyJzdWI") || strings.Contains(red, "opaqueAPIKey99") {
 		t.Fatalf("redactErrSnippet leaked long JWT or configured API key: %q", red)
+	}
+	redShort := redactErrSnippet(`{"detail":"echoed short key ab"}`, "ab")
+	if strings.Contains(redShort, "ab") {
+		t.Fatalf("redactErrSnippet leaked short (<4 byte) API key: %q", redShort)
 	}
 }

@@ -221,7 +221,7 @@ func starterClassSpecs() []seedClassSpec {
 					entropy: 5.78, surprisal: 12.10, count: 8,
 					sampleFn: func(rng *rand.Rand, i int) string {
 						const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-						buf := make([]byte, 64)
+						buf := make([]byte, 60)
 						for k := range buf {
 							buf[k] = alphabet[rng.Intn(len(alphabet))]
 						}

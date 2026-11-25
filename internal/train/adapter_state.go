@@ -63,6 +63,15 @@ func SaveActiveAdapter(dataDir string, state ActiveAdapter) error {
 		return err
 	}
 	payload = append(payload, '\n')
+	if len(payload) > maxActiveAdapterBytes {
+		return fmt.Errorf("active adapter manifest (%d bytes) exceeds %d-byte limit", len(payload), maxActiveAdapterBytes)
+	}
+
+	unlockDir, err := feedback.AcquireDirLock(dataDir)
+	if err != nil {
+		return fmt.Errorf("lock data dir %q: %w", dataDir, err)
+	}
+	defer unlockDir()
 
 	tmp, err := os.CreateTemp(dataDir, ".active-adapter-*.tmp")
 	if err != nil {
@@ -201,8 +210,11 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 		return "", fmt.Errorf("POST %s/adapter returned HTTP %d: %s", redactedTarget, resp.StatusCode, compactErrBody(respBody, authToken))
 	}
 	var ack struct {
+		Status  string `json:"status"`
 		DataDir string `json:"data_dir"`
 	}
-	_ = json.Unmarshal(respBody, &ack)
+	if err := json.Unmarshal(respBody, &ack); err != nil || ack.Status != "activated" {
+		return "", fmt.Errorf("POST %s/adapter returned incomplete or invalid activation acknowledgement", redactedTarget)
+	}
 	return strings.TrimSpace(ack.DataDir), nil
 }

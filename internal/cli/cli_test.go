@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
@@ -458,8 +459,22 @@ func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
 		t.Fatalf("expected active-adapter.json after --activate: %v", err)
 	}
 
-	// 4. Mock local Inference server + run `sentinel scan --triage-mode http`.
+	// 4. Mock local Inference server + run `sentinel scan --triage-mode http`, verifying adapter & model forwarding.
+	var inferHits atomic.Int32
 	inferSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			BaseModel   string `json:"baseModel"`
+			AdapterPath string `json:"adapterPath"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.BaseModel != model.ModelSmolLM2135MInstruct || req.AdapterPath != "artifacts/job-smol-01/model_adapters" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		inferHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job-smol-01/model_adapters","completion":"[INJECTION-ATTEMPT] severity=CRITICAL mitre=TA0001 explanation=Path traversal attack detected.","latencyMs":21.0}`))
 	}))
@@ -486,8 +501,8 @@ func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatalf("decode scan JSON: %v", err)
 	}
-	if rep.TriageEvaluated != 1 || len(rep.Alerts) != 1 || rep.Alerts[0].TriageClass != "INJECTION-ATTEMPT" || rep.Alerts[0].Tier != "tier0+tier2" {
-		t.Fatalf("unexpected Tier 2 scan report: %+v", rep)
+	if inferHits.Load() != 1 || rep.TriageEvaluated != 1 || len(rep.Alerts) != 1 || rep.Alerts[0].TriageClass != "INJECTION-ATTEMPT" || rep.Alerts[0].Tier != "tier0+tier2" {
+		t.Fatalf("unexpected Tier 2 scan report (inferHits=%d): %+v", inferHits.Load(), rep)
 	}
 
 	// 5. `sentinel burn -y` cleans feedback files AND active-adapter.json cleanly!

@@ -1183,22 +1183,41 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 		t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
 	}
 
-	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir, preserves invalid-slug filenames
-	// like "sentinel-feedback-team notes.jsonl", AND still cleans custom FeedbackDir when DataDir fails.
+	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir, removes generated decimal temp
+	// files (.sentinel-feedback-123456.tmp), preserves unrelated files ("sentinel-feedback-team notes.jsonl"
+	// and ".sentinel-feedback-notes.tmp"), reports non-directory custom feedbackDir as an error,
+	// AND still cleans custom FeedbackDir when DataDir fails.
 	fbOnlyDir := t.TempDir()
 	fbOnlyFile := filepath.Join(fbOnlyDir, "sentinel-feedback.jsonl")
+	genTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-123456.tmp")
+	notesTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-notes.tmp")
 	invalidSlugFile := filepath.Join(fbOnlyDir, "sentinel-feedback-team notes.jsonl")
-	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
-		t.Fatalf("write fbOnlyFile: %v", err)
+	for _, f := range []struct {
+		p string
+		c string
+	}{
+		{fbOnlyFile, `{"prompt":"x","completion":"[BENIGN-NOISE]"}` + "\n"},
+		{genTmpFile, "partial"},
+		{notesTmpFile, "keep-notes"},
+		{invalidSlugFile, `{"user":"keep"}` + "\n"},
+	} {
+		if err := os.WriteFile(f.p, []byte(f.c), 0600); err != nil {
+			t.Fatalf("write %s: %v", f.p, err)
+		}
 	}
-	if err := os.WriteFile(invalidSlugFile, []byte(`{"user":"keep"}`+"\n"), 0600); err != nil {
-		t.Fatalf("write invalidSlugFile: %v", err)
-	}
-	if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 1 {
+	if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 2 {
 		t.Fatalf("BurnLocalStateWithFeedbackDir('', fbOnlyDir) failed: rep=%+v err=%v", rep, err)
 	}
-	if _, err := os.Stat(invalidSlugFile); err != nil {
-		t.Fatalf("non-owned filename with space was removed by burn: %v", err)
+	if _, err := os.Stat(genTmpFile); !os.IsNotExist(err) {
+		t.Fatal("generated decimal temp file survived burn")
+	}
+	for _, preserved := range []string{invalidSlugFile, notesTmpFile} {
+		if _, err := os.Stat(preserved); err != nil {
+			t.Fatalf("non-owned file %s was removed by burn: %v", preserved, err)
+		}
+	}
+	if _, err := BurnLocalStateWithFeedbackDir("", badParent); err == nil {
+		t.Fatal("expected non-directory custom feedbackDir to return an error")
 	}
 
 	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
@@ -1212,15 +1231,21 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 		t.Fatal("custom feedback file survived partial burn")
 	}
 
-	// 6. Two fresh pipelines emitting in the same Unix second generate distinct AlertIDs.
+	// 6. Two fresh pipelines emitting at the exact same pinned Unix second generate distinct AlertIDs.
 	p1 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
 	p2 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
+	fixedClock := func() int64 { return 1763997000 }
+	p1.nowUnixFn = fixedClock
+	p2.nowUnixFn = fixedClock
 	ev := model.LogEvent{ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"}
 	p1.IngestEvent(ev)
 	p2.IngestEvent(ev)
 	a1, _ := p1.FlushWindow()
 	a2, _ := p2.FlushWindow()
-	if len(a1) != 1 || len(a2) != 1 || a1[0].AlertID == a2[0].AlertID {
-		t.Fatalf("expected distinct per-pipeline AlertIDs, got a1=%q a2=%q", a1[0].AlertID, a2[0].AlertID)
+	if len(a1) != 1 || len(a2) != 1 {
+		t.Fatalf("expected 1 alert from each pipeline, got len(a1)=%d len(a2)=%d", len(a1), len(a2))
+	}
+	if a1[0].AlertID == a2[0].AlertID {
+		t.Fatalf("expected distinct per-pipeline AlertIDs at identical Unix second, got %q == %q", a1[0].AlertID, a2[0].AlertID)
 	}
 }

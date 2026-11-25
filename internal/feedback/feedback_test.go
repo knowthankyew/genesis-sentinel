@@ -38,9 +38,14 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		"Authorization: Bearer opaqueToken123456",
 		"Authorization: Basic dXNlcjpwYXNz",
 		"Basic YTpi",
+		"Basic YTo/",
+		"Basic YTo+",
+		"Basic dGVzdDoxMjPCow==",
 		`{"Authorization": "Basic YTpi"}`,
 		`DOCKER_AUTH_CONFIG={"auths":{"reg.local":{"auth":"cmVnOnNlY3JldA=="}}}`,
 		"DOCKER_AUTH_CONFIG={\n  \"auths\": {\n    \"reg.local\": {\"auth\": \"cmVnOnNlY3JldA==\"}\n  }\n}",
+		`DOCKER_AUTH_CONFIG={"padding":"` + strings.Repeat("A", 17000) + `","auth":"c2VjcmV0"}`,
+		`DOCKER_AUTH_CONFIG={"padding":"` + strings.Repeat("B", 17000) + `","auth":"c2VjcmV0"`,
 		`password=myplaintextpw`,
 		`password=[REDACTED_SECRET]leaked_suffix`,
 		`{"password":"[REDACTED_SECRET]leaked_suffix"}`,
@@ -58,7 +63,23 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	if cardBoundary != "card=[REDACTED_CARD] 2 attempts" {
 		t.Fatalf("unexpected card boundary redaction: got %q", cardBoundary)
 	}
-	// Verify multi-line DOCKER_AUTH_CONFIG and partial [REDACTED_SECRET]leaked_suffix are completely scrubbed.
+	// Verify oversized complete and unterminated DOCKER_AUTH_CONFIG objects (>16 KiB) never leak trailing auth fields.
+	for _, bigCfg := range []string{
+		`DOCKER_AUTH_CONFIG={"padding":"` + strings.Repeat("A", 17000) + `","auth":"c2VjcmV0"}`,
+		`DOCKER_AUTH_CONFIG={"padding":"` + strings.Repeat("B", 17000) + `","auth":"c2VjcmV0"`,
+	} {
+		redBig, _ := RedactText(bigCfg)
+		if strings.Contains(redBig, "c2VjcmV0") || strings.Contains(redBig, `"auth"`) {
+			t.Fatalf("oversized DOCKER_AUTH_CONFIG leaked trailing auth field: %q", redBig)
+		}
+	}
+	// Verify Basic tokens ending in '/' or '+' and UTF-8 RFC 7617 credentials are scrubbed.
+	basicEdge, _ := RedactText("Basic YTo/ Basic YTo+ Basic dGVzdDoxMjPCow==")
+	for _, tok := range []string{"YTo/", "YTo+", "dGVzdDoxMjPCow=="} {
+		if strings.Contains(basicEdge, tok) {
+			t.Fatalf("Basic token %q survived RedactText: %q", tok, basicEdge)
+		}
+	}
 	mlDocker, _ := RedactText("DOCKER_AUTH_CONFIG={\n  \"auths\": {\"reg\": {\"auth\": \"cmVnOnNlY3JldA==\"}}\n}")
 	if strings.Contains(mlDocker, "cmVnOnNlY3JldA==") || strings.Contains(mlDocker, "auths") {
 		t.Fatalf("multi-line DOCKER_AUTH_CONFIG leaked: %q", mlDocker)
@@ -261,12 +282,13 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 	// Verify ValidateJSONLFile rejects schema violations using PII-free fixtures (extra field,
 	// duplicate keys, null prompt, non-JSON NBSP whitespace) plus email & credential KV PII.
 	for name, content := range map[string]string{
-		"extra-field.jsonl": `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"harmless metadata"}` + "\n",
-		"dup-key.jsonl":     `{"prompt":"first clean prompt","prompt":"second clean prompt","completion":"[BENIGN-NOISE]"}` + "\n",
-		"null-prompt.jsonl": `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
-		"nbsp-prefix.jsonl": "\u00a0" + `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
-		"email-pii.jsonl":   `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",
-		"cred-kv.jsonl":     `{"prompt":"login password=unredactedpw failed","completion":"[AUTH-BRUTEFORCE]"}` + "\n",
+		"extra-field.jsonl":  `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"harmless metadata"}` + "\n",
+		"dup-key.jsonl":      `{"prompt":"first clean prompt","prompt":"second clean prompt","completion":"[BENIGN-NOISE]"}` + "\n",
+		"null-prompt.jsonl":  `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
+		"nbsp-prefix.jsonl":  "\u00a0" + `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
+		"invalid-utf8.jsonl": "{\"prompt\":\"bad \xff utf8\",\"completion\":\"[BENIGN-NOISE]\"}\n",
+		"email-pii.jsonl":    `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",
+		"cred-kv.jsonl":      `{"prompt":"login password=unredactedpw failed","completion":"[AUTH-BRUTEFORCE]"}` + "\n",
 	} {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(content), 0600); err != nil {

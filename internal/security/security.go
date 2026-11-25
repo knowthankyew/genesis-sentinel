@@ -50,7 +50,7 @@ var (
 	}
 
 	// SanitizeURLError cause scrubbers.
-	embeddedURLRe  = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	embeddedURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 	diagAuthCredRe = regexp.MustCompile(`(?i)\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{4,}`)
 )
 
@@ -391,16 +391,21 @@ func sanitizeSingleURLString(raw string) string {
 }
 
 func sanitizeErrMessage(msg string) string {
+	// Go's net/http embeds raw Location header values (including malformed relative URLs with
+	// sensitive fragments or query params) before CheckRedirect runs; replace with a safe message.
+	if strings.Contains(strings.ToLower(msg), "location header") {
+		return "invalid redirect Location header"
+	}
 	s := embeddedURLRe.ReplaceAllStringFunc(msg, func(m string) string {
 		return sanitizeSingleURLString(m)
 	})
 	s = diagAuthCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
-	// Scrub bare malformed redirect URL fragments that contain query strings (?...) or userinfo (@).
-	if strings.Contains(s, "?") || strings.Contains(s, "@") {
+	// Scrub bare malformed URL fragments that contain query strings (?...), fragments (#...), or userinfo (@).
+	if strings.ContainsAny(s, "?#@") {
 		fields := strings.Fields(s)
 		for i, f := range fields {
 			trimmed := strings.Trim(f, `"'(),;`)
-			if strings.Contains(trimmed, "?") || (strings.Contains(trimmed, "@") && strings.Contains(trimmed, "://")) {
+			if strings.ContainsAny(trimmed, "?#") || (strings.Contains(trimmed, "@") && strings.Contains(trimmed, "://")) {
 				fields[i] = "<redacted-url>"
 			}
 		}

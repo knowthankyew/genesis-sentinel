@@ -133,19 +133,22 @@ type bucketAccumulator struct {
 // per-event deterministic rule accumulation, Tier 1 Laplace-LK surprisal scoring,
 // and Genesis alert emission.
 type Pipeline struct {
-	cfg              *config.Config
-	agg              *template.Aggregator
-	ruleEng          *rules.Engine
-	surprisalEng     *surprisal.Engine
-	triageClient     *triage.Client
-	alertJournal     *feedback.AlertJournal
-	sink             emit.Sink
-	activeSource     string
-	instanceID       string
-	startTime        time.Time
-	triageReqTimeout time.Duration
-	triageCancelMu   sync.Mutex
-	triageCancel     context.CancelFunc
+	cfg                *config.Config
+	agg                *template.Aggregator
+	ruleEng            *rules.Engine
+	surprisalEng       *surprisal.Engine
+	triageClient       *triage.Client
+	alertJournal       *feedback.AlertJournal
+	sink               emit.Sink
+	activeSource       string
+	instanceID         string
+	startTime          time.Time
+	nowUnixFn          func() int64
+	triageReqTimeout   time.Duration
+	triageCancelMu     sync.Mutex
+	burnPending        int
+	nextFlushCancelID  uint64
+	activeTriageCancel map[uint64]context.CancelFunc
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
@@ -243,6 +246,7 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		instanceID:            instanceID,
 		startTime:             time.Now(),
 		triageReqTimeout:      reqTimeout,
+		activeTriageCancel:    make(map[uint64]context.CancelFunc),
 		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
 		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
@@ -561,6 +565,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		emittedWinKeys = make(map[ruleBucketKey]bool, len(keys))
 	)
 	nowUnix := time.Now().Unix()
+	if p.nowUnixFn != nil {
+		nowUnix = p.nowUnixFn()
+	}
 
 	triageClient := p.triageClient
 	var (
@@ -574,12 +581,25 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		}
 		triageCtx, cancelTriage = context.WithTimeout(context.Background(), flushBudget)
 		p.triageCancelMu.Lock()
-		p.triageCancel = cancelTriage
+		var flushCancelID uint64
+		if p.burnPending > 0 {
+			// A Burn() is already pending: cancel immediately so no new inference starts behind Burn.
+			cancelTriage()
+		} else {
+			p.nextFlushCancelID++
+			flushCancelID = p.nextFlushCancelID
+			if p.activeTriageCancel == nil {
+				p.activeTriageCancel = make(map[uint64]context.CancelFunc)
+			}
+			p.activeTriageCancel[flushCancelID] = cancelTriage
+		}
 		p.triageCancelMu.Unlock()
 		defer func() {
-			p.triageCancelMu.Lock()
-			p.triageCancel = nil
-			p.triageCancelMu.Unlock()
+			if flushCancelID != 0 {
+				p.triageCancelMu.Lock()
+				delete(p.activeTriageCancel, flushCancelID)
+				p.triageCancelMu.Unlock()
+			}
 			cancelTriage()
 		}()
 	}
@@ -990,13 +1010,19 @@ func (p *Pipeline) Stats() Stats {
 // pending hits, Tier 1 rolling surprisal baselines, and active ingest cursors
 // (.seg and /query), and deletes Sentinel-owned disk state.
 func (p *Pipeline) Burn() (BurnReport, error) {
-	// Cancel any in-flight Tier 2 HTTP call immediately so Burn never stalls waiting for a
-	// hung local inference server before acquiring burnMu.Lock().
+	// Mark Burn as pending and cancel ALL active in-flight Tier 2 HTTP calls immediately so
+	// no existing or newly entering flush can stall Burn waiting on a hung inference server.
 	p.triageCancelMu.Lock()
-	if p.triageCancel != nil {
-		p.triageCancel()
+	p.burnPending++
+	for _, cancelFn := range p.activeTriageCancel {
+		cancelFn()
 	}
 	p.triageCancelMu.Unlock()
+	defer func() {
+		p.triageCancelMu.Lock()
+		p.burnPending--
+		p.triageCancelMu.Unlock()
+	}()
 
 	p.burnMu.Lock()
 	defer p.burnMu.Unlock()
@@ -1295,7 +1321,9 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 			if lstatErr == nil {
 				if customInfo.Mode()&os.ModeSymlink != 0 {
 					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", trimmedFB))
-				} else if customInfo.IsDir() && (defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo)) {
+				} else if !customInfo.IsDir() {
+					errs = append(errs, fmt.Errorf("custom feedback dir %q is not a directory", trimmedFB))
+				} else if defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo) {
 					unlockCustom, cLockErr := feedback.AcquireDirLock(trimmedFB)
 					if cLockErr != nil {
 						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", trimmedFB, cLockErr))

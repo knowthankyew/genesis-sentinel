@@ -36,7 +36,10 @@ const (
 	MaxFeedbackRecordBytes = 256 * 1024
 )
 
-var safeSlugRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+var (
+	safeSlugRe         = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+	tempFeedbackFileRe = regexp.MustCompile(`^\.sentinel-feedback-[0-9]+\.tmp$`)
+)
 
 // ExportSummary describes a finalized FTaaS-compatible JSONL dataset export.
 type ExportSummary struct {
@@ -123,8 +126,8 @@ func (s *Store) PathFor(filename string) (string, error) {
 }
 
 // IsOwnedFeedbackFilename reports whether name matches Sentinel's owned feedback queue
-// or writer temporary filename grammar (exact safeSlugRe slugs; never unrelated user files
-// such as "sentinel-feedback-team notes.jsonl").
+// or os.CreateTemp writer temporary filename grammar (exact safeSlugRe slugs and decimal
+// CreateTemp suffixes; never unrelated user files such as ".sentinel-feedback-notes.tmp").
 func IsOwnedFeedbackFilename(name string) bool {
 	if name == DefaultFeedbackFilename || name == DefaultFeedbackFilename+".tmp" {
 		return true
@@ -139,7 +142,7 @@ func IsOwnedFeedbackFilename(name string) bool {
 			return safeSlugRe.MatchString(mid)
 		}
 	}
-	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
+	return tempFeedbackFileRe.MatchString(name)
 }
 
 func isSentinelFeedbackFilename(name string) bool {
@@ -175,7 +178,7 @@ func RecordFromAlert(
 		return model.FeedbackRecord{}, nil, fmt.Errorf("invalid feedback weight %v: must be positive and finite", weight)
 	}
 
-	prompt, _, _ := triage.BuildTriagePrompt(triage.PromptInput{
+	prompt, _, _, err := triage.BuildTriagePromptChecked(triage.PromptInput{
 		Service:              alert.SourceService,
 		Level:                alert.SourceLevel,
 		TemplateID:           alert.TemplateID,
@@ -191,6 +194,9 @@ func RecordFromAlert(
 		InjectionSuspected:   alert.InjectionSuspected,
 		InjectionSignals:     alert.InjectionSignals,
 	}, maxPromptBytes)
+	if err != nil {
+		return model.FeedbackRecord{}, nil, err
+	}
 
 	exp := strings.TrimSpace(note)
 	if exp == "" {
@@ -598,9 +604,13 @@ func validateJSONLStream(r io.Reader, path string, requirePIIScan bool) (Validat
 			return ValidationSummary{}, fmt.Errorf("dataset %q grew past FTaaS ceiling of %d bytes during read",
 				path, config.DefaultMaxTrainingFileBytes)
 		}
+		rawBytes := scanner.Bytes()
+		if !utf8.Valid(rawBytes) {
+			return ValidationSummary{}, fmt.Errorf("dataset %q line %d contains invalid UTF-8 bytes", path, count+1)
+		}
 		// Trim only RFC 8259 JSON whitespace so non-JSON spaces (e.g. U+00A0 NBSP) fail
 		// validation rather than passing locally and breaking strict JSON parsers on upload.
-		line := trimJSONWhitespace(scanner.Text())
+		line := trimJSONWhitespace(string(rawBytes))
 		if line == "" {
 			continue
 		}
@@ -760,11 +770,15 @@ func (s *Store) isExistingCuratedQueue(outPath string) bool {
 func isExistingCuratedQueueFile(outPath string) bool {
 	f, _, err := OpenRegularFileNonBlocking(outPath)
 	if err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return false
+		}
+		// Fail closed on unreadable/non-regular existing paths so we never overwrite them.
+		return true
 	}
 	defer func() { _ = f.Close() }()
 
-	sc := bufio.NewScanner(io.LimitReader(f, MaxFeedbackRecordBytes+64*1024))
+	sc := bufio.NewScanner(io.LimitReader(f, config.DefaultMaxTrainingFileBytes+1))
 	sc.Buffer(make([]byte, 32*1024), MaxFeedbackRecordBytes+64*1024)
 	for sc.Scan() {
 		line := trimJSONWhitespace(sc.Text())
@@ -773,7 +787,8 @@ func isExistingCuratedQueueFile(outPath string) bool {
 		}
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			return false
+			// Fail closed if an existing file has non-JSON/malformed rows.
+			return true
 		}
 		if _, hasLabel := obj["label"]; hasLabel {
 			return true
@@ -784,7 +799,9 @@ func isExistingCuratedQueueFile(outPath string) bool {
 		if _, hasRedacted := obj["redacted"]; hasRedacted {
 			return true
 		}
-		return false
+	}
+	if sc.Err() != nil {
+		return true
 	}
 	return false
 }
@@ -826,31 +843,28 @@ func canonicalPathForCompare(p string) string {
 }
 
 func readFeedbackRecordsLocked(path string, maxRecords int, maxBytes int64) ([]model.FeedbackRecord, error) {
-	fi, err := os.Stat(path)
+	f, fi, err := OpenRegularFileNonBlocking(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("stat feedback file %q: %w", path, err)
+		return nil, fmt.Errorf("open feedback file %q: %w", path, err)
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("feedback file %q must be a regular file", path)
-	}
+	defer func() { _ = f.Close() }()
+
 	if fi.Size() > maxBytes {
 		return nil, fmt.Errorf("feedback file %q (%d bytes) exceeds %d-byte limit", path, fi.Size(), maxBytes)
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-
-	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes+1))
+	cr := &countingReader{r: io.LimitReader(f, maxBytes+1)}
+	scanner := bufio.NewScanner(cr)
 	scanner.Buffer(make([]byte, 64*1024), MaxFeedbackRecordBytes+64*1024)
 	var out []model.FeedbackRecord
 	lineNo := 0
 	for scanner.Scan() {
+		if cr.n > maxBytes {
+			return nil, fmt.Errorf("feedback file %q grew past %d-byte limit during read", path, maxBytes)
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -867,6 +881,9 @@ func readFeedbackRecordsLocked(path string, maxRecords int, maxBytes int64) ([]m
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read feedback file %q: %w", path, err)
+	}
+	if cr.n > maxBytes {
+		return nil, fmt.Errorf("feedback file %q grew past %d-byte limit during read", path, maxBytes)
 	}
 	return out, nil
 }

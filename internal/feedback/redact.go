@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
 )
@@ -19,7 +21,7 @@ var (
 	// Authorization Bearer and Basic credentials (both plain headers and JSON-quoted header keys).
 	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
 	bearerRe         = regexp.MustCompile(`(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
-	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{4,}={0,2})\b`)
+	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{4,}={0,2})`)
 
 	// Credential-bearing *_AUTH_CONFIG keys (e.g., DOCKER_AUTH_CONFIG JSON objects or strings).
 	authConfigKeyRe = regexp.MustCompile(`(?i)(["']?)\b([A-Z0-9_-]*auth[_-]?config)(["']?\s*[=:]\s*)`)
@@ -322,8 +324,7 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 		inQuote := byte(0)
 		escaped := false
 		i := valStart
-		maxEnd := min(len(s), valStart+16*1024)
-		for i < maxEnd {
+		for i < len(s) {
 			ch := s[i]
 			if inQuote != 0 {
 				if escaped {
@@ -348,7 +349,8 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 			}
 			i++
 		}
-		return i, "[REDACTED_AUTH_CONFIG]", true
+		// Unterminated object: consume the full remaining suffix rather than leaking trailing fields.
+		return len(s), "[REDACTED_AUTH_CONFIG]", true
 	case '"', '\'':
 		q := s[valStart]
 		escaped := false
@@ -423,8 +425,11 @@ func looksLikeEncodedBasicCred(tok string) bool {
 	if colon < 0 || (colon == 0 && len(decoded) < 2) {
 		return false
 	}
-	for _, b := range decoded {
-		if b < 0x20 || b > 0x7e {
+	if !utf8.Valid(decoded) {
+		return false
+	}
+	for _, r := range string(decoded) {
+		if unicode.IsControl(r) {
 			return false
 		}
 	}

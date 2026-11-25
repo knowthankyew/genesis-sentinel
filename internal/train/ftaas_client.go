@@ -479,6 +479,11 @@ func buildMultipartUploadFromBytes(fileName string, content []byte, fields map[s
 }
 
 func compactErrBody(b []byte, secrets ...string) string {
+	for _, sec := range secrets {
+		if len(sec) > 0 && len(sec) < 4 {
+			return "[response body omitted: short API key configured]"
+		}
+	}
 	s := strings.TrimSpace(string(b))
 	if len(s) > 4096 {
 		s = s[:4096]

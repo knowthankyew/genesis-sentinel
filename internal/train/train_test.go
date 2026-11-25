@@ -60,10 +60,14 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 			}
 			gotFile, _ := io.ReadAll(f)
 			_ = f.Close()
-			auditCh <- auditCapture{
+			select {
+			case auditCh <- auditCapture{
 				ablation:  r.FormValue("ablationThreshold"),
 				anomaly:   r.FormValue("anomalyThreshold"),
 				fileBytes: gotFile,
+			}:
+			default:
+				t.Errorf("unexpected duplicate audit request")
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"isValid":true,"cleanedRecordCount":14,"summary":{"original_count":16,"cleaned_count":14,"ablated_count":2,"anomalous_count":0}}`))
@@ -82,7 +86,11 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 			bm := r.FormValue("baseModel")
 			jn := r.FormValue("jobName")
 			pf := r.FormValue("enableSurprisalPreflight")
-			submitCh <- submitCapture{baseModel: bm, jobName: jn, preflight: pf, fileBytes: gotFile}
+			select {
+			case submitCh <- submitCapture{baseModel: bm, jobName: jn, preflight: pf, fileBytes: gotFile}:
+			default:
+				t.Errorf("unexpected duplicate submit request")
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"jobId":"job_abc123","jobName":"` + jn + `","status":"Queued","baseModel":"` + bm + `","datasetPath":"datasets/job_abc123.jsonl","datasetHash":"deadbeef","surprisalPreflightStatus":"Completed"}`))
@@ -124,7 +132,12 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	if err != nil || !auditRes.IsValid || auditRes.CleanedRecordCount != 14 {
 		t.Fatalf("AuditDataset unexpected: %+v err=%v", auditRes, err)
 	}
-	gotAudit := <-auditCh
+	var gotAudit auditCapture
+	select {
+	case gotAudit = <-auditCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mock audit handler to receive upload")
+	}
 	if gotAudit.ablation != "0.00001" || !bytes.Equal(gotAudit.fileBytes, dsBytes) {
 		t.Fatalf("AuditDataset mismatch: ablation=%q fileLen=%d wantLen=%d", gotAudit.ablation, len(gotAudit.fileBytes), len(dsBytes))
 	}
@@ -140,7 +153,12 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitJob unexpected error: %v", err)
 	}
-	gotSub := <-submitCh
+	var gotSub submitCapture
+	select {
+	case gotSub = <-submitCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mock submit handler to receive upload")
+	}
 	if subRes.JobID != "job_abc123" || gotSub.preflight != "true" || gotSub.baseModel != model.ModelSmolLM2135MInstruct || gotSub.jobName != "sentinel-test" || !bytes.Equal(gotSub.fileBytes, dsBytes) {
 		t.Fatalf("SubmitJob unexpected: res=%+v fileMatch=%v", subRes, bytes.Equal(gotSub.fileBytes, dsBytes))
 	}
@@ -190,6 +208,12 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	}
 	if _, exists, err := LoadActiveAdapter(emptyDir); !exists || err == nil {
 		t.Fatalf("expected LoadActiveAdapter to reject empty adapter_path with exists=true, got exists=%v err=%v", exists, err)
+	}
+	// Reject oversized manifest exceeding maxActiveAdapterBytes before writing to disk.
+	oversizedState := state
+	oversizedState.JobID = strings.Repeat("J", maxActiveAdapterBytes)
+	if err := SaveActiveAdapter(tmp, oversizedState); err == nil {
+		t.Fatal("expected SaveActiveAdapter to reject oversized manifest exceeding maxActiveAdapterBytes")
 	}
 }
 
@@ -245,7 +269,9 @@ func TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload(
 }
 
 func TestNotifyDaemonAdapterRedactsEchoedCredentialsInErrorBody(t *testing.T) {
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 		// Echo both labeled Bearer token AND unlabeled opaque configured token!
 		_, _ = w.Write([]byte(`{"error":"rejected Authorization: Bearer leaked-daemon-secret-9999 and raw opaque-token-xyz987"}`))
@@ -258,6 +284,9 @@ func TestNotifyDaemonAdapterRedactsEchoedCredentialsInErrorBody(t *testing.T) {
 	}, false)
 	if err == nil {
 		t.Fatal("expected HTTP 500 error from NotifyDaemonAdapter")
+	}
+	if hits.Load() != 1 || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("expected request to reach HTTP 500 handler, hits=%d err=%v", hits.Load(), err)
 	}
 	if strings.Contains(err.Error(), "leaked-daemon-secret-9999") || strings.Contains(err.Error(), "opaque-token-xyz987") {
 		t.Fatalf("NotifyDaemonAdapter leaked credential in error output: %v", err)
