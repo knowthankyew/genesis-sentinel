@@ -28,6 +28,11 @@ const (
 	maxInferenceResponseBytes = 256 * 1024 // 256 KiB cap on local inference response bodies
 )
 
+// ErrStaleRuntime is returned when the active base model or LoRA adapter is hot-swapped
+// or reset by Burn() while an inference request is in flight, preventing retired adapters
+// from publishing stale verdicts.
+var ErrStaleRuntime = errors.New("tier2 runtime changed while inference was in flight")
+
 // ClientOptions configures the loopback Tier 2 inference client targeting
 // ml/src/FtaaSService.Inference (/api/v1/inference/generate).
 type ClientOptions struct {
@@ -116,6 +121,7 @@ type Client struct {
 	adapterPath        string
 	openUntil          time.Time
 	circuitGen         uint64
+	runtimeGen         uint64
 	evaluatedTotal     uint64
 	fallbacksTotal     uint64
 	injectionOverrides uint64
@@ -252,6 +258,7 @@ func (c *Client) SetAdapterPath(relPath string) error {
 	c.adapterPath = clean
 	c.openUntil = time.Time{}
 	c.circuitGen++
+	c.runtimeGen++
 	c.mu.Unlock()
 	return nil
 }
@@ -265,6 +272,7 @@ func (c *Client) SetBaseModel(baseModel string) error {
 	c.baseModel = strings.TrimSpace(baseModel)
 	c.openUntil = time.Time{}
 	c.circuitGen++
+	c.runtimeGen++
 	c.mu.Unlock()
 	return nil
 }
@@ -298,6 +306,7 @@ func (c *Client) SetModelAndAdapter(baseModel, relPath string) error {
 	c.adapterPath = clean
 	c.openUntil = time.Time{}
 	c.circuitGen++
+	c.runtimeGen++
 	c.mu.Unlock()
 	return nil
 }
@@ -309,6 +318,7 @@ func (c *Client) ResetAdapter() {
 	c.adapterPath = ""
 	c.openUntil = time.Time{}
 	c.circuitGen++
+	c.runtimeGen++
 	c.mu.Unlock()
 }
 
@@ -397,6 +407,7 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	baseModel := c.baseModel
 	adapterPath := c.adapterPath
 	circuitGen := c.circuitGen
+	runtimeGen := c.runtimeGen
 	c.mu.Unlock()
 
 	prompt, injSuspected, injSignals, err := BuildTriagePromptChecked(in, c.maxPromptBytes)
@@ -495,6 +506,11 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	)
 
 	c.mu.Lock()
+	if c.runtimeGen != runtimeGen {
+		c.fallbacksTotal++
+		c.mu.Unlock()
+		return model.TriageVerdict{}, false, ErrStaleRuntime
+	}
 	c.evaluatedTotal++
 	if overridden {
 		c.injectionOverrides++
@@ -520,7 +536,7 @@ func (c *Client) recordFailure(circuitGen uint64, tripBreaker bool) {
 var (
 	diagAuthCredRe = regexp.MustCompile(`(?i)\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{6,}`)
 	diagJWTRe      = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	diagCredKVRe   = regexp.MustCompile(`(?i)(["']?)(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}]+)`)
+	diagCredKVRe   = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;&}]+)`)
 )
 
 func redactErrSnippet(raw string, secrets ...string) string {

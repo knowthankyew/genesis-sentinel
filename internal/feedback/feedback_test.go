@@ -394,6 +394,8 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		if err := j.Record(emit.Alert{
 			AlertID:           fmt.Sprintf("  sentinel-100-%d  ", i),
+			Service:           "alertsvc-owner@example.com",
+			TemplateID:        "tmpl-owner@example.com",
 			TraceID:           "trace-user@example.com",
 			SourceService:     "svc-owner@example.com",
 			Severity:          "HIGH",
@@ -425,12 +427,27 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	if len(got.TopSurprisalFeatures) != 1 || got.TopSurprisalFeatures["entropy"] != 3.2 {
 		t.Fatalf("expected redacted feature keys to be omitted deterministically while preserving clean keys, got %+v", got.TopSurprisalFeatures)
 	}
-	// Verify PII/secrets (including SourceService, TraceID, TriageAdapter, feature keys) were scrubbed before persistence in alerts.jsonl.
+	// Verify in-place upsert on an existing AlertID replaces the record without duplicating rows.
+	updated := got
+	updated.Tier = "tier0+tier2"
+	updated.TriageClass = "AUTH-BRUTEFORCE"
+	if err := j.Record(updated); err != nil {
+		t.Fatalf("upsert Record failed: %v", err)
+	}
+	gotUpsert, foundUpsert, err := j.FindByID("sentinel-100-5")
+	if err != nil || !foundUpsert || gotUpsert.Tier != "tier0+tier2" || gotUpsert.TriageClass != "AUTH-BRUTEFORCE" {
+		t.Fatalf("expected in-place upserted alert, got=%+v found=%v err=%v", gotUpsert, foundUpsert, err)
+	}
+	allRecent, err := j.Recent(10)
+	if err != nil || len(allRecent) != 3 {
+		t.Fatalf("expected upsert to preserve 3 unique alert rows without duplication, got len=%d err=%v", len(allRecent), err)
+	}
+	// Verify PII/secrets (including Service, TemplateID, SourceService, TraceID, TriageAdapter, feature keys) were scrubbed before persistence in alerts.jsonl.
 	rawJournal, err := os.ReadFile(j.Path())
 	if err != nil {
 		t.Fatalf("read alerts.jsonl: %v", err)
 	}
-	for _, secret := range []string{"trace-user@example.com", "svc-owner@example.com", "alice@example.com", "a@example.com", "b@example.com", "adaptersecret", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
+	for _, secret := range []string{"alertsvc-owner@example.com", "tmpl-owner@example.com", "trace-user@example.com", "svc-owner@example.com", "alice@example.com", "a@example.com", "b@example.com", "adaptersecret", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
 		if strings.Contains(string(rawJournal), secret) {
 			t.Fatalf("secret %q leaked into alerts.jsonl: %s", secret, string(rawJournal))
 		}

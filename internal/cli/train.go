@@ -97,15 +97,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-		if *feedbackDir == "" {
-			cfg.FeedbackDir = filepath.Join(*dataDir, "feedback")
-		}
-	}
-	if *feedbackDir != "" {
-		cfg.FeedbackDir = *feedbackDir
-	}
+	applyDirOverrides(cfg, *dataDir, *feedbackDir)
 	if *ftaasHTTP != "" {
 		cfg.FTaaSAPIAddr = *ftaasHTTP
 	}

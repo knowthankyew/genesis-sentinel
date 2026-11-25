@@ -57,6 +57,18 @@ Canonical Classes (enforced fail-closed by live Tier 2 parser):
   (custom [A-Z0-9-] tags are permitted for dataset curation; live Tier 2 defaults unknown tags to NEEDS-REVIEW)`)
 }
 
+func applyDirOverrides(cfg *config.Config, dataDir, feedbackDir string) {
+	if dataDir != "" {
+		cfg.DataDir = dataDir
+		if feedbackDir == "" {
+			cfg.FeedbackDir = filepath.Join(dataDir, "feedback")
+		}
+	}
+	if feedbackDir != "" {
+		cfg.FeedbackDir = feedbackDir
+	}
+}
+
 func runFeedbackAdd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("feedback add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -82,15 +94,7 @@ func runFeedbackAdd(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-		if *feedbackDir == "" {
-			cfg.FeedbackDir = filepath.Join(*dataDir, "feedback")
-		}
-	}
-	if *feedbackDir != "" {
-		cfg.FeedbackDir = *feedbackDir
-	}
+	applyDirOverrides(cfg, *dataDir, *feedbackDir)
 	if *noRedact {
 		cfg.RequireRedaction = false
 	}
@@ -204,15 +208,7 @@ func runFeedbackSeed(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-		if *feedbackDir == "" {
-			cfg.FeedbackDir = filepath.Join(*dataDir, "feedback")
-		}
-	}
-	if *feedbackDir != "" {
-		cfg.FeedbackDir = *feedbackDir
-	}
+	applyDirOverrides(cfg, *dataDir, *feedbackDir)
 
 	trainName, err := feedback.NamedFilename(*name)
 	if err != nil {
@@ -296,15 +292,7 @@ func runFeedbackExport(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-		if *feedbackDir == "" {
-			cfg.FeedbackDir = filepath.Join(*dataDir, "feedback")
-		}
-	}
-	if *feedbackDir != "" {
-		cfg.FeedbackDir = *feedbackDir
-	}
+	applyDirOverrides(cfg, *dataDir, *feedbackDir)
 
 	srcName, err := feedback.NamedFilename(*name)
 	if err != nil {
@@ -346,15 +334,7 @@ func runFeedbackStats(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-		if *feedbackDir == "" {
-			cfg.FeedbackDir = filepath.Join(*dataDir, "feedback")
-		}
-	}
-	if *feedbackDir != "" {
-		cfg.FeedbackDir = *feedbackDir
-	}
+	applyDirOverrides(cfg, *dataDir, *feedbackDir)
 
 	filename, err := feedback.NamedFilename(*name)
 	if err != nil {
@@ -385,9 +365,7 @@ func runFeedbackAlerts(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-	}
+	applyDirOverrides(cfg, *dataDir, "")
 
 	journal := feedback.NewAlertJournal(cfg.DataDir)
 	alerts, err := journal.Recent(*limit)

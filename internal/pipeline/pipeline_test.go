@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/emit"
@@ -1099,190 +1100,597 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 	}))
 	defer srv.Close()
 
-	// 1. Persistence failure MUST leave adapter A active in live memory.
-	badParent := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(badParent, []byte("file"), 0600); err != nil {
-		t.Fatalf("write blocker file: %v", err)
-	}
-	cfgFail := config.DefaultConfig()
-	cfgFail.DataDir = badParent
-	cfgFail.TriageMode = "http"
-	cfgFail.InferenceAddr = srv.URL
-	cfgFail.AdapterPath = "artifacts/adapter-A/model_adapters"
-	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
-	pipeFail := New(cfgFail, ruleEng, emit.NopSink{}, "file")
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
-	req.Header.Set("Content-Type", "application/json")
-	pipeFail.HandleAdapter(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 when SaveActiveAdapter fails, got %d", rec.Code)
-	}
-	if st := pipeFail.Stats(); st.TriageAdapter != "artifacts/adapter-A/model_adapters" {
-		t.Fatalf("failed persistence mutated live adapter: got %q, want adapter-A", st.TriageAdapter)
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
 	}
 
-	// 2. Concurrent HandleAdapter activations MUST serialize live and persisted state cleanly.
-	goodDir := t.TempDir()
-	cfgConc := config.DefaultConfig()
-	cfgConc.DataDir = goodDir
-	cfgConc.TriageMode = "http"
-	cfgConc.InferenceAddr = srv.URL
-	pipeConc := New(cfgConc, ruleEng, emit.NopSink{}, "file")
+	t.Run("AdapterPersistenceRollback", func(t *testing.T) {
+		badParent := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(badParent, []byte("file"), 0600); err != nil {
+			t.Fatalf("write blocker file: %v", err)
+		}
+		cfgFail := config.DefaultConfig()
+		cfgFail.DataDir = badParent
+		cfgFail.TriageMode = "http"
+		cfgFail.InferenceAddr = srv.URL
+		cfgFail.AdapterPath = "artifacts/adapter-A/model_adapters"
+		pipeFail := New(cfgFail, ruleEng, emit.NopSink{}, "file")
 
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			payload := fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
-				model.ModelSmolLM2135MInstruct, idx)
-			if idx%2 == 1 {
-				payload = fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
-					model.ModelSmolLM2360MInstruct, idx)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
+		req.Header.Set("Content-Type", "application/json")
+		pipeFail.HandleAdapter(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 when SaveActiveAdapter fails, got %d", rec.Code)
+		}
+		if st := pipeFail.Stats(); st.TriageAdapter != "artifacts/adapter-A/model_adapters" {
+			t.Fatalf("failed persistence mutated live adapter: got %q, want adapter-A", st.TriageAdapter)
+		}
+	})
+
+	t.Run("ConcurrentAdapterSerialization", func(t *testing.T) {
+		goodDir := t.TempDir()
+		cfgConc := config.DefaultConfig()
+		cfgConc.DataDir = goodDir
+		cfgConc.TriageMode = "http"
+		cfgConc.InferenceAddr = srv.URL
+		pipeConc := New(cfgConc, ruleEng, emit.NopSink{}, "file")
+
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				payload := fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
+					model.ModelSmolLM2135MInstruct, idx)
+				if idx%2 == 1 {
+					payload = fmt.Sprintf(`{"base_model":"%s","adapter_path":"artifacts/job-%d/model_adapters"}`,
+						model.ModelSmolLM2360MInstruct, idx)
+				}
+				rr := httptest.NewRecorder()
+				r := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
+				r.Header.Set("Content-Type", "application/json")
+				pipeConc.HandleAdapter(rr, r)
+				if rr.Code != http.StatusOK {
+					t.Errorf("concurrent HandleAdapter %d failed: %d %s", idx, rr.Code, rr.Body.String())
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		live := pipeConc.Stats()
+		disk, exists, err := train.LoadActiveAdapter(goodDir)
+		if err != nil || !exists {
+			t.Fatalf("LoadActiveAdapter after concurrent swaps failed: exists=%v err=%v", exists, err)
+		}
+		if live.TriageModel != disk.BaseModel || live.TriageAdapter != disk.AdapterPath {
+			t.Fatalf("live vs persisted adapter diverged after concurrent swaps: live=(%q,%q) disk=(%q,%q)",
+				live.TriageModel, live.TriageAdapter, disk.BaseModel, disk.AdapterPath)
+		}
+	})
+
+	t.Run("JournalFailureDoesNotFailSink", func(t *testing.T) {
+		badParent := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(badParent, []byte("file"), 0600); err != nil {
+			t.Fatalf("write blocker file: %v", err)
+		}
+		cfgFail := config.DefaultConfig()
+		cfgFail.DataDir = badParent
+		cfgFail.TriageMode = "http"
+		cfgFail.InferenceAddr = srv.URL
+		pipeJournalErr := New(cfgFail, ruleEng, emit.NopSink{}, "file")
+		pipeJournalErr.AttachAlertJournal(feedback.NewAlertJournal(badParent))
+		pipeJournalErr.IngestEvent(model.LogEvent{
+			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
+			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+		})
+		emitted, failed := pipeJournalErr.FlushWindow()
+		if len(failed) != 0 || len(emitted) != 1 {
+			t.Fatalf("journal failure should not fail sink delivery: emitted=%d failed=%d", len(emitted), len(failed))
+		}
+		if st := pipeJournalErr.Stats(); st.JournalErrors != 1 || st.SinkErrors != 0 {
+			t.Fatalf("expected JournalErrors=1 SinkErrors=0, got %+v", st)
+		}
+	})
+
+	t.Run("HandleAdapterCSRFAndTrailingJSON", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.DataDir = t.TempDir()
+		cfg.TriageMode = "http"
+		cfg.InferenceAddr = srv.URL
+		pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+		csrfRec := httptest.NewRecorder()
+		csrfReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}`))
+		csrfReq.Header.Set("Content-Type", "text/plain")
+		pipe.HandleAdapter(csrfRec, csrfReq)
+		if csrfRec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("expected 415 for text/plain Content-Type in HandleAdapter, got %d", csrfRec.Code)
+		}
+		trailRec := httptest.NewRecorder()
+		trailReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}{"adapter_path":"artifacts/b/model_adapters"}`))
+		trailReq.Header.Set("Content-Type", "application/json")
+		pipe.HandleAdapter(trailRec, trailReq)
+		if trailRec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
+		}
+	})
+
+	t.Run("TopLevelBurnTempWhitelist", func(t *testing.T) {
+		topBurnDir := t.TempDir()
+		topGenAdapter := filepath.Join(topBurnDir, ".active-adapter-123456.tmp")
+		topGenAlerts := filepath.Join(topBurnDir, ".alerts-789012.tmp")
+		topNotesAdapter := filepath.Join(topBurnDir, ".active-adapter-notes.tmp")
+		topNotesAlerts := filepath.Join(topBurnDir, ".alerts-notes.tmp")
+		for _, p := range []string{topGenAdapter, topGenAlerts, topNotesAdapter, topNotesAlerts} {
+			if err := os.WriteFile(p, []byte("tmp"), 0600); err != nil {
+				t.Fatalf("write %s: %v", p, err)
 			}
-			rr := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
-			r.Header.Set("Content-Type", "application/json")
-			pipeConc.HandleAdapter(rr, r)
-			if rr.Code != http.StatusOK {
-				t.Errorf("concurrent HandleAdapter %d failed: %d %s", idx, rr.Code, rr.Body.String())
+		}
+		if rep, err := BurnLocalStateWithFeedbackDir(topBurnDir, ""); err != nil || rep.FilesRemoved != 2 {
+			t.Fatalf("top-level temp burn unexpected: rep=%+v err=%v", rep, err)
+		}
+		for _, gone := range []string{topGenAdapter, topGenAlerts} {
+			if _, err := os.Stat(gone); !os.IsNotExist(err) {
+				t.Fatalf("generated top-level temp file %s survived burn", gone)
 			}
-		}(i)
-	}
-	wg.Wait()
+		}
+		for _, kept := range []string{topNotesAdapter, topNotesAlerts} {
+			if _, err := os.Stat(kept); err != nil {
+				t.Fatalf("unrelated top-level file %s was removed by burn: %v", kept, err)
+			}
+		}
+	})
 
-	live := pipeConc.Stats()
-	disk, exists, err := train.LoadActiveAdapter(goodDir)
-	if err != nil || !exists {
-		t.Fatalf("LoadActiveAdapter after concurrent swaps failed: exists=%v err=%v", exists, err)
-	}
-	if live.TriageModel != disk.BaseModel || live.TriageAdapter != disk.AdapterPath {
-		t.Fatalf("live vs persisted adapter diverged after concurrent swaps: live=(%q,%q) disk=(%q,%q)",
-			live.TriageModel, live.TriageAdapter, disk.BaseModel, disk.AdapterPath)
-	}
+	t.Run("CustomFeedbackBurnAndPartialCleanup", func(t *testing.T) {
+		badParent := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(badParent, []byte("file"), 0600); err != nil {
+			t.Fatalf("write blocker file: %v", err)
+		}
+		fbOnlyDir := t.TempDir()
+		fbOnlyFile := filepath.Join(fbOnlyDir, "sentinel-feedback.jsonl")
+		genTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-123456.tmp")
+		notesTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-notes.tmp")
+		invalidSlugFile := filepath.Join(fbOnlyDir, "sentinel-feedback-team notes.jsonl")
+		for _, f := range []struct {
+			p string
+			c string
+		}{
+			{fbOnlyFile, `{"prompt":"x","completion":"[BENIGN-NOISE]"}` + "\n"},
+			{genTmpFile, "partial"},
+			{notesTmpFile, "keep-notes"},
+			{invalidSlugFile, `{"user":"keep"}` + "\n"},
+		} {
+			if err := os.WriteFile(f.p, []byte(f.c), 0600); err != nil {
+				t.Fatalf("write %s: %v", f.p, err)
+			}
+		}
+		if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 2 {
+			t.Fatalf("BurnLocalStateWithFeedbackDir('', fbOnlyDir) failed: rep=%+v err=%v", rep, err)
+		}
+		if _, err := os.Stat(genTmpFile); !os.IsNotExist(err) {
+			t.Fatal("generated decimal temp file survived burn")
+		}
+		for _, preserved := range []string{invalidSlugFile, notesTmpFile} {
+			if _, err := os.Stat(preserved); err != nil {
+				t.Fatalf("non-owned file %s was removed by burn: %v", preserved, err)
+			}
+		}
+		if _, err := BurnLocalStateWithFeedbackDir("", badParent); err == nil {
+			t.Fatal("expected non-directory custom feedbackDir to return an error")
+		}
 
-	// 3. Journal failure reports JournalErrors without failing sink delivery.
-	pipeJournalErr := New(cfgFail, ruleEng, emit.NopSink{}, "file")
-	pipeJournalErr.AttachAlertJournal(feedback.NewAlertJournal(badParent))
-	pipeJournalErr.IngestEvent(model.LogEvent{
+		if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+			t.Fatalf("rewrite fbOnlyFile: %v", err)
+		}
+		partialRep, partialErr := BurnLocalStateWithFeedbackDir(badParent, fbOnlyDir)
+		if partialErr == nil || partialRep.Status != "partial" || partialRep.FilesRemoved != 1 {
+			t.Fatalf("expected partial burn cleaning custom feedbackDir despite invalid DataDir, got rep=%+v err=%v", partialRep, partialErr)
+		}
+		if _, err := os.Stat(fbOnlyFile); !os.IsNotExist(err) {
+			t.Fatal("custom feedback file survived partial burn")
+		}
+
+		// Preserve trailing spaces in custom FeedbackDir so "feedback " never burns sibling "feedback".
+		spaceBase := t.TempDir()
+		dirTrimmed := filepath.Join(spaceBase, "feedback")
+		dirSpaced := filepath.Join(spaceBase, "feedback ")
+		if err := os.MkdirAll(dirTrimmed, 0700); err != nil {
+			t.Fatalf("mkdir trimmed: %v", err)
+		}
+		if err := os.MkdirAll(dirSpaced, 0700); err != nil {
+			t.Fatalf("mkdir spaced: %v", err)
+		}
+		trimmedQueue := filepath.Join(dirTrimmed, "sentinel-feedback.jsonl")
+		spacedQueue := filepath.Join(dirSpaced, "sentinel-feedback.jsonl")
+		if err := os.WriteFile(trimmedQueue, []byte(`{"prompt":"keep","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+			t.Fatalf("write trimmed queue: %v", err)
+		}
+		if err := os.WriteFile(spacedQueue, []byte(`{"prompt":"burn","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+			t.Fatalf("write spaced queue: %v", err)
+		}
+		if rep, err := BurnLocalStateWithFeedbackDir("", dirSpaced); err != nil || rep.FilesRemoved != 1 {
+			t.Fatalf("spaced feedback burn unexpected: rep=%+v err=%v", rep, err)
+		}
+		if _, err := os.Stat(spacedQueue); !os.IsNotExist(err) {
+			t.Fatal("spaced feedbackDir queue survived burn")
+		}
+		if _, err := os.Stat(trimmedQueue); err != nil {
+			t.Fatalf("sibling feedback dir was erroneously burned: %v", err)
+		}
+	})
+
+	t.Run("DistinctPerPipelineAlertIDs", func(t *testing.T) {
+		p1 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
+		p2 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
+		fixedClock := func() int64 { return 1763997000 }
+		p1.nowUnixFn = fixedClock
+		p2.nowUnixFn = fixedClock
+		ev := model.LogEvent{ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"}
+		p1.IngestEvent(ev)
+		p2.IngestEvent(ev)
+		a1, _ := p1.FlushWindow()
+		a2, _ := p2.FlushWindow()
+		if len(a1) != 1 || len(a2) != 1 {
+			t.Fatalf("expected 1 alert from each pipeline, got len(a1)=%d len(a2)=%d", len(a1), len(a2))
+		}
+		if a1[0].AlertID == a2[0].AlertID {
+			t.Fatalf("expected distinct per-pipeline AlertIDs at identical Unix second, got %q == %q", a1[0].AlertID, a2[0].AlertID)
+		}
+	})
+}
+
+type chanAlertSink struct {
+	ch chan emit.Alert
+}
+
+func (s *chanAlertSink) Emit(a emit.Alert) error {
+	s.ch <- a
+	return nil
+}
+
+func (s *chanAlertSink) Close() error { return nil }
+
+func TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate(t *testing.T) {
+	reqStarted := make(chan struct{})
+	releaseInfer := make(chan struct{})
+	var closeOnce sync.Once
+	release := func() { closeOnce.Do(func() { close(releaseInfer) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-reqStarted:
+		default:
+			close(reqStarted)
+		}
+		select {
+		case <-releaseInfer:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/async-v1/model_adapters","completion":"[INJECTION-ATTEMPT] severity=CRITICAL mitre=TA0001 confidence=0.95 explanation=Path traversal probe confirmed."}`))
+	}))
+	t.Cleanup(func() {
+		release()
+		srv.Close()
+	})
+
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.TriageMode = "http"
+	cfg.InferenceAddr = srv.URL
+	cfg.AdapterPath = "artifacts/async-v1/model_adapters"
+
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	sink := &chanAlertSink{ch: make(chan emit.Alert, 16)}
+	pipe := New(cfg, ruleEng, sink, "file")
+	pipe.EnableAsyncTriage(8)
+	defer pipe.Close()
+
+	journal := feedback.NewAlertJournal(dataDir)
+	pipe.AttachAlertJournal(journal)
+
+	pipe.IngestEvent(model.LogEvent{
 		ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
 		Message: "GET /../../../../etc/passwd HTTP/1.1 403",
 	})
-	emitted, failed := pipeJournalErr.FlushWindow()
-	if len(failed) != 0 || len(emitted) != 1 {
-		t.Fatalf("journal failure should not fail sink delivery: emitted=%d failed=%d", len(emitted), len(failed))
+
+	flushDone := make(chan []emit.Alert, 1)
+	go func() {
+		emitted, _ := pipe.FlushWindow()
+		flushDone <- emitted
+	}()
+
+	// Deterministic alert MUST be emitted to the sink while inference is STILL blocked!
+	var firstAlert emit.Alert
+	select {
+	case firstAlert = <-sink.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deterministic alert stalled waiting for blocked Tier 2 inference")
 	}
-	if st := pipeJournalErr.Stats(); st.JournalErrors != 1 || st.SinkErrors != 0 {
-		t.Fatalf("expected JournalErrors=1 SinkErrors=0, got %+v", st)
+	select {
+	case emitted := <-flushDone:
+		if len(emitted) != 1 || emitted[0].AlertID != firstAlert.AlertID {
+			t.Fatalf("unexpected immediate FlushWindow result: %+v", emitted)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushWindow blocked waiting for Tier 2 inference")
+	}
+	if firstAlert.Tier != "tier0" || firstAlert.TriageClass != "" {
+		t.Fatalf("expected immediate deterministic tier0 alert before inference completes, got %+v", firstAlert)
 	}
 
-	// 4. Reject non-JSON Content-Type (CSRF guard) and trailing JSON tokens in HandleAdapter before locking or writing.
-	csrfRec := httptest.NewRecorder()
-	csrfReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}`))
-	csrfReq.Header.Set("Content-Type", "text/plain")
-	pipeConc.HandleAdapter(csrfRec, csrfReq)
-	if csrfRec.Code != http.StatusUnsupportedMediaType {
-		t.Fatalf("expected 415 for text/plain Content-Type in HandleAdapter, got %d", csrfRec.Code)
-	}
-	trailRec := httptest.NewRecorder()
-	trailReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}{"adapter_path":"artifacts/b/model_adapters"}`))
-	trailReq.Header.Set("Content-Type", "application/json")
-	pipeConc.HandleAdapter(trailRec, trailReq)
-	if trailRec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
+	// Ensure inference handler is genuinely in flight before releasing it.
+	select {
+	case <-reqStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async Tier 2 worker did not dispatch inference request")
 	}
 
-	// 4b. Top-level Burn removes generated decimal temp files (.active-adapter-123456.tmp, .alerts-123456.tmp)
-	// while preserving unrelated user temp files (.active-adapter-notes.tmp, .alerts-notes.tmp).
-	topBurnDir := t.TempDir()
-	topGenAdapter := filepath.Join(topBurnDir, ".active-adapter-123456.tmp")
-	topGenAlerts := filepath.Join(topBurnDir, ".alerts-789012.tmp")
-	topNotesAdapter := filepath.Join(topBurnDir, ".active-adapter-notes.tmp")
-	topNotesAlerts := filepath.Join(topBurnDir, ".alerts-notes.tmp")
-	for _, p := range []string{topGenAdapter, topGenAlerts, topNotesAdapter, topNotesAlerts} {
-		if err := os.WriteFile(p, []byte("tmp"), 0600); err != nil {
-			t.Fatalf("write %s: %v", p, err)
-		}
+	release()
+
+	// Correlated Tier 2 update MUST arrive with the exact same AlertID and TraceID.
+	var updateAlert emit.Alert
+	select {
+	case updateAlert = <-sink.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async Tier 2 enrichment update")
 	}
-	if rep, err := BurnLocalStateWithFeedbackDir(topBurnDir, ""); err != nil || rep.FilesRemoved != 2 {
-		t.Fatalf("top-level temp burn unexpected: rep=%+v err=%v", rep, err)
+	if updateAlert.AlertID != firstAlert.AlertID || updateAlert.TraceID != firstAlert.TraceID {
+		t.Fatalf("async Tier 2 update AlertID/TraceID mismatch: got (%q,%q) want (%q,%q)",
+			updateAlert.AlertID, updateAlert.TraceID, firstAlert.AlertID, firstAlert.TraceID)
 	}
-	for _, gone := range []string{topGenAdapter, topGenAlerts} {
-		if _, err := os.Stat(gone); !os.IsNotExist(err) {
-			t.Fatalf("generated top-level temp file %s survived burn", gone)
-		}
-	}
-	for _, kept := range []string{topNotesAdapter, topNotesAlerts} {
-		if _, err := os.Stat(kept); err != nil {
-			t.Fatalf("unrelated top-level file %s was removed by burn: %v", kept, err)
-		}
+	if updateAlert.Tier != "tier0+tier2" || updateAlert.TriageClass != "INJECTION-ATTEMPT" || updateAlert.Severity != "CRITICAL" {
+		t.Fatalf("unexpected async Tier 2 update alert: %+v", updateAlert)
 	}
 
-	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir, removes generated decimal temp
-	// files (.sentinel-feedback-123456.tmp), preserves unrelated files ("sentinel-feedback-team notes.jsonl"
-	// and ".sentinel-feedback-notes.tmp"), reports non-directory custom feedbackDir as an error,
-	// AND still cleans custom FeedbackDir when DataDir fails.
-	fbOnlyDir := t.TempDir()
-	fbOnlyFile := filepath.Join(fbOnlyDir, "sentinel-feedback.jsonl")
-	genTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-123456.tmp")
-	notesTmpFile := filepath.Join(fbOnlyDir, ".sentinel-feedback-notes.tmp")
-	invalidSlugFile := filepath.Join(fbOnlyDir, "sentinel-feedback-team notes.jsonl")
-	for _, f := range []struct {
-		p string
-		c string
-	}{
-		{fbOnlyFile, `{"prompt":"x","completion":"[BENIGN-NOISE]"}` + "\n"},
-		{genTmpFile, "partial"},
-		{notesTmpFile, "keep-notes"},
-		{invalidSlugFile, `{"user":"keep"}` + "\n"},
-	} {
-		if err := os.WriteFile(f.p, []byte(f.c), 0600); err != nil {
-			t.Fatalf("write %s: %v", f.p, err)
+	// Poll briefly for journal upsert completion (happens right after sink.Emit inside worker).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		jAlert, found, jErr := journal.FindByID(firstAlert.AlertID)
+		if jErr == nil && found && jAlert.Tier == "tier0+tier2" && jAlert.TriageClass == "INJECTION-ATTEMPT" {
+			break
 		}
-	}
-	if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 2 {
-		t.Fatalf("BurnLocalStateWithFeedbackDir('', fbOnlyDir) failed: rep=%+v err=%v", rep, err)
-	}
-	if _, err := os.Stat(genTmpFile); !os.IsNotExist(err) {
-		t.Fatal("generated decimal temp file survived burn")
-	}
-	for _, preserved := range []string{invalidSlugFile, notesTmpFile} {
-		if _, err := os.Stat(preserved); err != nil {
-			t.Fatalf("non-owned file %s was removed by burn: %v", preserved, err)
+		if time.Now().After(deadline) {
+			t.Fatalf("alerts.jsonl was not upserted with async Tier 2 enrichment: found=%v err=%v alert=%+v", found, jErr, jAlert)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := BurnLocalStateWithFeedbackDir("", badParent); err == nil {
-		t.Fatal("expected non-directory custom feedbackDir to return an error")
+	recent, err := journal.Recent(10)
+	if err != nil || len(recent) != 1 {
+		t.Fatalf("expected alerts.jsonl upsert to keep exactly 1 row for AlertID, got len=%d err=%v", len(recent), err)
+	}
+	if st := pipe.Stats(); !st.TriageAsync || st.TriageUpdatesEmitted != 1 || st.AlertsEmitted != 1 {
+		t.Fatalf("unexpected async stats: %+v", st)
+	}
+}
+
+func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
+	ruleEng, err := rules.NewEngine(rules.DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
 	}
 
-	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
-		t.Fatalf("rewrite fbOnlyFile: %v", err)
-	}
-	partialRep, partialErr := BurnLocalStateWithFeedbackDir(badParent, fbOnlyDir)
-	if partialErr == nil || partialRep.Status != "partial" || partialRep.FilesRemoved != 1 {
-		t.Fatalf("expected partial burn cleaning custom feedbackDir despite invalid DataDir, got rep=%+v err=%v", partialRep, partialErr)
-	}
-	if _, err := os.Stat(fbOnlyFile); !os.IsNotExist(err) {
-		t.Fatal("custom feedback file survived partial burn")
-	}
+	t.Run("BurnCancelsInFlightAndPreventsPostBurnLeak", func(t *testing.T) {
+		reqStarted := make(chan struct{})
+		releaseInfer := make(chan struct{})
+		var closeOnce sync.Once
+		release := func() { closeOnce.Do(func() { close(releaseInfer) }) }
 
-	// 6. Two fresh pipelines emitting at the exact same pinned Unix second generate distinct AlertIDs.
-	p1 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
-	p2 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
-	fixedClock := func() int64 { return 1763997000 }
-	p1.nowUnixFn = fixedClock
-	p2.nowUnixFn = fixedClock
-	ev := model.LogEvent{ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"}
-	p1.IngestEvent(ev)
-	p2.IngestEvent(ev)
-	a1, _ := p1.FlushWindow()
-	a2, _ := p2.FlushWindow()
-	if len(a1) != 1 || len(a2) != 1 {
-		t.Fatalf("expected 1 alert from each pipeline, got len(a1)=%d len(a2)=%d", len(a1), len(a2))
-	}
-	if a1[0].AlertID == a2[0].AlertID {
-		t.Fatalf("expected distinct per-pipeline AlertIDs at identical Unix second, got %q == %q", a1[0].AlertID, a2[0].AlertID)
-	}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-reqStarted:
+			default:
+				close(reqStarted)
+			}
+			select {
+			case <-releaseInfer:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=stale"}`))
+		}))
+		t.Cleanup(func() {
+			release()
+			srv.Close()
+		})
+
+		dataDir := t.TempDir()
+		cfg := config.DefaultConfig()
+		cfg.DataDir = dataDir
+		cfg.TriageMode = "http"
+		cfg.InferenceAddr = srv.URL
+		sink := &chanAlertSink{ch: make(chan emit.Alert, 8)}
+		pipe := New(cfg, ruleEng, sink, "file")
+		pipe.EnableAsyncTriage(4)
+		defer pipe.Close()
+		pipe.AttachAlertJournal(feedback.NewAlertJournal(dataDir))
+
+		pipe.IngestEvent(model.LogEvent{
+			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
+			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+		})
+		_, _ = pipe.FlushWindow()
+		<-sink.ch // deterministic alert
+		select {
+		case <-reqStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("async worker did not start inference")
+		}
+
+		// Burn MUST complete promptly while server is blocked and prevent any pre-burn Tier 2 update.
+		burnDone := make(chan error, 1)
+		go func() {
+			_, burnErr := pipe.Burn()
+			burnDone <- burnErr
+		}()
+		select {
+		case burnErr := <-burnDone:
+			if burnErr != nil {
+				t.Fatalf("Burn failed: %v", burnErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Burn stalled on blocked async Tier 2 inference")
+		}
+		release()
+		time.Sleep(50 * time.Millisecond)
+
+		select {
+		case leaked := <-sink.ch:
+			t.Fatalf("pre-burn async Tier 2 alert leaked after Burn(): %+v", leaked)
+		default:
+		}
+		if _, statErr := os.Stat(filepath.Join(dataDir, "alerts.jsonl")); !os.IsNotExist(statErr) {
+			t.Fatal("pre-burn async Tier 2 worker recreated alerts.jsonl after Burn()")
+		}
+	})
+
+	t.Run("HotSwapDiscardsRetiredAdapterVerdict", func(t *testing.T) {
+		reqAStarted := make(chan struct{})
+		releaseA := make(chan struct{})
+		var closeAOnce sync.Once
+		relA := func() { closeAOnce.Do(func() { close(releaseA) }) }
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				AdapterPath string `json:"adapterPath"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.AdapterPath == "artifacts/adapter-A/model_adapters" {
+				select {
+				case <-reqAStarted:
+				default:
+					close(reqAStarted)
+				}
+				select {
+				case <-releaseA:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"` + body.AdapterPath + `","completion":"[INJECTION-ATTEMPT] severity=HIGH mitre=TA0001 explanation=ok"}`))
+		}))
+		t.Cleanup(func() {
+			relA()
+			srv.Close()
+		})
+
+		dataDir := t.TempDir()
+		cfg := config.DefaultConfig()
+		cfg.DataDir = dataDir
+		cfg.TriageMode = "http"
+		cfg.InferenceAddr = srv.URL
+		cfg.AdapterPath = "artifacts/adapter-A/model_adapters"
+		sink := &chanAlertSink{ch: make(chan emit.Alert, 16)}
+		pipe := New(cfg, ruleEng, sink, "file")
+		pipe.EnableAsyncTriage(8)
+		defer pipe.Close()
+
+		pipe.IngestEvent(model.LogEvent{
+			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
+			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+		})
+		_, _ = pipe.FlushWindow()
+		<-sink.ch // deterministic alert #1
+		select {
+		case <-reqAStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("adapter-A request did not start")
+		}
+
+		// Hot-swap to adapter-B while adapter-A inference is in flight.
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
+		req.Header.Set("Content-Type", "application/json")
+		pipe.HandleAdapter(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HandleAdapter returned %d: %s", rec.Code, rec.Body.String())
+		}
+		relA()
+
+		// Flush alert #2 under adapter-B and verify ONLY adapter-B update is ever emitted.
+		pipe.IngestEvent(model.LogEvent{
+			ID: 2, Timestamp: 1763997001, Service: "nginx", Level: "WARN",
+			Message: "GET /../../../../etc/shadow HTTP/1.1 403",
+		})
+		emitted2, _ := pipe.FlushWindow()
+		if len(emitted2) != 1 {
+			t.Fatalf("expected 1 deterministic alert #2, got %d", len(emitted2))
+		}
+		var gotB bool
+		deadline := time.After(2 * time.Second)
+		for !gotB {
+			select {
+			case a := <-sink.ch:
+				if a.TriageAdapter == "artifacts/adapter-A/model_adapters" {
+					t.Fatalf("retired adapter-A verdict was emitted after hot-swap: %+v", a)
+				}
+				if a.AlertID == emitted2[0].AlertID && a.TriageAdapter == "artifacts/adapter-B/model_adapters" {
+					gotB = true
+				}
+			case <-deadline:
+				t.Fatal("timed out waiting for adapter-B async enrichment")
+			}
+		}
+	})
+
+	t.Run("QueueBackpressureFailsOpen", func(t *testing.T) {
+		reqStarted := make(chan struct{})
+		release := make(chan struct{})
+		var closeOnce sync.Once
+		rel := func() { closeOnce.Do(func() { close(release) }) }
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-reqStarted:
+			default:
+				close(reqStarted)
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
+		}))
+		t.Cleanup(func() {
+			rel()
+			srv.Close()
+		})
+
+		cfg := config.DefaultConfig()
+		cfg.TriageMode = "http"
+		cfg.InferenceAddr = srv.URL
+		pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+		pipe.EnableAsyncTriage(1)
+		defer pipe.Close()
+
+		// Alert 1 occupies the worker; alerts 2..4 overflow the 1-slot queue cleanly without blocking.
+		pipe.IngestEvent(model.LogEvent{ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"})
+		_, _ = pipe.FlushWindow()
+		select {
+		case <-reqStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not start first alert")
+		}
+		for i := 2; i <= 4; i++ {
+			pipe.IngestEvent(model.LogEvent{ID: uint64(i), Timestamp: 1763997000 + int64(i), Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"})
+			em, _ := pipe.FlushWindow()
+			if len(em) != 1 {
+				t.Fatalf("flush %d failed to emit deterministic alert under backpressure", i)
+			}
+		}
+		if dropped := pipe.Stats().TriageQueueDropped; dropped < 2 {
+			t.Fatalf("expected >= 2 dropped async triage tasks under queue cap 1, got %d", dropped)
+		}
+	})
 }

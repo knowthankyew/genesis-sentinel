@@ -92,7 +92,22 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 		return fmt.Errorf("read alert journal %q: %w", j.path, err)
 	}
 
-	combined := append(existing, incoming...)
+	combined := make([]emit.Alert, len(existing), len(existing)+len(incoming))
+	copy(combined, existing)
+	idxByID := make(map[string]int, len(combined))
+	for i, a := range combined {
+		idxByID[a.AlertID] = i
+	}
+	for _, a := range incoming {
+		if idx, exists := idxByID[a.AlertID]; exists {
+			// Upsert in-place so async Tier 2 enrichment updates replace the
+			// initial deterministic record without duplicating AlertID rows.
+			combined[idx] = a
+		} else {
+			idxByID[a.AlertID] = len(combined)
+			combined = append(combined, a)
+		}
+	}
 	if len(combined) > j.maxRecords {
 		combined = combined[len(combined)-j.maxRecords:]
 	}
@@ -100,9 +115,11 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 }
 
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
+	a.Service, _ = RedactText(a.Service)
 	a.TraceID, _ = RedactText(a.TraceID)
 	a.SourceService, _ = RedactText(a.SourceService)
 	a.SourceLevel, _ = RedactText(a.SourceLevel)
+	a.TemplateID, _ = RedactText(a.TemplateID)
 	a.Message, _ = RedactText(a.Message)
 	a.Template, _ = RedactText(a.Template)
 	a.SanitizedSample, _ = RedactText(a.SanitizedSample)

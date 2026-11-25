@@ -206,6 +206,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
+	pipe.EnableAsyncTriage(0)
+	defer pipe.Close()
 	pipe.AttachSegReader(segReader)
 	pipe.AttachQueryPoller(queryPoller)
 	if cfg.DataDir != "" {
@@ -237,7 +239,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	logger.Printf("[Tier1]  Laplace-LK Mode   : %s | Threshold: %.2f nats | Baseline: %d/%d (%s)",
 		cfg.SurprisalMode, cfg.SurprisalThreshold, loadedBaseline, cfg.BaselineWindowSize, baselinePath)
 	if cfg.TriageMode == "http" {
-		logger.Printf("[Tier2]  LoRA Triage Mode  : http (%s) | Model: %s | Adapter: %q",
+		logger.Printf("[Tier2]  LoRA Triage Mode  : http-async (%s) | Model: %s | Adapter: %q",
 			cfg.InferenceAddr, cfg.BaseModel, cfg.AdapterPath)
 	} else {
 		logger.Printf("[Tier2]  LoRA Triage Mode  : off (enable via --triage-mode http; default model %s)", cfg.BaseModel)
@@ -317,6 +319,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 					shutdownErr = errors.Join(shutdownErr, closeErr)
 				}
 			}
+			pipe.Close()
 			return errors.Join(finalSaveErr, shutdownErr)
 
 		case <-pollTicker.C:

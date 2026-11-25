@@ -194,6 +194,11 @@ func TestClientTriageWindowCircuitBreakerAndAdapterHotSwap(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":"Healthy","device":"cpu","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","baseModelLoaded":true,"backend":"transformers"}`))
 			return
 		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/inference/generate" {
+			t.Errorf("unexpected inference request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -449,5 +454,89 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 	redShort := redactErrSnippet(`{"detail":"echoed short key ab"}`, "ab")
 	if strings.Contains(redShort, "ab") {
 		t.Fatalf("redactErrSnippet leaked short (<4 byte) API key: %q", redShort)
+	}
+	redTok := redactErrSnippet(`{"token":"opaqueTok9999"}`)
+	if strings.Contains(redTok, "opaqueTok9999") {
+		t.Fatalf("redactErrSnippet leaked JSON token field: %q", redTok)
+	}
+}
+
+func TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Client) error
+	}{
+		{
+			name:   "HotSwapAdapter",
+			mutate: func(c *Client) error { return c.SetAdapterPath("artifacts/job-B/model_adapters") },
+		},
+		{
+			name: "ResetAdapter",
+			mutate: func(c *Client) error {
+				c.ResetAdapter()
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reqStarted := make(chan struct{})
+			release := make(chan struct{})
+			var closeOnce sync.Once
+			rel := func() { closeOnce.Do(func() { close(release) }) }
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/v1/inference/generate" {
+					t.Errorf("unexpected inference request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				close(reqStarted)
+				<-release
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job-A/model_adapters","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
+			}))
+			t.Cleanup(func() {
+				rel()
+				srv.Close()
+			})
+
+			client, err := NewClient(ClientOptions{
+				BaseURL:     srv.URL,
+				BaseModel:   model.ModelSmolLM2135MInstruct,
+				AdapterPath: "artifacts/job-A/model_adapters",
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+
+			errCh := make(chan error, 1)
+			go func() {
+				_, _, callErr := client.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "test"})
+				errCh <- callErr
+			}()
+			select {
+			case <-reqStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("inference call did not reach mock server")
+			}
+
+			if err := tc.mutate(client); err != nil {
+				t.Fatalf("mutate runtime: %v", err)
+			}
+			rel()
+
+			select {
+			case callErr := <-errCh:
+				if !errors.Is(callErr, ErrStaleRuntime) {
+					t.Fatalf("expected ErrStaleRuntime after %s, got %v", tc.name, callErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for TriageWindow to return")
+			}
+			st := client.Stats()
+			if st.EvaluatedTotal != 0 || st.CircuitOpen {
+				t.Fatalf("stale runtime verdict mutated evaluated count or breaker: %+v", st)
+			}
+		})
 	}
 }
