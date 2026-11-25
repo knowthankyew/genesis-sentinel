@@ -8,6 +8,9 @@
 services:
   genesis:
     image: ghcr.io/knowthankyew/genesis:latest
+    # Match distroless static-debian12 nonroot UID/GID (65532:65532) across both containers
+    # so Sentinel can read initial and rotated Genesis .seg segments on the shared volume.
+    user: "65532:65532"
     command:
       - server
       - -tcp=0.0.0.0:9000
@@ -31,6 +34,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    user: "65532:65532"
     command:
       - watch
       - --http=0.0.0.0:8090

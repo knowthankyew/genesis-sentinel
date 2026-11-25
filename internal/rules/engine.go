@@ -747,9 +747,18 @@ func mergeUniqueSignals(groups ...[]string) []string {
 	return out
 }
 
+const (
+	// maxPrefilterLiteralBytes and maxPrefilterLiterals bound work performed by the ASCII
+	// literal prefilter so pathological long literals (e.g. 2 KiB "AAA...AB") fall back
+	// directly to Go's guaranteed linear-time RE2 engine.
+	maxPrefilterLiteralBytes = 64
+	maxPrefilterLiterals     = 16
+)
+
 // extractRequiredASCIILiterals inspects a Go RE2 syntax tree and returns a sound set of
-// lowercase ASCII substrings such that any ASCII match of pattern MUST contain at least one
-// element (case-insensitively). Returns nil whenever any branch lacks a guaranteed ASCII literal.
+// bounded lowercase ASCII substrings such that any ASCII match of pattern MUST contain at
+// least one element (case-insensitively). Returns nil whenever any branch lacks a guaranteed
+// short ASCII literal or exceeds prefilter bounds.
 func extractRequiredASCIILiterals(pattern string) []string {
 	ast, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -757,12 +766,15 @@ func extractRequiredASCIILiterals(pattern string) []string {
 	}
 	ast = ast.Simplify()
 	lits, ok := requiredBranchLiterals(ast)
-	if !ok || len(lits) == 0 {
+	if !ok || len(lits) == 0 || len(lits) > maxPrefilterLiterals {
 		return nil
 	}
 	seen := make(map[string]struct{}, len(lits))
 	out := make([]string, 0, len(lits))
 	for _, l := range lits {
+		if len(l) == 0 || len(l) > maxPrefilterLiteralBytes {
+			return nil
+		}
 		if _, dup := seen[l]; !dup {
 			seen[l] = struct{}{}
 			out = append(out, l)

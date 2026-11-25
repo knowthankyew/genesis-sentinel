@@ -238,6 +238,10 @@ func TestAdversarialPromptInjectionAndDelimiterEscapeCampaign(t *testing.T) {
 		if strings.Count(p, "BEGIN_UNTRUSTED_LOG_TELEMETRY") != 1 || strings.Count(p, "END_UNTRUSTED_LOG_TELEMETRY") != 1 {
 			t.Errorf("prompt %d broke strict single-fence invariant: %q", idx, p)
 		}
+		upperP := strings.ToUpper(p)
+		if strings.Count(upperP, "BEGIN_UNTRUSTED_LOG_TELEMETRY") != 1 || strings.Count(upperP, "END_UNTRUSTED_LOG_TELEMETRY") != 1 {
+			t.Errorf("prompt %d leaked mixed-case spoofed fence marker: %q", idx, p)
+		}
 		if !strings.Contains(p, "injection_flag=true") {
 			t.Errorf("prompt %d missing injection_flag=true: %q", idx, p)
 		}
@@ -431,9 +435,19 @@ func TestAdversarialCorruptedSegTailAndBurnRewindRecovery(t *testing.T) {
 	binary.BigEndian.PutUint32(badHdr[4:8], 0xDEADBEEF)
 	buf.Write(badHdr[:])
 	buf.WriteString("corrupted-tail-junk-bytes-not-a-valid-frame!!!")
-	// Append a valid frame after corruption that SegReader must resync and recover.
+	// Append a valid frame after oversized-length corruption that SegReader must resync and recover.
 	if err := ingest.WriteSegmentFrame(&buf, []byte(fmt.Sprintf(`{"timestamp":%d,"service":"nginx","level":"WARN","message":"GET /static/../../../../etc/passwd HTTP/1.1 403"}`, baseTS+1))); err != nil {
 		t.Fatalf("encode frame 2: %v", err)
+	}
+	// Separately exercise CRC32 checksum mismatch recovery (valid length, bad CRC) followed by a distinct valid frame.
+	badCRCPayload := []byte(`{"timestamp":1764072002,"service":"api","level":"INFO","message":"corrupt-crc-payload"}`)
+	var badCRCHdr [8]byte
+	binary.BigEndian.PutUint32(badCRCHdr[0:4], uint32(len(badCRCPayload)))
+	binary.BigEndian.PutUint32(badCRCHdr[4:8], 0x12345678) // deliberately wrong CRC32
+	buf.Write(badCRCHdr[:])
+	buf.Write(badCRCPayload)
+	if err := ingest.WriteSegmentFrame(&buf, []byte(fmt.Sprintf(`{"timestamp":%d,"service":"coredns","level":"WARN","message":"TXT query Q7xK9mP2vL4nR8tW1zB5yC3fH6jM0qS9uE4gA2kN7pV8xZ1cT5wY3rD6bF0hJ4mL.tunnel.invalid NXDOMAIN"}`, baseTS+3))); err != nil {
+		t.Fatalf("encode frame 3: %v", err)
 	}
 	if err := os.WriteFile(seg1Path, buf.Bytes(), 0600); err != nil {
 		t.Fatalf("write seg1: %v", err)
@@ -448,7 +462,7 @@ func TestAdversarialCorruptedSegTailAndBurnRewindRecovery(t *testing.T) {
 	pipe := New(config.DefaultConfig(), ruleEng, sink, "adversarial-corrupt")
 	pipe.AttachSegReader(reader)
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 6; i++ {
 		batch, readErr := reader.ReadBatch(100)
 		if readErr != nil {
 			t.Fatalf("ReadBatch error: %v", readErr)
@@ -467,12 +481,12 @@ func TestAdversarialCorruptedSegTailAndBurnRewindRecovery(t *testing.T) {
 			seen1[rid] = true
 		}
 	}
-	if !seen1["SENT-002"] || !seen1["SENT-003"] {
-		t.Fatalf("expected both pre- and post-corruption alerts (SENT-002, SENT-003), got %v", seen1)
+	if !seen1["SENT-002"] || !seen1["SENT-003"] || !seen1["SENT-005"] {
+		t.Fatalf("expected pre-, post-length-corruption, and post-CRC-corruption alerts (SENT-002, SENT-003, SENT-005), got %v", seen1)
 	}
 	st1 := pipe.Stats()
-	if st1.CorruptedFrames == 0 {
-		t.Fatalf("expected CorruptedFrames > 0 after corrupt length header, got 0")
+	if st1.CorruptedFrames < 2 {
+		t.Fatalf("expected CorruptedFrames >= 2 (length + CRC corruption), got %d", st1.CorruptedFrames)
 	}
 
 	// Simulate `genesis burn` deleting and recreating 00000001.seg with fresh shorter content.
@@ -528,7 +542,7 @@ func TestAdversarialSelfAlertLoopImmunityAndBaselinePoisoningResistance(t *testi
 		sink := &threadSafeCaptureSink{}
 		pipe := New(cfg, ruleEng, sink, "adversarial-loop")
 
-		variants := []string{svcName, strings.ToUpper(svcName), "  " + svcName + "  "}
+		variants := []string{svcName, strings.ToUpper(svcName), "  " + svcName + "  ", "sentinel", "SENTINEL"}
 		for i := 0; i < 900; i++ {
 			pipe.IngestEvent(model.LogEvent{
 				ID:        uint64(i + 1),
@@ -650,9 +664,10 @@ func TestAdversarialPIIAndSecretExfiltrationEndToEnd(t *testing.T) {
 	journal := feedback.NewAlertJournal(dataDir)
 	pipe.AttachAlertJournal(journal)
 
-	// Build hostile logs that each trigger a deterministic rule (SQLi / traversal / RCE)
-	// while carrying a distinct high-risk secret or PII payload.
-	boundaryPad := strings.Repeat("a", 470)
+	// Place a URL credential directly straddling MaxPromptByte (512): "GET /api?id=1' UNION SELECT 5-- " (32 bytes)
+	// + 454 'a's + " postgres://edgeuser:" (21 bytes) = 507 bytes, putting "edgePass" across bytes 507..515
+	// so truncation-before-redaction would leak the pre-cutoff password fragment "edgeP" / "edgeuser".
+	boundaryPad := strings.Repeat("a", 454)
 	secretCases := []struct {
 		name      string
 		message   string
@@ -706,7 +721,7 @@ func TestAdversarialPIIAndSecretExfiltrationEndToEnd(t *testing.T) {
 		{
 			name:      "truncation_boundary_url_credential",
 			message:   "GET /api?id=1' UNION SELECT 5-- " + boundaryPad + " postgres://edgeuser:edgePassSecret44@127.0.0.1:5432/app",
-			forbidden: []string{"edgeuser", "edgePassSecret44"},
+			forbidden: []string{"edgeuser", "edgePass", "edgePassSecret44"},
 		},
 	}
 
@@ -788,20 +803,34 @@ func TestAdversarialPIIAndSecretExfiltrationEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Verify tampered export containing unredacted PII fails closed on pre-upload validation.
-	tamperedSSN := filepath.Join(t.TempDir(), "tampered-ssn.jsonl")
-	if err := os.WriteFile(tamperedSSN, []byte(`{"prompt":"alert for user ssn 123-45-6789","completion":"[NEEDS-REVIEW] severity=MEDIUM mitre=NONE explanation=review"}`+"\n"), 0600); err != nil {
-		t.Fatalf("write tampered ssn: %v", err)
+	// Verify tampered copies of a previously validated export record fail closed specifically
+	// due to PII/secret detection (not generic JSON or schema parse errors).
+	firstLine := strings.SplitN(strings.TrimSpace(string(exportRaw)), "\n", 2)[0]
+	var validRow map[string]any
+	if err := json.Unmarshal([]byte(firstLine), &validRow); err != nil {
+		t.Fatalf("unmarshal validated export row: %v", err)
 	}
-	if _, err := feedback.ValidateJSONLFile(tamperedSSN, true); err == nil {
-		t.Fatal("expected ValidateJSONLFile to reject tampered unredacted SSN")
-	}
+	basePrompt, _ := validRow["prompt"].(string)
 
-	tamperedJWT := filepath.Join(t.TempDir(), "tampered-jwt.jsonl")
-	if err := os.WriteFile(tamperedJWT, []byte(`{"prompt":"token eyJhbGciOiJIUzI1NiJ9.e30.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c","completion":"[NEEDS-REVIEW] severity=MEDIUM mitre=NONE explanation=review"}`+"\n"), 0600); err != nil {
-		t.Fatalf("write tampered jwt: %v", err)
+	tamperAndExpect := func(suffix, wantErrSubstr string) {
+		t.Helper()
+		rowCopy := map[string]any{
+			"prompt":     basePrompt + " " + suffix,
+			"completion": validRow["completion"],
+		}
+		rawRow, err := json.Marshal(rowCopy)
+		if err != nil {
+			t.Fatalf("marshal tampered row: %v", err)
+		}
+		tamperedPath := filepath.Join(t.TempDir(), "tampered.jsonl")
+		if err := os.WriteFile(tamperedPath, append(rawRow, '\n'), 0600); err != nil {
+			t.Fatalf("write tampered file: %v", err)
+		}
+		_, valErr := feedback.ValidateJSONLFile(tamperedPath, true)
+		if valErr == nil || !strings.Contains(valErr.Error(), wantErrSubstr) {
+			t.Fatalf("expected ValidateJSONLFile error containing %q, got %v", wantErrSubstr, valErr)
+		}
 	}
-	if _, err := feedback.ValidateJSONLFile(tamperedJWT, true); err == nil {
-		t.Fatal("expected ValidateJSONLFile to reject tampered unredacted JWT")
-	}
+	tamperAndExpect("ssn=123-45-6789", "Social Security Number (SSN)")
+	tamperAndExpect("jwt=eyJhbGciOiJIUzI1NiJ9.e30.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", "JWT Bearer Token")
 }

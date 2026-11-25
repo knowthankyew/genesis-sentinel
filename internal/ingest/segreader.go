@@ -329,7 +329,19 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 		return nil, false, false, fmt.Errorf("seek segment %q: %w", segPath, err)
 	}
 
-	br := bufio.NewReaderSize(f, 64*1024)
+	// Size read-ahead buffer to match the requested batch budget so small single-frame polls
+	// do not discard 64 KiB of read-ahead while bulk replay keeps full buffered throughput.
+	bufSize := 64 * 1024
+	if budget.eventsRemaining <= 4 || budget.bytesRemaining <= 4096 {
+		bufSize = 4096
+	}
+	if remBytes := fileSize - r.cursor.Offset; remBytes > 0 && remBytes < int64(bufSize) {
+		bufSize = int(remBytes)
+		if bufSize < 64 {
+			bufSize = 64
+		}
+	}
+	br := bufio.NewReaderSize(f, bufSize)
 	payloadScratch := make([]byte, 4096)
 
 	var (

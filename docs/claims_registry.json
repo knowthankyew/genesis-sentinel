@@ -348,7 +348,7 @@
       "json_path": "memory_profile.heap_alloc_peak_mb",
       "format_rule": "{value:.2f} MB",
       "used_in": ["README.md"],
-      "description": "Measured Go heap peak allocation during benchmark"
+      "description": "Largest Go heap allocation observed at benchmark checkpoints"
     },
     "bench_mem_rss_peak_mb": {
       "source_artifact": "docs/benchmarks/empirical_benchmarks.json",

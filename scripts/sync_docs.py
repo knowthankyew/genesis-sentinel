@@ -155,6 +155,9 @@ def resolve_claim_value(claim_id: str, claim_cfg: dict, repo_root: Path = REPO_R
     raise ValueError(f"Claim '{claim_id}' has neither 'go_const' nor 'json_path'")
 
 
+MAX_SAFE_INT64 = (1 << 63) - 1
+
+
 def _reject_nonfinite_json_constant(const: str) -> None:
     raise ValueError(f"Non-standard non-finite JSON constant not permitted: {const!r}")
 
@@ -163,12 +166,28 @@ def _loads_strict_json(raw: str):
     return json.loads(raw, parse_constant=_reject_nonfinite_json_constant)
 
 
+def _contains_personal_host_path(obj) -> bool:
+    """Recursively check decoded JSON strings for personal host prefixes (catching JSON-escaped slashes)."""
+    if isinstance(obj, str):
+        return "/Users/" in obj or "/home/" in obj
+    if isinstance(obj, dict):
+        return any(_contains_personal_host_path(k) or _contains_personal_host_path(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_contains_personal_host_path(v) for v in obj)
+    return False
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
 def _is_finite_num(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(float(v))
+    except (OverflowError, ValueError, TypeError):
+        return False
 
 
 def _req_dict(parent: dict, key: str, errors: list[str], prefix: str) -> dict:
@@ -179,13 +198,23 @@ def _req_dict(parent: dict, key: str, errors: list[str], prefix: str) -> dict:
     return val
 
 
-def _req_int(section: dict, key: str, errors: list[str], prefix: str, min_val: int | None = None) -> int | None:
+def _req_int(
+    section: dict,
+    key: str,
+    errors: list[str],
+    prefix: str,
+    min_val: int | None = None,
+    max_val: int = MAX_SAFE_INT64,
+) -> int | None:
     val = section.get(key)
     if not _is_int(val):
         errors.append(f"{prefix}.{key} must be an integer, got {val!r}")
         return None
     if min_val is not None and val < min_val:
         errors.append(f"{prefix}.{key} must be >= {min_val}, got {val}")
+        return None
+    if val > max_val:
+        errors.append(f"{prefix}.{key} exceeds maximum safe int64 bound ({max_val}), got {val}")
         return None
     return val
 
@@ -198,17 +227,45 @@ def _req_num(section: dict, key: str, errors: list[str], prefix: str) -> float |
     return float(val)
 
 
+def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], list[str]]:
+    """
+    Strip HTML comments and fenced code blocks, then return (published_table_rows, duplicate_labels)
+    so hidden comments or stale duplicate metric rows cannot satisfy parity verification.
+    """
+    cleaned = re.sub(r"<!--.*?-->", "", md_text, flags=re.DOTALL)
+    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL)
+    rows: set[str] = set()
+    seen_labels: set[str] = set()
+    dup_labels: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        rows.add(line)
+        parts = [p.strip() for p in line.split("|")[1:-1]]
+        if len(parts) >= 2 and parts[0].startswith("**") and parts[0].endswith("**"):
+            lbl = parts[0]
+            if lbl in seen_labels:
+                dup_labels.append(lbl)
+            else:
+                seen_labels.add(lbl)
+    return rows, dup_labels
+
+
 def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = REPO_ROOT) -> tuple[bool, list[str]]:
     """
     Independently verify mathematical consistency of docs/benchmarks/empirical_benchmarks.json,
     strict schema & finite-number bounds, status gate derivations from recomputed metrics,
-    and exact row-level parity against the committed Markdown benchmark report.
+    and exact published-table row parity against the committed Markdown benchmark report.
     """
     errors: list[str] = []
     if not benchmark_json_path.is_file():
         return False, [f"Missing empirical benchmark JSON: {benchmark_json_path}"]
 
-    raw_json = benchmark_json_path.read_text(encoding="utf-8")
+    try:
+        raw_json = benchmark_json_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, [f"Failed to read {benchmark_json_path}: {exc}"]
     if "/Users/" in raw_json or "/home/" in raw_json:
         errors.append("Empirical benchmark JSON contains leaked personal host path")
 
@@ -219,6 +276,8 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
 
     if not isinstance(data, dict):
         return False, [f"Empirical benchmark JSON root must be an object, got {type(data).__name__}"]
+    if _contains_personal_host_path(data):
+        errors.append("Empirical benchmark JSON contains leaked personal host path in decoded strings")
 
     meta = _req_dict(data, "metadata", errors, "benchmark")
     gates = _req_dict(data, "acceptance_gates", errors, "benchmark")
@@ -258,6 +317,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     stored_collapse = _req_num(t0, "collapse_ratio", errors, "tier0_replay")
 
     calc_tps = None
+    calc_collapse = None
     if lines_written is not None and lines_read is not None and lines_dropped is not None and dur_sec is not None and stored_tps is not None:
         if dur_sec <= 0:
             errors.append("tier0_replay.duration_seconds must be positive")
@@ -267,13 +327,13 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                 errors.append(f"tier0_replay lines_dropped mismatch: stored {lines_dropped}, expected {exp_dropped}")
 
             calc_tps = round(lines_read / dur_sec, 2)
-            if abs(calc_tps - stored_tps) > 0.05:
+            # Require stored and recomputed throughput to match at the published 2-decimal precision.
+            if f"{stored_tps:.2f}" != f"{calc_tps:.2f}":
                 errors.append(
-                    f"Tier 0 throughput recomputation mismatch: stored {stored_tps}, calculated {calc_tps} "
+                    f"Tier 0 throughput recomputation mismatch: stored {stored_tps:.2f}, calculated {calc_tps:.2f} "
                     f"({lines_read} / {dur_sec})"
                 )
             if tps_target is not None:
-                # Derive gate status strictly from the recomputed throughput rather than stored value.
                 exp_tps_status = "PASSED" if calc_tps >= tps_target else "MISSED TARGET"
                 if t0.get("throughput_gate_status") != exp_tps_status:
                     errors.append(
@@ -283,9 +343,9 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
 
         if tmpls is not None and stored_collapse is not None:
             calc_collapse = round(lines_read / tmpls, 2)
-            if abs(calc_collapse - stored_collapse) > 0.05:
+            if f"{stored_collapse:.2f}" != f"{calc_collapse:.2f}":
                 errors.append(
-                    f"Tier 0 collapse_ratio recomputation mismatch: stored {stored_collapse}, calculated {calc_collapse}"
+                    f"Tier 0 collapse_ratio recomputation mismatch: stored {stored_collapse:.2f}, calculated {calc_collapse:.2f}"
                 )
 
         if drop_target is not None and isinstance(digest_matched, bool):
@@ -340,6 +400,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     stored_rec = _req_num(det, "recall", errors, "detection_accuracy")
     stored_f1 = _req_num(det, "f1_score", errors, "detection_accuracy")
 
+    calc_prec = calc_rec = calc_f1 = None
     if None not in (tot_win, pos_win, neg_win, tp, fp, fn, tn, t0_det, t1_det, stored_prec, stored_rec, stored_f1):
         if tot_win != pos_win + neg_win or tot_win != tp + fp + fn + tn:
             errors.append(
@@ -366,7 +427,9 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if det.get("f1_gate_status") != exp_f1_status:
                 errors.append(f"detection_accuracy f1_gate_status mismatch: expected {exp_f1_status!r}")
 
-    # 5. Tier 2 triage latency & injection-safety checks (when enabled)
+    # 5. Tier 2 triage latency & defensive injection-safety checks (when enabled)
+    # Note: injection_overrides_actual counts defensive fail-closed overrides where Sentinel
+    # forced a coerced BENIGN-NOISE model output back to NEEDS-REVIEW (HIGH).
     t2_enabled = t2.get("enabled")
     if not isinstance(t2_enabled, bool):
         errors.append(f"tier2_triage.enabled must be a boolean, got {t2_enabled!r}")
@@ -410,6 +473,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     peak_mb = _req_num(mem, "heap_alloc_peak_mb", errors, "memory_profile")
     rss_kb = _req_int(mem, "rss_peak_kb", errors, "memory_profile", min_val=1)
     rss_mb = _req_num(mem, "rss_peak_mb", errors, "memory_profile")
+    calc_rss_mb = None
     if plateau_mb is not None and peak_mb is not None:
         if not (0 < plateau_mb <= peak_mb):
             errors.append(f"Memory heap invariant violated: plateau={plateau_mb}MB, peak={peak_mb}MB")
@@ -418,45 +482,68 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if mem.get("heap_gate_status") != exp_heap_status:
                 errors.append(f"memory_profile heap_gate_status mismatch: expected {exp_heap_status!r}")
     if rss_kb is not None and rss_mb is not None:
-        if abs(round(rss_kb / 1024.0, 2) - rss_mb) > 0.05:
-            errors.append(f"rss_peak_mb mismatch: stored {rss_mb}, calculated {round(rss_kb / 1024.0, 2)}")
+        calc_rss_mb = round(rss_kb / 1024.0, 2)
+        if f"{rss_mb:.2f}" != f"{calc_rss_mb:.2f}":
+            errors.append(f"rss_peak_mb mismatch: stored {rss_mb:.2f}, calculated {calc_rss_mb:.2f}")
 
     # 7. Adversarial inline checks
     adv_target = _req_num(gates, "adversarial_pass_target_pct", errors, "acceptance_gates")
     adv_total = _req_int(adv, "total_checks", errors, "adversarial_checks", min_val=1)
     adv_passed = _req_int(adv, "passed_checks", errors, "adversarial_checks", min_val=0)
     adv_pct = _req_num(adv, "pass_rate_pct", errors, "adversarial_checks")
+    calc_adv_pct = None
     if adv_total is not None and adv_passed is not None and adv_pct is not None:
         if adv_passed > adv_total:
             errors.append(f"adversarial_checks passed_checks ({adv_passed}) > total_checks ({adv_total})")
         else:
             calc_adv_pct = round(adv_passed * 100.0 / adv_total, 2)
-            if abs(calc_adv_pct - adv_pct) > 0.02:
-                errors.append(f"adversarial_checks pass_rate_pct mismatch: stored {adv_pct}, calculated {calc_adv_pct}")
+            if f"{adv_pct:.2f}" != f"{calc_adv_pct:.2f}":
+                errors.append(f"adversarial_checks pass_rate_pct mismatch: stored {adv_pct:.2f}, calculated {calc_adv_pct:.2f}")
             if adv_target is not None:
                 exp_adv_status = "PASSED" if calc_adv_pct >= adv_target else "FAILED"
                 if adv.get("gate_status") != exp_adv_status:
                     errors.append(f"adversarial_checks gate_status mismatch: expected {exp_adv_status!r}")
 
-    # 8. Row-level labeled parity cross-check against referenced Markdown benchmark report
+    # 8. Published-table row parity cross-check against repo-confined Markdown benchmark report
     report_rel = meta.get("report_markdown", "")
-    report_path = repo_root / report_rel if isinstance(report_rel, str) and report_rel else None
-    if not report_path or not report_path.is_file():
-        errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
-    elif not errors:
-        md_text = report_path.read_text(encoding="utf-8")
+    report_path: Path | None = None
+    if not isinstance(report_rel, str) or not report_rel.strip():
+        errors.append(f"Referenced markdown benchmark report path is missing or invalid: {report_rel!r}")
+    elif Path(report_rel).is_absolute():
+        errors.append(f"Referenced markdown benchmark report must be repository-relative, got absolute path: {report_rel!r}")
+    else:
+        cand = (repo_root / report_rel).resolve()
+        try:
+            cand.relative_to(repo_root.resolve())
+        except ValueError:
+            errors.append(f"Referenced markdown benchmark report escapes repository root: {report_rel!r}")
+        else:
+            if not cand.is_file():
+                errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
+            else:
+                report_path = cand
+
+    if report_path is not None and not errors:
+        try:
+            md_text = report_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return False, [f"Failed to read markdown benchmark report {report_rel}: {exc}"]
         if "/Users/" in md_text or "/home/" in md_text:
             errors.append(f"Markdown benchmark report {report_rel} contains leaked personal host path")
 
+        published_rows, dup_labels = _extract_published_markdown_table_rows(md_text)
+        if dup_labels:
+            errors.append(f"Markdown benchmark report {report_rel} contains duplicate metric row labels: {dup_labels}")
+
         expected_rows = [
             f"| **Lines Written / Read** | `{lines_written}` written / `{lines_read}` read (`{lines_dropped}` dropped, digest matched=`{'true' if digest_matched else 'false'}`) | `{t0['lossless_gate_status']}` |",
-            f"| **Tier 0+1 Throughput** | `{stored_tps:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{t0['throughput_gate_status']}` |",
-            f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{stored_collapse:.2f}x` collapse, `{t0.get('clusters_active', 0)}` active clusters) | — |",
+            f"| **Tier 0+1 Throughput** | `{calc_tps:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{t0['throughput_gate_status']}` |",
+            f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{calc_collapse:.2f}x` collapse, `{t0.get('clusters_active', 0)}` active clusters) | — |",
             f"| **Latency P50 / P90 / P99 / Max** | `{p50_us:.3f} us` / `{p90_us:.3f} us` / `{p99_us:.3f} us` / `{max_us:.3f} us` | `{t1['p99_gate_status']}` |",
-            f"| **Precision / Recall / F1** | `{stored_prec:.4f}` / `{stored_rec:.4f}` / `{stored_f1:.4f}` (target F1 >= {f1_target:.2f}) | `{det['f1_gate_status']}` |",
+            f"| **Precision / Recall / F1** | `{calc_prec:.4f}` / `{calc_rec:.4f}` / `{calc_f1:.4f}` (target F1 >= {f1_target:.2f}) | `{det['f1_gate_status']}` |",
             f"| **Sampled Go Heap Plateau / Peak** | `{plateau_mb:.2f} MB` plateau / `{peak_mb:.2f} MB` sampled peak (ceiling `{ceiling_mb:.0f} MB`, method=`{mem.get('heap_sampling_method', '')}`) | `{mem['heap_gate_status']}` |",
-            f"| **Process Peak RSS** | `{rss_kb} KB` (`{rss_mb:.2f} MB`) | — |",
-            f"| **Adversarial Hostile-Log Self-Checks** | `{adv_passed}/{adv_total}` passed (`{adv_pct:.2f}%`) | `{adv['gate_status']}` |",
+            f"| **Process Peak RSS** | `{rss_kb} KB` (`{calc_rss_mb:.2f} MB`) | — |",
+            f"| **Adversarial Hostile-Log Self-Checks** | `{adv_passed}/{adv_total}` passed (`{calc_adv_pct:.2f}%`) | `{adv['gate_status']}` |",
         ]
         if t2_enabled:
             expected_rows.extend([
@@ -464,8 +551,8 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                 f"| **Hostile Injection Safety** | `{t2['injection_probes_safe']}/{t2['injection_probes_attempted']}` safe non-benign verdicts (`{t2['injection_overrides_actual']}` actual overrides, `{t2['injection_probes_failed']}` failed) | `{t2['injection_override_gate_status']}` |",
             ])
         for row in expected_rows:
-            if row not in md_text:
-                errors.append(f"Benchmark JSON/Markdown row parity error: expected row {row!r} missing from {report_rel}")
+            if row not in published_rows:
+                errors.append(f"Benchmark JSON/Markdown published-table parity error: expected row {row!r} missing from {report_rel}")
 
     return len(errors) == 0, errors
 
@@ -473,10 +560,15 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
 def independent_recompute_embedding_comparison(embedding_json_path: Path) -> tuple[bool, list[str]]:
     """Independently verify mathematical consistency of docs/benchmarks/embedding_comparison.json."""
     errors: list[str] = []
-    if not embedding_json_path.is_file():
+    if not embedding_json_path.exists():
         return True, []
+    if not embedding_json_path.is_file():
+        return False, [f"Embedding comparison path is not a regular file: {embedding_json_path}"]
 
-    raw = embedding_json_path.read_text(encoding="utf-8")
+    try:
+        raw = embedding_json_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, [f"Failed to read {embedding_json_path}: {exc}"]
     if "/Users/" in raw or "/home/" in raw:
         errors.append("Embedding comparison JSON contains leaked personal host path")
     try:
@@ -485,6 +577,8 @@ def independent_recompute_embedding_comparison(embedding_json_path: Path) -> tup
         return False, [f"Failed to parse {embedding_json_path}: {exc}"]
     if not isinstance(data, dict):
         return False, [f"Embedding comparison JSON root must be an object, got {type(data).__name__}"]
+    if _contains_personal_host_path(data):
+        errors.append("Embedding comparison JSON contains leaked personal host path in decoded strings")
 
     ds = _req_dict(data, "dataset", errors, "embedding_comparison")
     lk = _req_dict(data, "pure_laplace_lk", errors, "embedding_comparison")
@@ -833,7 +927,7 @@ def main() -> int:
         print("[PASS] Independent benchmark math recomputation & Markdown parity verified.")
 
     emb_json = REPO_ROOT / "docs" / "benchmarks" / "embedding_comparison.json"
-    if emb_json.is_file():
+    if emb_json.exists():
         emb_ok, emb_errs = independent_recompute_embedding_comparison(emb_json)
         if not emb_ok:
             overall_success = False
@@ -841,6 +935,10 @@ def main() -> int:
                 print(f"[FAIL] {err}", file=sys.stderr)
         else:
             print("[PASS] Independent semantic embedding comparison math verified.")
+
+    if do_write and not overall_success:
+        print("\nAborting --write because benchmark artifact recomputation failed.", file=sys.stderr)
+        return 1
 
     if args.doc is not None:
         target_docs = [args.doc]

@@ -249,4 +249,23 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 	if _, relErr := resolveReportMarkdownPath(extPath, true); relErr == nil {
 		t.Fatalf("expected external --out-md %q to be rejected when publishing JSON", extPath)
 	}
+
+	// Verify publishReportPair preserves prior Markdown if JSON publication fails (e.g. target is a directory).
+	pairDir := t.TempDir()
+	mdPath := filepath.Join(pairDir, "report.md")
+	origMD := []byte("# prior report\n")
+	if err := os.WriteFile(mdPath, origMD, 0644); err != nil {
+		t.Fatalf("write prior md: %v", err)
+	}
+	badJSONTarget := filepath.Join(pairDir, "dir-not-file")
+	if err := os.MkdirAll(badJSONTarget, 0755); err != nil {
+		t.Fatalf("mkdir bad target: %v", err)
+	}
+	if err := publishReportPair(mdPath, badJSONTarget, []byte("# new report\n"), BenchmarkReport{}); err == nil {
+		t.Fatal("expected publishReportPair to fail when JSON target is a directory")
+	}
+	gotMD, err := os.ReadFile(mdPath)
+	if err != nil || string(gotMD) != string(origMD) {
+		t.Fatalf("expected prior Markdown to be preserved after failed JSON publish, got %q (err=%v)", string(gotMD), err)
+	}
 }

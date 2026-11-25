@@ -373,7 +373,8 @@ func truncateUTF8Bytes(s string, maxBytes int) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut]
+	// Clone truncated prefix so a small retained sample never pins a 64 KiB raw log frame in RAM.
+	return strings.Clone(s[:cut])
 }
 
 func maybeMatchesHeuristic(name, raw string) bool {

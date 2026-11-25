@@ -307,17 +307,67 @@ class TestClaimsLinter(unittest.TestCase):
                 self.assertFalse(ok_sub)
                 self.assertTrue(any("disguised_semantic_recall mismatch" in e for e in errs_sub), errs_sub)
 
-                # Non-finite NaN constant in embedding JSON must be rejected!
+                # Non-finite NaN constant in embedding JSON must be rejected deterministically!
+                nan_emb = json.loads(emb_json.read_text(encoding="utf-8"))
+                nan_emb["comparison"]["f1_delta"] = float("nan")
                 p_emb_nan = tmp_root / "emb_nan.json"
-                p_emb_nan.write_text(emb_json.read_text(encoding="utf-8").replace('"f1_delta": 0.25', '"f1_delta": NaN'), encoding="utf-8")
+                p_emb_nan.write_text(json.dumps(nan_emb, allow_nan=True), encoding="utf-8")
                 ok_en, errs_en = sync_docs.independent_recompute_embedding_comparison(p_emb_nan)
-                self.assertFalse(ok_en, f"Expected NaN rejection in embedding JSON, got {errs_en}")
+                self.assertFalse(ok_en)
+                self.assertTrue(any("Non-standard non-finite JSON constant" in e for e in errs_en), errs_en)
 
-            # 6. Non-finite NaN constant and malformed top-level/field types in benchmark JSON
+            # 6. Non-finite NaN, integer overflow (10**400), JSON-escaped personal path, invalid UTF-8, and bad shapes
+            nan_bench = json.loads(json.dumps(base_data))
+            nan_bench["tier1_surprisal"]["separation_nats"] = float("nan")
             p_nan = tmp_root / "bench_nan.json"
-            p_nan.write_text(bench_json.read_text(encoding="utf-8").replace('"separation_nats":', '"separation_nats": NaN, "_ignored":'), encoding="utf-8")
-            ok_nan, _ = sync_docs.independent_recompute_metrics(p_nan, repo_root=tmp_root)
+            p_nan.write_text(json.dumps(nan_bench, allow_nan=True), encoding="utf-8")
+            ok_nan, errs_nan = sync_docs.independent_recompute_metrics(p_nan, repo_root=tmp_root)
             self.assertFalse(ok_nan)
+            self.assertTrue(any("Non-standard non-finite JSON constant" in e for e in errs_nan), errs_nan)
+
+            huge_int = json.loads(json.dumps(base_data))
+            huge_int["memory_profile"]["rss_peak_kb"] = 10**400
+            p_huge = tmp_root / "bench_huge.json"
+            p_huge.write_text(json.dumps(huge_int), encoding="utf-8")
+            ok_huge, errs_huge = sync_docs.independent_recompute_metrics(p_huge, repo_root=tmp_root)
+            self.assertFalse(ok_huge)
+            self.assertTrue(any("int64 bound" in e for e in errs_huge), errs_huge)
+
+            esc_path = json.loads(json.dumps(base_data))
+            esc_path["metadata"]["cpu"] = "/Users/alice/cpu"
+            p_esc = tmp_root / "bench_escaped_path.json"
+            p_esc.write_text(json.dumps(esc_path).replace("/Users/", r"\/Users\/"), encoding="utf-8")
+            ok_esc, errs_esc = sync_docs.independent_recompute_metrics(p_esc, repo_root=tmp_root)
+            self.assertFalse(ok_esc)
+            self.assertTrue(any("personal host path" in e for e in errs_esc), errs_esc)
+
+            p_bad_utf8 = tmp_root / "bad_utf8.json"
+            p_bad_utf8.write_bytes(b"\xff\xfeinvalid")
+            ok_utf8, errs_utf8 = sync_docs.independent_recompute_metrics(p_bad_utf8, repo_root=tmp_root)
+            self.assertFalse(ok_utf8)
+            self.assertTrue(any("Failed to read" in e for e in errs_utf8), errs_utf8)
+
+            abs_md = json.loads(json.dumps(base_data))
+            abs_md["metadata"]["report_markdown"] = str((tmp_root / md_rel).resolve())
+            p_abs = tmp_root / "abs_md.json"
+            p_abs.write_text(json.dumps(abs_md), encoding="utf-8")
+            ok_abs, errs_abs = sync_docs.independent_recompute_metrics(p_abs, repo_root=tmp_root)
+            self.assertFalse(ok_abs)
+            self.assertTrue(any("repository-relative" in e for e in errs_abs), errs_abs)
+
+            # HTML-commented correct row with stale visible row must fail published-table parity!
+            comment_md_root = tmp_root / "comment_case"
+            (comment_md_root / "docs" / "benchmarks").mkdir(parents=True)
+            tps_val = base_data["tier0_replay"]["throughput_lps"]
+            real_row = f"| **Tier 0+1 Throughput** | `{tps_val:.2f} lines/sec` (target >= 50000 lines/sec) | `PASSED` |"
+            stale_row = "| **Tier 0+1 Throughput** | `12345.00 lines/sec` (target >= 50000 lines/sec) | `MISSED TARGET` |"
+            commented_md = md_text.replace(real_row, f"<!-- {real_row} -->\n{stale_row}")
+            (comment_md_root / md_rel).write_text(commented_md, encoding="utf-8")
+            p_cmt = comment_md_root / "bench.json"
+            p_cmt.write_text(json.dumps(base_data), encoding="utf-8")
+            ok_cmt, errs_cmt = sync_docs.independent_recompute_metrics(p_cmt, repo_root=comment_md_root)
+            self.assertFalse(ok_cmt)
+            self.assertTrue(any("published-table parity error" in e for e in errs_cmt), errs_cmt)
 
             p_list = tmp_root / "bench_list.json"
             p_list.write_text("[]", encoding="utf-8")

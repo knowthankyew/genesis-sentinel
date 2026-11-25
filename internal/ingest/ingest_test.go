@@ -844,13 +844,13 @@ func TestSegReaderScratchBufferDoesNotAliasEvents(t *testing.T) {
 	if len(evs) != len(frames) {
 		t.Fatalf("expected %d events, got %d", len(frames), len(evs))
 	}
-	if evs[0].Service != "alpha" || evs[0].Message != "first-payload-aaaa" {
+	if evs[0].Service != "alpha" || evs[0].Level != "INFO" || evs[0].TraceID != "t-1" || evs[0].Timestamp != 1700000001 || evs[0].Message != "first-payload-aaaa" {
 		t.Fatalf("frame 0 aliased/corrupted by subsequent scratch writes: %+v", evs[0])
 	}
-	if evs[1].Service != "bravo" || evs[1].Message != "secnd-payload-bbbb" {
+	if evs[1].Service != "bravo" || evs[1].Level != "WARN" || evs[1].TraceID != "t-2" || evs[1].Timestamp != 1700000002 || evs[1].Message != "secnd-payload-bbbb" {
 		t.Fatalf("frame 1 aliased/corrupted: %+v", evs[1])
 	}
-	if evs[2].Service != "charlie" || evs[2].Message != "third-payload-cccc" {
+	if evs[2].Service != "charlie" || evs[2].Level != "ERROR" || evs[2].TraceID != "t-3" || evs[2].Timestamp != 1700000003 || evs[2].Message != "third-payload-cccc" {
 		t.Fatalf("frame 2 aliased/corrupted: %+v", evs[2])
 	}
 	if evs[3].Message != "plain-fourth-payload-dddd" {

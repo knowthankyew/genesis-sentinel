@@ -205,21 +205,16 @@ func main() {
 
 	md := RenderMarkdownReport(report)
 
-	// Publish Markdown atomically FIRST, then publish JSON atomically SECOND, so a failed
-	// Markdown write never leaves empirical_benchmarks.json pointing to a missing report.
+	// Stage and validate both artifacts before committing replacement; if JSON publication
+	// fails after Markdown replacement, restore the previous Markdown file so prior parity stays intact.
+	if err := publishReportPair(opts.outMD, opts.outJSON, []byte(md), report); err != nil {
+		fmt.Fprintf(os.Stderr, "publish benchmark artifacts: %v\n", err)
+		os.Exit(1)
+	}
 	if opts.outMD != "" {
-		if err := writeFileAtomic(opts.outMD, []byte(md), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "write md report: %v\n", err)
-			os.Exit(1)
-		}
 		fmt.Printf("Wrote Markdown benchmark report: %s\n", opts.outMD)
 	}
-
 	if opts.outJSON != "" {
-		if err := writeJSONReport(opts.outJSON, report); err != nil {
-			fmt.Fprintf(os.Stderr, "write json report: %v\n", err)
-			os.Exit(1)
-		}
 		fmt.Printf("Wrote JSON benchmark artifact: %s\n", opts.outJSON)
 	}
 
@@ -266,7 +261,10 @@ func runBenchmarks(opts benchOptions) (BenchmarkReport, error) {
 		AdversarialPassTarget: 100.0,
 	}
 
-	var peakHeapBytes uint64
+	var (
+		peakHeapBytes    uint64
+		plateauHeapBytes uint64
+	)
 	samplePeak := func() {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
@@ -274,14 +272,27 @@ func runBenchmarks(opts benchOptions) (BenchmarkReport, error) {
 			peakHeapBytes = m.HeapAlloc
 		}
 	}
+	sampleSteadyPlateau := func() {
+		// Called while the populated pipeline / rolling baseline is still reachable so GC
+		// measures live retained steady-state heap rather than post-workload empty heap.
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		if m.HeapAlloc > plateauHeapBytes {
+			plateauHeapBytes = m.HeapAlloc
+		}
+		if m.HeapAlloc > peakHeapBytes {
+			peakHeapBytes = m.HeapAlloc
+		}
+	}
 
-	t0, err := benchTier0Replay(opts.lines, opts.windowEvents, opts.seed, gates, samplePeak)
+	t0, err := benchTier0Replay(opts.lines, opts.windowEvents, opts.seed, gates, samplePeak, sampleSteadyPlateau)
 	if err != nil {
 		return BenchmarkReport{}, fmt.Errorf("tier0 replay: %w", err)
 	}
 	samplePeak()
 
-	t1 := benchTier1Surprisal(opts.surprisalEvals, opts.baselineSize, opts.seed, gates)
+	t1 := benchTier1Surprisal(opts.surprisalEvals, opts.baselineSize, opts.seed, gates, sampleSteadyPlateau)
 	samplePeak()
 
 	det, err := benchDetectionAccuracy(opts.seed, gates)
@@ -299,14 +310,7 @@ func runBenchmarks(opts benchOptions) (BenchmarkReport, error) {
 	adv := benchAdversarialChecks(gates)
 	samplePeak()
 
-	// Measure post-GC steady-state plateau alongside maximum checkpoint-sampled HeapAlloc and OS MaxRSS.
-	runtime.GC()
-	var afterGC runtime.MemStats
-	runtime.ReadMemStats(&afterGC)
-	if afterGC.HeapAlloc > peakHeapBytes {
-		peakHeapBytes = afterGC.HeapAlloc
-	}
-	plateauMB := round2(float64(afterGC.HeapAlloc) / (1024 * 1024))
+	plateauMB := round2(float64(plateauHeapBytes) / (1024 * 1024))
 	peakMB := round2(float64(peakHeapBytes) / (1024 * 1024))
 	if plateauMB > peakMB {
 		peakMB = plateauMB
@@ -365,7 +369,7 @@ func hashLogEventOrdered(h interface{ Write([]byte) (int, error) }, ev model.Log
 	writeField(ev.Message)
 }
 
-func benchTier0Replay(totalLines, windowEvents int, seed uint64, gates AcceptanceGates, samplePeak func()) (Tier0ReplayMetrics, error) {
+func benchTier0Replay(totalLines, windowEvents int, seed uint64, gates AcceptanceGates, samplePeak, sampleSteadyPlateau func()) (Tier0ReplayMetrics, error) {
 	tmpDir, err := os.MkdirTemp("", "sentinel-bench-seg-*")
 	if err != nil {
 		return Tier0ReplayMetrics{}, err
@@ -439,6 +443,10 @@ func benchTier0Replay(totalLines, windowEvents int, seed uint64, gates Acceptanc
 	pipe.FlushWindow()
 	elapsed := time.Since(start)
 	samplePeak()
+	// Measure live post-GC steady-state heap while the populated pipeline/Drain/Tier-1 state is reachable.
+	sampleSteadyPlateau()
+	runtime.KeepAlive(pipe)
+	runtime.KeepAlive(reader)
 
 	actualDigest := hex.EncodeToString(readHash.Sum(nil))
 	digestMatched := actualDigest == expectedDigest
@@ -484,7 +492,7 @@ func benchTier0Replay(totalLines, windowEvents int, seed uint64, gates Acceptanc
 	}, nil
 }
 
-func benchTier1Surprisal(evals, baselineSize int, seed uint64, gates AcceptanceGates) Tier1SurprisalMetrics {
+func benchTier1Surprisal(evals, baselineSize int, seed uint64, gates AcceptanceGates, sampleSteadyPlateau func()) Tier1SurprisalMetrics {
 	eng := surprisal.NewEngine(surprisal.Options{
 		Mode:               "inprocess",
 		ThresholdNats:      surprisal.DefaultThresholdNats,
@@ -664,9 +672,14 @@ func benchTier1Surprisal(evals, baselineSize int, seed uint64, gates AcceptanceG
 		p99Status = "MISSED TARGET"
 	}
 
+	// Measure steady-state heap while the full-capacity Tier 1 rolling baseline is still live.
+	sampleSteadyPlateau()
+	baselineCases := eng.Stats().BaselineCases
+	runtime.KeepAlive(eng)
+
 	return Tier1SurprisalMetrics{
 		Evaluations:       evals,
-		BaselineCases:     eng.Stats().BaselineCases,
+		BaselineCases:     baselineCases,
 		ThresholdNats:     surprisal.DefaultThresholdNats,
 		P50US:             p50,
 		P90US:             p90,
@@ -1204,26 +1217,108 @@ func RenderMarkdownReport(r BenchmarkReport) string {
 	return b.String()
 }
 
-func writeJSONReport(path string, r BenchmarkReport) error {
+func marshalJSONReport(r BenchmarkReport) ([]byte, error) {
 	raw, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	raw = append(raw, '\n')
 	if strings.Contains(string(raw), "/Users/") || strings.Contains(string(raw), "/home/") {
-		return fmt.Errorf("refusing to write benchmark JSON containing personal host path")
+		return nil, fmt.Errorf("refusing to write benchmark JSON containing personal host path")
+	}
+	return raw, nil
+}
+
+func writeJSONReport(path string, r BenchmarkReport) error {
+	raw, err := marshalJSONReport(r)
+	if err != nil {
+		return err
 	}
 	return writeFileAtomic(path, raw, 0644)
 }
 
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+// publishReportPair stages both Markdown and JSON artifacts before replacing either destination
+// and restores any previous Markdown file if JSON replacement fails, preserving prior pair parity.
+func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkReport) error {
+	var jsonBytes []byte
+	if outJSON != "" {
+		var err error
+		jsonBytes, err = marshalJSONReport(report)
+		if err != nil {
+			return err
+		}
+	}
+
+	var (
+		mdTmp      string
+		jsonTmp    string
+		prevMD     []byte
+		hadPrevMD  bool
+		prevMDMode os.FileMode = 0644
+	)
+	cleanupTmp := func(p string) {
+		if p != "" {
+			_ = os.Remove(p)
+		}
+	}
+	defer func() {
+		cleanupTmp(mdTmp)
+		cleanupTmp(jsonTmp)
+	}()
+
+	if outMD != "" {
+		if fi, statErr := os.Stat(outMD); statErr == nil && fi.Mode().IsRegular() {
+			if orig, readErr := os.ReadFile(outMD); readErr == nil {
+				prevMD = orig
+				hadPrevMD = true
+				prevMDMode = fi.Mode().Perm()
+			}
+		}
+		var err error
+		mdTmp, err = stageTempFile(outMD, mdBytes, 0644)
+		if err != nil {
+			return fmt.Errorf("stage markdown report: %w", err)
+		}
+	}
+	if outJSON != "" {
+		var err error
+		jsonTmp, err = stageTempFile(outJSON, jsonBytes, 0644)
+		if err != nil {
+			return fmt.Errorf("stage json report: %w", err)
+		}
+	}
+
+	if mdTmp != "" {
+		if err := os.Rename(mdTmp, outMD); err != nil {
+			return fmt.Errorf("publish markdown report: %w", err)
+		}
+		mdTmp = ""
+	}
+	if jsonTmp != "" {
+		if err := os.Rename(jsonTmp, outJSON); err != nil {
+			// Roll back Markdown to keep any prior JSON/Markdown pair synchronized.
+			if outMD != "" {
+				if hadPrevMD {
+					_ = writeFileAtomic(outMD, prevMD, prevMDMode)
+				} else {
+					_ = os.Remove(outMD)
+				}
+			}
+			return fmt.Errorf("publish json report: %w", err)
+		}
+		jsonTmp = ""
+	}
+	return nil
+}
+
+func stageTempFile(path string, data []byte, perm os.FileMode) (string, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return "", err
 	}
 	tmp, err := os.CreateTemp(dir, ".sentinel-bench-*.tmp")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpPath := tmp.Name()
 	ok := false
@@ -1234,21 +1329,30 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		}
 	}()
 	if err := tmp.Chmod(perm); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		return err
+		return "", err
 	}
 	if err := tmp.Sync(); err != nil {
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return tmpPath, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmpPath, err := stageTempFile(path, data, perm)
+	if err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	ok = true
 	return nil
 }
 

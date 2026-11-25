@@ -350,10 +350,11 @@ def main() -> int:
         )
 
     recommendation = (
-        f"Pure-Go Laplace-LK remains the default Tier 1 hot path (P50 {lk_p50:.4f} ms vs hybrid {hyb_p50:.4f} ms, "
-        f"~{latency_ratio}x slower, +{rss_delta:.2f} MB peak process RSS delta after PyTorch/Transformers imports). "
-        f"{recall_summary} Because additive semantic scoring increases latency and memory substantially, "
-        f"neural embeddings remain optional for sidecar or offline evaluation rather than embedded in the pure-Go binary."
+        f"In this Python proxy comparison, the Laplace-LK baseline scored P50 {lk_p50:.4f} ms vs hybrid "
+        f"all-MiniLM-L6-v2 P50 {hyb_p50:.4f} ms (~{latency_ratio}x slower in Python, +{rss_delta:.2f} MB peak "
+        f"process RSS delta after PyTorch/Transformers imports). {recall_summary} Because neural embedding "
+        f"inference adds multi-millisecond latency and >100 MB memory overhead, semantic embeddings remain "
+        f"optional for sidecar or offline evaluation rather than embedded in the zero-dependency Go binary."
     )
 
     result = {
