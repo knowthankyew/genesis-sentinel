@@ -317,17 +317,17 @@
     },
     "bench_tier2_inj_enforced": {
       "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
-      "json_path": "tier2_triage.injection_overrides_enforced",
+      "json_path": "tier2_triage.injection_probes_safe",
       "format_rule": "{value}",
       "used_in": ["README.md"],
-      "description": "Live Tier 2 injection probes prevented from downgrading to BENIGN-NOISE"
+      "description": "Live Tier 2 injection probes returning safe non-benign verdicts"
     },
     "bench_tier2_inj_tested": {
       "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
-      "json_path": "tier2_triage.injection_probes_tested",
+      "json_path": "tier2_triage.injection_probes_attempted",
       "format_rule": "{value}",
       "used_in": ["README.md"],
-      "description": "Total live Tier 2 injection probes evaluated"
+      "description": "Total live Tier 2 injection probes attempted"
     },
     "bench_tier2_override_status": {
       "source_artifact": "docs/benchmarks/empirical_benchmarks.json",

@@ -1,15 +1,16 @@
 {
   "metadata": {
-    "date": "2026-11-25T12:30:09Z",
+    "date": "2026-11-25T12:55:26Z",
     "model_id": "sentence-transformers/all-MiniLM-L6-v2",
     "offline_mode": true,
     "platform": "Darwin x86_64",
     "python_version": "3.12.1",
     "torch_version": "2.2.2",
-    "model_load_seconds": 0.646,
-    "rss_before_model_mb": 175.72,
-    "rss_after_model_mb": 309.08,
-    "rss_delta_mb": 133.36
+    "model_load_seconds": 0.396,
+    "rss_measurement_method": "ru_maxrss_peak_process_post_import",
+    "rss_before_model_mb": 175.88,
+    "rss_after_model_mb": 309.56,
+    "rss_delta_mb": 133.68
   },
   "dataset": {
     "warmup_benign_windows": 30,
@@ -25,31 +26,36 @@
     "fp": 0,
     "fn": 10,
     "tn": 25,
+    "structural_tp": 10,
+    "disguised_semantic_tp": 5,
     "precision": 1.0,
     "recall": 0.6,
     "f1": 0.75,
     "structural_recall": 1.0,
     "disguised_semantic_recall": 0.3333,
-    "latency_p50_ms": 0.0405,
-    "latency_p99_ms": 0.0972
+    "latency_p50_ms": 0.0232,
+    "latency_p99_ms": 0.0563
   },
   "hybrid_laplace_lk_minilm": {
     "tp": 25,
     "fp": 0,
     "fn": 0,
     "tn": 25,
+    "structural_tp": 10,
+    "disguised_semantic_tp": 15,
     "precision": 1.0,
     "recall": 1.0,
     "f1": 1.0,
     "structural_recall": 1.0,
     "disguised_semantic_recall": 1.0,
-    "latency_p50_ms": 5.8451,
-    "latency_p99_ms": 13.2453
+    "latency_p50_ms": 5.9333,
+    "latency_p99_ms": 8.0042
   },
   "comparison": {
     "f1_delta": 0.25,
+    "fp_delta": 0,
     "disguised_semantic_recall_delta": 0.6667,
-    "p50_latency_slowdown_x": 144.3,
-    "recommendation": "Keep pure-Go Laplace-LK as the default Tier 1 hot path (P50 0.0405 ms vs hybrid 5.8451 ms, ~144.3x slower with +133.4 MB RSS delta for MiniLM). Hybrid MiniLM improved disguised semantic-only attack recall by +0.6667 (0.3333 -> 1.0000), confirming that semantic embeddings are best reserved as an optional offline/sidecar enrichment tier rather than embedded in the zero-dependency Go binary."
+    "p50_latency_slowdown_x": 255.7,
+    "recommendation": "Pure-Go Laplace-LK remains the default Tier 1 hot path (P50 0.0232 ms vs hybrid 5.9333 ms, ~255.7x slower, +133.68 MB peak process RSS delta after PyTorch/Transformers imports). On this synthetic corpus at fixed threshold 5.0 nats (semantic_weight=12), disguised-semantic recall changed by +0.6667 (0.3333 -> 1.0000) with FP delta +0 (0 -> 0). Because additive semantic scoring increases latency and memory substantially, neural embeddings remain optional for sidecar or offline evaluation rather than embedded in the pure-Go binary."
   }
 }

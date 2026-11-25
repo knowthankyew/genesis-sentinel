@@ -224,7 +224,7 @@ def compute_metrics(preds: list[int], eval_set: list[dict]) -> dict:
     tn = sum(1 for p, row in zip(preds, eval_set) if p == 0 and row["label"] == 0)
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    f1 = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
 
     struct_tot = sum(1 for r in eval_set if r["kind"] == "structural")
     struct_hit = sum(1 for p, r in zip(preds, eval_set) if r["kind"] == "structural" and p == 1)
@@ -235,6 +235,8 @@ def compute_metrics(preds: list[int], eval_set: list[dict]) -> dict:
         "fp": fp,
         "fn": fn,
         "tn": tn,
+        "structural_tp": struct_hit,
+        "disguised_semantic_tp": disg_hit,
         "precision": round(prec, 4),
         "recall": round(rec, 4),
         "f1": round(f1, 4),
@@ -260,6 +262,8 @@ def main() -> int:
     )
     parser.add_argument("--semantic-weight", type=float, default=12.0, help="Nats multiplier for semantic cosine distance")
     args = parser.parse_args()
+    if not math.isfinite(args.semantic_weight) or args.semantic_weight < 0.0:
+        parser.error(f"--semantic-weight must be a finite number >= 0 (got {args.semantic_weight!r})")
 
     warmup, eval_set = build_corpus()
     base_conts, base_noms = [], []
@@ -326,14 +330,30 @@ def main() -> int:
     hyb_p50 = round(pct(hyb_lat_sorted, 50), 4)
     latency_ratio = round(hyb_p50 / max(lk_p50, 0.0001), 1)
     recall_delta = round(hyb_metrics["disguised_semantic_recall"] - lk_metrics["disguised_semantic_recall"], 4)
+    fp_delta = hyb_metrics["fp"] - lk_metrics["fp"]
+    rss_delta = round(max(rss_after_model - rss_before_model, 0.0), 2)
+
+    if recall_delta > 0:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {DEFAULT_THRESHOLD_NATS:.1f} nats "
+            f"(semantic_weight={args.semantic_weight:g}), disguised-semantic recall changed by "
+            f"{recall_delta:+.4f} ({lk_metrics['disguised_semantic_recall']:.4f} -> "
+            f"{hyb_metrics['disguised_semantic_recall']:.4f}) with FP delta {fp_delta:+d} "
+            f"({lk_metrics['fp']} -> {hyb_metrics['fp']})."
+        )
+    else:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {DEFAULT_THRESHOLD_NATS:.1f} nats "
+            f"(semantic_weight={args.semantic_weight:g}), disguised-semantic recall showed "
+            f"{recall_delta:+.4f} change ({lk_metrics['disguised_semantic_recall']:.4f} -> "
+            f"{hyb_metrics['disguised_semantic_recall']:.4f}) with FP delta {fp_delta:+d}."
+        )
 
     recommendation = (
-        f"Keep pure-Go Laplace-LK as the default Tier 1 hot path (P50 {lk_p50:.4f} ms vs hybrid {hyb_p50:.4f} ms, "
-        f"~{latency_ratio}x slower with +{round(max(rss_after_model - rss_before_model, 0.0), 1)} MB RSS delta for MiniLM). "
-        f"Hybrid MiniLM improved disguised semantic-only attack recall by {recall_delta:+.4f} "
-        f"({lk_metrics['disguised_semantic_recall']:.4f} -> {hyb_metrics['disguised_semantic_recall']:.4f}), "
-        f"confirming that semantic embeddings are best reserved as an optional offline/sidecar enrichment tier "
-        f"rather than embedded in the zero-dependency Go binary."
+        f"Pure-Go Laplace-LK remains the default Tier 1 hot path (P50 {lk_p50:.4f} ms vs hybrid {hyb_p50:.4f} ms, "
+        f"~{latency_ratio}x slower, +{rss_delta:.2f} MB peak process RSS delta after PyTorch/Transformers imports). "
+        f"{recall_summary} Because additive semantic scoring increases latency and memory substantially, "
+        f"neural embeddings remain optional for sidecar or offline evaluation rather than embedded in the pure-Go binary."
     )
 
     result = {
@@ -345,9 +365,10 @@ def main() -> int:
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
             "model_load_seconds": load_sec,
+            "rss_measurement_method": "ru_maxrss_peak_process_post_import",
             "rss_before_model_mb": rss_before_model,
             "rss_after_model_mb": rss_after_model,
-            "rss_delta_mb": round(max(rss_after_model - rss_before_model, 0.0), 2),
+            "rss_delta_mb": rss_delta,
         },
         "dataset": {
             "warmup_benign_windows": len(warmup),
@@ -370,13 +391,14 @@ def main() -> int:
         },
         "comparison": {
             "f1_delta": round(hyb_metrics["f1"] - lk_metrics["f1"], 4),
+            "fp_delta": fp_delta,
             "disguised_semantic_recall_delta": recall_delta,
             "p50_latency_slowdown_x": latency_ratio,
             "recommendation": recommendation,
         },
     }
 
-    encoded = json.dumps(result, indent=2) + "\n"
+    encoded = json.dumps(result, indent=2, allow_nan=False) + "\n"
     if "/Users/" in encoded:
         raise RuntimeError("Refusing to write embedding comparison JSON containing '/Users/' path")
 

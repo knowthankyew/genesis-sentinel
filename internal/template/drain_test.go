@@ -307,3 +307,39 @@ func TestAggregatorReservesDedicatedSlotAndEnforcesByteBudgets(t *testing.T) {
 		}
 	}
 }
+
+func TestDrainLeafCapPreservesExistingMatchesAndOverflowsExcess(t *testing.T) {
+	miner := NewDrainMiner(DefaultMaxClusters, 0.75)
+	// Fill one single prefix-tree leaf (same service, level, tokenCount=8, same first two tokens)
+	// up to maxLeafClusters (128) with mutually distinct remaining 6 tokens.
+	var firstID string
+	for i := 0; i < maxLeafClusters; i++ {
+		msg := fmt.Sprintf("prefixA prefixB t%da t%db t%dc t%dd t%de t%df", i, i, i, i, i, i)
+		id, _, ov := miner.ExtractTemplate("svc", "INFO", msg)
+		if ov {
+			t.Fatalf("unexpected overflow at leaf cluster %d", i)
+		}
+		if i == 0 {
+			firstID = id
+		}
+	}
+	if miner.ClusterCount() != maxLeafClusters {
+		t.Fatalf("expected %d clusters in leaf, got %d", maxLeafClusters, miner.ClusterCount())
+	}
+
+	// Existing cluster in the saturated leaf must still match cleanly without overflowing.
+	matchID, _, matchOv := miner.ExtractTemplate("svc", "INFO", "prefixA prefixB t0a t0b t0c t0d t0e t0f")
+	if matchOv || matchID != firstID {
+		t.Fatalf("existing cluster failed to match after leaf filled: id=%s want=%s ov=%v", matchID, firstID, matchOv)
+	}
+
+	// Non-matching new messages into the saturated leaf must overflow without exceeding maxLeafClusters.
+	_, tmpl1, ov1 := miner.ExtractTemplate("svc", "INFO", "prefixA prefixB x1a x1b x1c x1d x1e x1f")
+	_, tmpl2, ov2 := miner.ExtractTemplate("svc", "INFO", "prefixA prefixB x2a x2b x2c x2d x2e x2f")
+	if !ov1 || !ov2 || tmpl1 != "<OVERFLOW>" || tmpl2 != "<OVERFLOW>" {
+		t.Fatalf("expected overflow on saturated leaf excess messages: ov=(%v,%v) tmpl=(%q,%q)", ov1, ov2, tmpl1, tmpl2)
+	}
+	if miner.ClusterCount() != maxLeafClusters {
+		t.Fatalf("cluster count grew past leaf cap: got %d want %d", miner.ClusterCount(), maxLeafClusters)
+	}
+}

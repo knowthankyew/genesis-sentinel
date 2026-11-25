@@ -1,6 +1,9 @@
 # Example local-only compose topology pairing Project Genesis with Genesis Sentinel.
 # All published host ports bind strictly to 127.0.0.1 (zero external network exposure).
-# Genesis writes CRC32 .seg segments to a shared volume mounted read-only (:ro) into Sentinel.
+# Both services run on a private Docker bridge network: Genesis writes CRC32 .seg segments
+# to a shared volume mounted read-only (:ro) into Sentinel, and Sentinel emits alerts to
+# the sibling `genesis:9000` container while serving `/healthz` and `/stats` on 127.0.0.1:8090.
+# For host-native Genesis deployments on 127.0.0.1:9000, use deploy/systemd or deploy/launchd.
 
 services:
   genesis:
@@ -65,4 +68,4 @@ volumes:
 
 networks:
   sentinel-local:
-    internal: true
+    driver: bridge

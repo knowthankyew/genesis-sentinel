@@ -8,6 +8,8 @@ Wants=genesis.service
 Type=simple
 User=genesis-sentinel
 Group=genesis-sentinel
+# Grant read-only group membership for initial and rotated Genesis .seg files under /var/lib/genesis (0750/0640).
+SupplementaryGroups=genesis
 StateDirectory=genesis-sentinel
 StateDirectoryMode=0700
 Environment=SENTINEL_MAX_MEM_MB=256

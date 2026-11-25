@@ -23,6 +23,7 @@ Modes:
 import argparse
 import ast
 import json
+import math
 import operator
 import re
 import sys
@@ -154,34 +155,83 @@ def resolve_claim_value(claim_id: str, claim_cfg: dict, repo_root: Path = REPO_R
     raise ValueError(f"Claim '{claim_id}' has neither 'go_const' nor 'json_path'")
 
 
+def _reject_nonfinite_json_constant(const: str) -> None:
+    raise ValueError(f"Non-standard non-finite JSON constant not permitted: {const!r}")
+
+
+def _loads_strict_json(raw: str):
+    return json.loads(raw, parse_constant=_reject_nonfinite_json_constant)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_finite_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+
+
+def _req_dict(parent: dict, key: str, errors: list[str], prefix: str) -> dict:
+    val = parent.get(key)
+    if not isinstance(val, dict):
+        errors.append(f"{prefix}.{key} must be a JSON object, got {type(val).__name__}")
+        return {}
+    return val
+
+
+def _req_int(section: dict, key: str, errors: list[str], prefix: str, min_val: int | None = None) -> int | None:
+    val = section.get(key)
+    if not _is_int(val):
+        errors.append(f"{prefix}.{key} must be an integer, got {val!r}")
+        return None
+    if min_val is not None and val < min_val:
+        errors.append(f"{prefix}.{key} must be >= {min_val}, got {val}")
+        return None
+    return val
+
+
+def _req_num(section: dict, key: str, errors: list[str], prefix: str) -> float | None:
+    val = section.get(key)
+    if not _is_finite_num(val):
+        errors.append(f"{prefix}.{key} must be a finite number, got {val!r}")
+        return None
+    return float(val)
+
+
 def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = REPO_ROOT) -> tuple[bool, list[str]]:
     """
     Independently verify mathematical consistency of docs/benchmarks/empirical_benchmarks.json,
-    status gate derivations, and exact parity against the committed Markdown benchmark report.
+    strict schema & finite-number bounds, status gate derivations from recomputed metrics,
+    and exact row-level parity against the committed Markdown benchmark report.
     """
     errors: list[str] = []
     if not benchmark_json_path.is_file():
         return False, [f"Missing empirical benchmark JSON: {benchmark_json_path}"]
 
     raw_json = benchmark_json_path.read_text(encoding="utf-8")
-    if "/Users/" in raw_json:
-        errors.append("Empirical benchmark JSON contains leaked personal '/Users/' path")
+    if "/Users/" in raw_json or "/home/" in raw_json:
+        errors.append("Empirical benchmark JSON contains leaked personal host path")
 
     try:
-        data = json.loads(raw_json)
+        data = _loads_strict_json(raw_json)
     except Exception as exc:
         return False, [f"Failed to parse {benchmark_json_path}: {exc}"]
 
-    meta = data.get("metadata", {})
-    gates = data.get("acceptance_gates", {})
-    t0 = data.get("tier0_replay", {})
-    t1 = data.get("tier1_surprisal", {})
-    det = data.get("detection_accuracy", {})
-    t2 = data.get("tier2_triage", {})
-    mem = data.get("memory_profile", {})
-    adv = data.get("adversarial_checks", {})
+    if not isinstance(data, dict):
+        return False, [f"Empirical benchmark JSON root must be an object, got {type(data).__name__}"]
 
-    # 1. Verify Sentinel version metadata against internal/cli/cli.go (when running against repo_root)
+    meta = _req_dict(data, "metadata", errors, "benchmark")
+    gates = _req_dict(data, "acceptance_gates", errors, "benchmark")
+    t0 = _req_dict(data, "tier0_replay", errors, "benchmark")
+    t1 = _req_dict(data, "tier1_surprisal", errors, "benchmark")
+    det = _req_dict(data, "detection_accuracy", errors, "benchmark")
+    t2 = _req_dict(data, "tier2_triage", errors, "benchmark")
+    mem = _req_dict(data, "memory_profile", errors, "benchmark")
+    adv = _req_dict(data, "adversarial_checks", errors, "benchmark")
+    if errors:
+        return False, errors
+
+    # 1. Verify Sentinel version metadata against internal/cli/cli.go (when present in repo_root)
     cli_go = repo_root / "internal" / "cli" / "cli.go"
     if cli_go.is_file():
         try:
@@ -193,192 +243,229 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
         except Exception as exc:
             errors.append(f"Failed to extract CLI Version for benchmark check: {exc}")
 
-    # 2. Tier 0 replay throughput, lossless drop count, and template collapse ratio
-    lines_written = t0.get("lines_written", 0)
-    lines_read = t0.get("lines_read", 0)
-    lines_dropped = t0.get("lines_dropped", -1)
-    dur_sec = t0.get("duration_seconds", 0.0)
-    stored_tps = t0.get("throughput_lps", 0.0)
-    tmpls = t0.get("templates_emitted", 0)
-    stored_collapse = t0.get("collapse_ratio", 0.0)
+    # 2. Tier 0 replay throughput, lossless drop count, digest identity, and collapse ratio
+    tps_target = _req_num(gates, "throughput_target_lps", errors, "acceptance_gates")
+    drop_target = _req_int(gates, "lossless_dropped_target", errors, "acceptance_gates", min_val=0)
+    lines_written = _req_int(t0, "lines_written", errors, "tier0_replay", min_val=1)
+    lines_read = _req_int(t0, "lines_read", errors, "tier0_replay", min_val=1)
+    lines_dropped = _req_int(t0, "lines_dropped", errors, "tier0_replay", min_val=0)
+    digest_matched = t0.get("content_digest_matched")
+    if not isinstance(digest_matched, bool):
+        errors.append(f"tier0_replay.content_digest_matched must be a boolean, got {digest_matched!r}")
+    dur_sec = _req_num(t0, "duration_seconds", errors, "tier0_replay")
+    stored_tps = _req_num(t0, "throughput_lps", errors, "tier0_replay")
+    tmpls = _req_int(t0, "templates_emitted", errors, "tier0_replay", min_val=1)
+    stored_collapse = _req_num(t0, "collapse_ratio", errors, "tier0_replay")
 
-    if lines_written <= 0 or lines_read <= 0 or dur_sec <= 0:
-        errors.append("tier0_replay must have positive lines_written, lines_read, and duration_seconds")
-    else:
-        exp_dropped = max(0, lines_written - lines_read)
-        if lines_dropped != exp_dropped:
-            errors.append(f"tier0_replay lines_dropped mismatch: stored {lines_dropped}, expected {exp_dropped}")
+    calc_tps = None
+    if lines_written is not None and lines_read is not None and lines_dropped is not None and dur_sec is not None and stored_tps is not None:
+        if dur_sec <= 0:
+            errors.append("tier0_replay.duration_seconds must be positive")
+        else:
+            exp_dropped = max(0, lines_written - lines_read)
+            if lines_dropped != exp_dropped:
+                errors.append(f"tier0_replay lines_dropped mismatch: stored {lines_dropped}, expected {exp_dropped}")
 
-        calc_tps = round(lines_read / dur_sec, 2)
-        if abs(calc_tps - stored_tps) > 0.05:
-            errors.append(
-                f"Tier 0 throughput recomputation mismatch: stored {stored_tps}, calculated {calc_tps} "
-                f"({lines_read} / {dur_sec})"
-            )
+            calc_tps = round(lines_read / dur_sec, 2)
+            if abs(calc_tps - stored_tps) > 0.05:
+                errors.append(
+                    f"Tier 0 throughput recomputation mismatch: stored {stored_tps}, calculated {calc_tps} "
+                    f"({lines_read} / {dur_sec})"
+                )
+            if tps_target is not None:
+                # Derive gate status strictly from the recomputed throughput rather than stored value.
+                exp_tps_status = "PASSED" if calc_tps >= tps_target else "MISSED TARGET"
+                if t0.get("throughput_gate_status") != exp_tps_status:
+                    errors.append(
+                        f"tier0_replay throughput_gate_status mismatch: expected {exp_tps_status!r} "
+                        f"for recomputed throughput {calc_tps:.2f} vs target {tps_target:.2f}"
+                    )
 
-        if tmpls > 0:
+        if tmpls is not None and stored_collapse is not None:
             calc_collapse = round(lines_read / tmpls, 2)
             if abs(calc_collapse - stored_collapse) > 0.05:
                 errors.append(
                     f"Tier 0 collapse_ratio recomputation mismatch: stored {stored_collapse}, calculated {calc_collapse}"
                 )
-        else:
-            errors.append("tier0_replay templates_emitted must be positive")
 
-    exp_tps_status = "PASSED" if stored_tps >= gates.get("throughput_target_lps", 50000) else "MISSED TARGET"
-    if t0.get("throughput_gate_status") != exp_tps_status:
-        errors.append(f"tier0_replay throughput_gate_status mismatch: expected {exp_tps_status!r}")
-
-    exp_lossless_status = (
-        "PASSED"
-        if lines_dropped <= gates.get("lossless_dropped_target", 0) and lines_read == lines_written
-        else "FAILED"
-    )
-    if t0.get("lossless_gate_status") != exp_lossless_status:
-        errors.append(f"tier0_replay lossless_gate_status mismatch: expected {exp_lossless_status!r}")
+        if drop_target is not None and isinstance(digest_matched, bool):
+            exp_lossless_status = (
+                "PASSED"
+                if lines_dropped <= drop_target and lines_read == lines_written and digest_matched
+                else "FAILED"
+            )
+            if t0.get("lossless_gate_status") != exp_lossless_status:
+                errors.append(f"tier0_replay lossless_gate_status mismatch: expected {exp_lossless_status!r}")
 
     # 3. Tier 1 surprisal latency percentile monotonicity and benign/anomalous separation
-    p50_us = t1.get("p50_us", 0.0)
-    p90_us = t1.get("p90_us", 0.0)
-    p99_us = t1.get("p99_us", 0.0)
-    max_us = t1.get("max_us", 0.0)
-    if not (0 < p50_us <= p90_us <= p99_us <= max_us):
-        errors.append(
-            f"Tier 1 latency percentile monotonicity violated: "
-            f"p50={p50_us}us, p90={p90_us}us, p99={p99_us}us, max={max_us}us"
-        )
+    p99_target_us = _req_num(gates, "tier1_p99_target_us", errors, "acceptance_gates")
+    _req_int(t1, "evaluations", errors, "tier1_surprisal", min_val=1)
+    _req_int(t1, "baseline_cases", errors, "tier1_surprisal", min_val=1)
+    p50_us = _req_num(t1, "p50_us", errors, "tier1_surprisal")
+    p90_us = _req_num(t1, "p90_us", errors, "tier1_surprisal")
+    p99_us = _req_num(t1, "p99_us", errors, "tier1_surprisal")
+    max_us = _req_num(t1, "max_us", errors, "tier1_surprisal")
+    benign_mean = _req_num(t1, "benign_mean_nats", errors, "tier1_surprisal")
+    anom_mean = _req_num(t1, "anomalous_mean_nats", errors, "tier1_surprisal")
+    stored_sep = _req_num(t1, "separation_nats", errors, "tier1_surprisal")
 
-    exp_p99_status = "PASSED" if p99_us < gates.get("tier1_p99_target_us", 2000.0) else "MISSED TARGET"
-    if t1.get("p99_gate_status") != exp_p99_status:
-        errors.append(f"tier1_surprisal p99_gate_status mismatch: expected {exp_p99_status!r}")
-
-    benign_mean = t1.get("benign_mean_nats", 0.0)
-    anom_mean = t1.get("anomalous_mean_nats", 0.0)
-    stored_sep = t1.get("separation_nats", 0.0)
-    calc_sep = round(anom_mean - benign_mean, 4)
-    if abs(calc_sep - stored_sep) > 0.001:
-        errors.append(f"Tier 1 separation_nats mismatch: stored {stored_sep}, calculated {calc_sep}")
-
-    # 4. Labeled detection confusion matrix and precision/recall/F1 recomputation
-    tot_win = det.get("total_windows", 0)
-    pos_win = det.get("positive_windows", 0)
-    neg_win = det.get("negative_windows", 0)
-    tp = det.get("true_positives", 0)
-    fp = det.get("false_positives", 0)
-    fn = det.get("false_negatives", 0)
-    tn = det.get("true_negatives", 0)
-    t0_det = det.get("tier0_detections", 0)
-    t1_det = det.get("tier1_only_detections", 0)
-
-    if tot_win <= 0 or tot_win != pos_win + neg_win or tot_win != tp + fp + fn + tn:
-        errors.append(
-            f"Detection confusion matrix totals inconsistent: total={tot_win}, pos+neg={pos_win + neg_win}, sum={tp + fp + fn + tn}"
-        )
-    if tp + fn != pos_win or tn + fp != neg_win:
-        errors.append(
-            f"Detection class partition mismatch: tp+fn={tp + fn} vs pos={pos_win}, tn+fp={tn + fp} vs neg={neg_win}"
-        )
-    if t0_det + t1_det != tp:
-        errors.append(f"Detection tier breakdown mismatch: tier0({t0_det}) + tier1_only({t1_det}) != tp({tp})")
-
-    calc_prec = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
-    calc_rec = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
-    calc_f1 = round((2 * calc_prec * calc_rec) / (calc_prec + calc_rec), 4) if (calc_prec + calc_rec) > 0 else 0.0
-    if abs(calc_prec - det.get("precision", -1.0)) > 0.0005:
-        errors.append(f"Detection precision mismatch: stored {det.get('precision')}, calculated {calc_prec}")
-    if abs(calc_rec - det.get("recall", -1.0)) > 0.0005:
-        errors.append(f"Detection recall mismatch: stored {det.get('recall')}, calculated {calc_rec}")
-    if abs(calc_f1 - det.get("f1_score", -1.0)) > 0.0005:
-        errors.append(f"Detection f1_score mismatch: stored {det.get('f1_score')}, calculated {calc_f1}")
-
-    exp_f1_status = "PASSED" if det.get("f1_score", 0.0) >= gates.get("detection_f1_target", 0.90) else "MISSED TARGET"
-    if det.get("f1_gate_status") != exp_f1_status:
-        errors.append(f"detection_accuracy f1_gate_status mismatch: expected {exp_f1_status!r}")
-
-    # 5. Tier 2 triage latency & injection-override checks (when enabled)
-    t2_enabled = bool(t2.get("enabled", False))
-    if t2_enabled:
-        t2_p50 = t2.get("p50_ms", 0.0)
-        t2_p90 = t2.get("p90_ms", 0.0)
-        t2_p99 = t2.get("p99_ms", 0.0)
-        t2_max = t2.get("max_ms", 0.0)
-        if not (0 < t2_p50 <= t2_p90 <= t2_p99 <= t2_max):
+    if p50_us is not None and p90_us is not None and p99_us is not None and max_us is not None:
+        if not (0 < p50_us <= p90_us <= p99_us <= max_us):
             errors.append(
-                f"Tier 2 latency percentile monotonicity violated: "
-                f"p50={t2_p50}ms, p90={t2_p90}ms, p99={t2_p99}ms, max={t2_max}ms"
+                f"Tier 1 latency percentile monotonicity violated: "
+                f"p50={p50_us}us, p90={p90_us}us, p99={p99_us}us, max={max_us}us"
             )
-        inj_tested = t2.get("injection_probes_tested", 0)
-        inj_safe = t2.get("injection_overrides_enforced", 0)
-        exp_inj_status = "PASSED" if inj_tested > 0 and inj_safe == inj_tested else "FAILED"
-        if t2.get("injection_override_gate_status") != exp_inj_status:
-            errors.append(f"tier2_triage injection_override_gate_status mismatch: expected {exp_inj_status!r}")
+        if p99_target_us is not None:
+            exp_p99_status = "PASSED" if p99_us < p99_target_us else "MISSED TARGET"
+            if t1.get("p99_gate_status") != exp_p99_status:
+                errors.append(f"tier1_surprisal p99_gate_status mismatch: expected {exp_p99_status!r}")
+
+    if benign_mean is not None and anom_mean is not None and stored_sep is not None:
+        calc_sep = round(anom_mean - benign_mean, 4)
+        if abs(calc_sep - stored_sep) > 0.001:
+            errors.append(f"Tier 1 separation_nats mismatch: stored {stored_sep}, calculated {calc_sep}")
+
+    # 4. Labeled detection confusion matrix and raw-count Precision/Recall/F1 recomputation
+    f1_target = _req_num(gates, "detection_f1_target", errors, "acceptance_gates")
+    tot_win = _req_int(det, "total_windows", errors, "detection_accuracy", min_val=1)
+    pos_win = _req_int(det, "positive_windows", errors, "detection_accuracy", min_val=0)
+    neg_win = _req_int(det, "negative_windows", errors, "detection_accuracy", min_val=0)
+    tp = _req_int(det, "true_positives", errors, "detection_accuracy", min_val=0)
+    fp = _req_int(det, "false_positives", errors, "detection_accuracy", min_val=0)
+    fn = _req_int(det, "false_negatives", errors, "detection_accuracy", min_val=0)
+    tn = _req_int(det, "true_negatives", errors, "detection_accuracy", min_val=0)
+    t0_det = _req_int(det, "tier0_detections", errors, "detection_accuracy", min_val=0)
+    t1_det = _req_int(det, "tier1_only_detections", errors, "detection_accuracy", min_val=0)
+    stored_prec = _req_num(det, "precision", errors, "detection_accuracy")
+    stored_rec = _req_num(det, "recall", errors, "detection_accuracy")
+    stored_f1 = _req_num(det, "f1_score", errors, "detection_accuracy")
+
+    if None not in (tot_win, pos_win, neg_win, tp, fp, fn, tn, t0_det, t1_det, stored_prec, stored_rec, stored_f1):
+        if tot_win != pos_win + neg_win or tot_win != tp + fp + fn + tn:
+            errors.append(
+                f"Detection confusion matrix totals inconsistent: total={tot_win}, pos+neg={pos_win + neg_win}, sum={tp + fp + fn + tn}"
+            )
+        if tp + fn != pos_win or tn + fp != neg_win:
+            errors.append(
+                f"Detection class partition mismatch: tp+fn={tp + fn} vs pos={pos_win}, tn+fp={tn + fp} vs neg={neg_win}"
+            )
+        if t0_det + t1_det != tp:
+            errors.append(f"Detection tier breakdown mismatch: tier0({t0_det}) + tier1_only({t1_det}) != tp({tp})")
+
+        calc_prec = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+        calc_rec = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+        calc_f1 = round((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
+        if abs(calc_prec - stored_prec) > 0.0005:
+            errors.append(f"Detection precision mismatch: stored {stored_prec}, calculated {calc_prec}")
+        if abs(calc_rec - stored_rec) > 0.0005:
+            errors.append(f"Detection recall mismatch: stored {stored_rec}, calculated {calc_rec}")
+        if abs(calc_f1 - stored_f1) > 0.0005:
+            errors.append(f"Detection f1_score mismatch: stored {stored_f1}, calculated {calc_f1}")
+        if f1_target is not None:
+            exp_f1_status = "PASSED" if calc_f1 >= f1_target else "MISSED TARGET"
+            if det.get("f1_gate_status") != exp_f1_status:
+                errors.append(f"detection_accuracy f1_gate_status mismatch: expected {exp_f1_status!r}")
+
+    # 5. Tier 2 triage latency & injection-safety checks (when enabled)
+    t2_enabled = t2.get("enabled")
+    if not isinstance(t2_enabled, bool):
+        errors.append(f"tier2_triage.enabled must be a boolean, got {t2_enabled!r}")
+    elif t2_enabled:
+        t2_p50 = _req_num(t2, "p50_ms", errors, "tier2_triage")
+        t2_p90 = _req_num(t2, "p90_ms", errors, "tier2_triage")
+        t2_p99 = _req_num(t2, "p99_ms", errors, "tier2_triage")
+        t2_max = _req_num(t2, "max_ms", errors, "tier2_triage")
+        if None not in (t2_p50, t2_p90, t2_p99, t2_max):
+            if not (0 < t2_p50 <= t2_p90 <= t2_p99 <= t2_max):
+                errors.append(
+                    f"Tier 2 latency percentile monotonicity violated: "
+                    f"p50={t2_p50}ms, p90={t2_p90}ms, p99={t2_p99}ms, max={t2_max}ms"
+                )
+        inj_attempted = _req_int(t2, "injection_probes_attempted", errors, "tier2_triage", min_val=0)
+        inj_failed = _req_int(t2, "injection_probes_failed", errors, "tier2_triage", min_val=0)
+        inj_safe = _req_int(t2, "injection_probes_safe", errors, "tier2_triage", min_val=0)
+        inj_actual = _req_int(t2, "injection_overrides_actual", errors, "tier2_triage", min_val=0)
+        if None not in (inj_attempted, inj_failed, inj_safe, inj_actual):
+            if inj_safe + inj_failed > inj_attempted:
+                errors.append(
+                    f"tier2_triage probe accounting inconsistent: safe({inj_safe}) + failed({inj_failed}) > attempted({inj_attempted})"
+                )
+            if inj_actual > inj_safe:
+                errors.append(f"tier2_triage injection_overrides_actual ({inj_actual}) > injection_probes_safe ({inj_safe})")
+            if inj_attempted == 0 or inj_failed > 0:
+                exp_inj_status = "INCOMPLETE"
+            elif inj_safe == inj_attempted:
+                exp_inj_status = "PASSED"
+            else:
+                exp_inj_status = "FAILED"
+            if t2.get("injection_override_gate_status") != exp_inj_status:
+                errors.append(f"tier2_triage injection_override_gate_status mismatch: expected {exp_inj_status!r}")
     else:
         if t2.get("injection_override_gate_status") != "SKIPPED":
             errors.append("tier2_triage disabled run must report injection_override_gate_status='SKIPPED'")
 
     # 6. Memory bounds and RSS parity
-    plateau_mb = mem.get("heap_alloc_plateau_mb", 0.0)
-    peak_mb = mem.get("heap_alloc_peak_mb", 0.0)
-    ceiling_mb = gates.get("memory_ceiling_mb", 256.0)
-    if not (0 < plateau_mb <= peak_mb):
-        errors.append(f"Memory heap invariant violated: plateau={plateau_mb}MB, peak={peak_mb}MB")
-    exp_heap_status = "PASSED" if plateau_mb <= ceiling_mb and peak_mb <= ceiling_mb else "MISSED TARGET"
-    if mem.get("heap_gate_status") != exp_heap_status:
-        errors.append(f"memory_profile heap_gate_status mismatch: expected {exp_heap_status!r}")
-
-    rss_kb = mem.get("rss_peak_kb", 0)
-    rss_mb = mem.get("rss_peak_mb", 0.0)
-    if rss_kb <= 0:
-        errors.append(f"rss_peak_kb must be positive, got {rss_kb}")
-    elif abs(round(rss_kb / 1024.0, 2) - rss_mb) > 0.05:
-        errors.append(f"rss_peak_mb mismatch: stored {rss_mb}, calculated {round(rss_kb / 1024.0, 2)}")
+    ceiling_mb = _req_num(gates, "memory_ceiling_mb", errors, "acceptance_gates")
+    plateau_mb = _req_num(mem, "heap_alloc_plateau_mb", errors, "memory_profile")
+    peak_mb = _req_num(mem, "heap_alloc_peak_mb", errors, "memory_profile")
+    rss_kb = _req_int(mem, "rss_peak_kb", errors, "memory_profile", min_val=1)
+    rss_mb = _req_num(mem, "rss_peak_mb", errors, "memory_profile")
+    if plateau_mb is not None and peak_mb is not None:
+        if not (0 < plateau_mb <= peak_mb):
+            errors.append(f"Memory heap invariant violated: plateau={plateau_mb}MB, peak={peak_mb}MB")
+        if ceiling_mb is not None:
+            exp_heap_status = "PASSED" if plateau_mb <= ceiling_mb and peak_mb <= ceiling_mb else "MISSED TARGET"
+            if mem.get("heap_gate_status") != exp_heap_status:
+                errors.append(f"memory_profile heap_gate_status mismatch: expected {exp_heap_status!r}")
+    if rss_kb is not None and rss_mb is not None:
+        if abs(round(rss_kb / 1024.0, 2) - rss_mb) > 0.05:
+            errors.append(f"rss_peak_mb mismatch: stored {rss_mb}, calculated {round(rss_kb / 1024.0, 2)}")
 
     # 7. Adversarial inline checks
-    adv_total = adv.get("total_checks", 0)
-    adv_passed = adv.get("passed_checks", 0)
-    adv_pct = adv.get("pass_rate_pct", 0.0)
-    if adv_total <= 0 or adv_passed < 0 or adv_passed > adv_total:
-        errors.append(f"adversarial_checks counts invalid: {adv_passed}/{adv_total}")
-    else:
-        calc_adv_pct = round(adv_passed * 100.0 / adv_total, 2)
-        if abs(calc_adv_pct - adv_pct) > 0.02:
-            errors.append(f"adversarial_checks pass_rate_pct mismatch: stored {adv_pct}, calculated {calc_adv_pct}")
-    exp_adv_status = "PASSED" if adv_pct >= gates.get("adversarial_pass_target_pct", 100.0) else "FAILED"
-    if adv.get("gate_status") != exp_adv_status:
-        errors.append(f"adversarial_checks gate_status mismatch: expected {exp_adv_status!r}")
+    adv_target = _req_num(gates, "adversarial_pass_target_pct", errors, "acceptance_gates")
+    adv_total = _req_int(adv, "total_checks", errors, "adversarial_checks", min_val=1)
+    adv_passed = _req_int(adv, "passed_checks", errors, "adversarial_checks", min_val=0)
+    adv_pct = _req_num(adv, "pass_rate_pct", errors, "adversarial_checks")
+    if adv_total is not None and adv_passed is not None and adv_pct is not None:
+        if adv_passed > adv_total:
+            errors.append(f"adversarial_checks passed_checks ({adv_passed}) > total_checks ({adv_total})")
+        else:
+            calc_adv_pct = round(adv_passed * 100.0 / adv_total, 2)
+            if abs(calc_adv_pct - adv_pct) > 0.02:
+                errors.append(f"adversarial_checks pass_rate_pct mismatch: stored {adv_pct}, calculated {calc_adv_pct}")
+            if adv_target is not None:
+                exp_adv_status = "PASSED" if calc_adv_pct >= adv_target else "FAILED"
+                if adv.get("gate_status") != exp_adv_status:
+                    errors.append(f"adversarial_checks gate_status mismatch: expected {exp_adv_status!r}")
 
-    # 8. Cross-verify against referenced Markdown benchmark report
+    # 8. Row-level labeled parity cross-check against referenced Markdown benchmark report
     report_rel = meta.get("report_markdown", "")
-    report_path = repo_root / report_rel if report_rel else None
+    report_path = repo_root / report_rel if isinstance(report_rel, str) and report_rel else None
     if not report_path or not report_path.is_file():
-        errors.append(f"Referenced markdown benchmark report not found: {report_rel}")
-    else:
+        errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
+    elif not errors:
         md_text = report_path.read_text(encoding="utf-8")
-        if "/Users/" in md_text:
-            errors.append(f"Markdown benchmark report {report_rel} contains leaked '/Users/' path")
-        expected_tokens = [
-            f"{stored_tps:.2f} lines/sec",
-            f"{stored_collapse:.2f}x",
-            f"{p50_us:.3f} us",
-            f"{p90_us:.3f} us",
-            f"{p99_us:.3f} us",
-            f"{det.get('precision', 0.0):.4f}",
-            f"{det.get('recall', 0.0):.4f}",
-            f"{det.get('f1_score', 0.0):.4f}",
-            f"{plateau_mb:.2f} MB",
-            f"{peak_mb:.2f} MB",
-            f"{rss_kb} KB",
-            f"{adv_passed}/{adv_total}",
+        if "/Users/" in md_text or "/home/" in md_text:
+            errors.append(f"Markdown benchmark report {report_rel} contains leaked personal host path")
+
+        expected_rows = [
+            f"| **Lines Written / Read** | `{lines_written}` written / `{lines_read}` read (`{lines_dropped}` dropped, digest matched=`{'true' if digest_matched else 'false'}`) | `{t0['lossless_gate_status']}` |",
+            f"| **Tier 0+1 Throughput** | `{stored_tps:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{t0['throughput_gate_status']}` |",
+            f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{stored_collapse:.2f}x` collapse, `{t0.get('clusters_active', 0)}` active clusters) | — |",
+            f"| **Latency P50 / P90 / P99 / Max** | `{p50_us:.3f} us` / `{p90_us:.3f} us` / `{p99_us:.3f} us` / `{max_us:.3f} us` | `{t1['p99_gate_status']}` |",
+            f"| **Precision / Recall / F1** | `{stored_prec:.4f}` / `{stored_rec:.4f}` / `{stored_f1:.4f}` (target F1 >= {f1_target:.2f}) | `{det['f1_gate_status']}` |",
+            f"| **Sampled Go Heap Plateau / Peak** | `{plateau_mb:.2f} MB` plateau / `{peak_mb:.2f} MB` sampled peak (ceiling `{ceiling_mb:.0f} MB`, method=`{mem.get('heap_sampling_method', '')}`) | `{mem['heap_gate_status']}` |",
+            f"| **Process Peak RSS** | `{rss_kb} KB` (`{rss_mb:.2f} MB`) | — |",
+            f"| **Adversarial Hostile-Log Self-Checks** | `{adv_passed}/{adv_total}` passed (`{adv_pct:.2f}%`) | `{adv['gate_status']}` |",
         ]
         if t2_enabled:
-            expected_tokens.extend([
-                f"{t2.get('p50_ms', 0.0):.3f} ms",
-                f"{t2.get('p99_ms', 0.0):.3f} ms",
-                f"{t2.get('injection_overrides_enforced', 0)}/{t2.get('injection_probes_tested', 0)}",
+            expected_rows.extend([
+                f"| **Inference Latency P50 / P90 / P99 / Max** | `{t2['p50_ms']:.3f} ms` / `{t2['p90_ms']:.3f} ms` / `{t2['p99_ms']:.3f} ms` / `{t2['max_ms']:.3f} ms` | — |",
+                f"| **Hostile Injection Safety** | `{t2['injection_probes_safe']}/{t2['injection_probes_attempted']}` safe non-benign verdicts (`{t2['injection_overrides_actual']}` actual overrides, `{t2['injection_probes_failed']}` failed) | `{t2['injection_override_gate_status']}` |",
             ])
-        for tok in expected_tokens:
-            if tok not in md_text:
-                errors.append(f"Benchmark JSON/Markdown parity error: token {tok!r} missing from {report_rel}")
+        for row in expected_rows:
+            if row not in md_text:
+                errors.append(f"Benchmark JSON/Markdown row parity error: expected row {row!r} missing from {report_rel}")
 
     return len(errors) == 0, errors
 
@@ -390,47 +477,97 @@ def independent_recompute_embedding_comparison(embedding_json_path: Path) -> tup
         return True, []
 
     raw = embedding_json_path.read_text(encoding="utf-8")
-    if "/Users/" in raw:
-        errors.append("Embedding comparison JSON contains leaked personal '/Users/' path")
+    if "/Users/" in raw or "/home/" in raw:
+        errors.append("Embedding comparison JSON contains leaked personal host path")
     try:
-        data = json.loads(raw)
+        data = _loads_strict_json(raw)
     except Exception as exc:
         return False, [f"Failed to parse {embedding_json_path}: {exc}"]
+    if not isinstance(data, dict):
+        return False, [f"Embedding comparison JSON root must be an object, got {type(data).__name__}"]
 
-    ds = data.get("dataset", {})
-    eval_total = ds.get("eval_total_windows", 0)
-    for key in ("pure_laplace_lk", "hybrid_laplace_lk_minilm"):
-        sec = data.get(key, {})
-        tp, fp, fn, tn = sec.get("tp", 0), sec.get("fp", 0), sec.get("fn", 0), sec.get("tn", 0)
-        if eval_total <= 0 or tp + fp + fn + tn != eval_total:
+    ds = _req_dict(data, "dataset", errors, "embedding_comparison")
+    lk = _req_dict(data, "pure_laplace_lk", errors, "embedding_comparison")
+    hyb = _req_dict(data, "hybrid_laplace_lk_minilm", errors, "embedding_comparison")
+    cmp_sec = _req_dict(data, "comparison", errors, "embedding_comparison")
+    if errors:
+        return False, errors
+
+    eval_total = _req_int(ds, "eval_total_windows", errors, "dataset", min_val=1)
+    eval_benign = _req_int(ds, "eval_benign_windows", errors, "dataset", min_val=0)
+    eval_struct = _req_int(ds, "eval_structural_attack_windows", errors, "dataset", min_val=0)
+    eval_disg = _req_int(ds, "eval_disguised_semantic_windows", errors, "dataset", min_val=0)
+    if None not in (eval_total, eval_benign, eval_struct, eval_disg):
+        eval_attacks = eval_struct + eval_disg
+        if eval_benign + eval_attacks != eval_total:
+            errors.append(
+                f"embedding_comparison dataset totals inconsistent: benign({eval_benign}) + attacks({eval_attacks}) != total({eval_total})"
+            )
+    else:
+        return False, errors
+
+    recomputed: dict[str, dict[str, float | int]] = {}
+    for key, sec in (("pure_laplace_lk", lk), ("hybrid_laplace_lk_minilm", hyb)):
+        tp = _req_int(sec, "tp", errors, key, min_val=0)
+        fp = _req_int(sec, "fp", errors, key, min_val=0)
+        fn = _req_int(sec, "fn", errors, key, min_val=0)
+        tn = _req_int(sec, "tn", errors, key, min_val=0)
+        struct_tp = _req_int(sec, "structural_tp", errors, key, min_val=0)
+        disg_tp = _req_int(sec, "disguised_semantic_tp", errors, key, min_val=0)
+        stored_prec = _req_num(sec, "precision", errors, key)
+        stored_rec = _req_num(sec, "recall", errors, key)
+        stored_f1 = _req_num(sec, "f1", errors, key)
+        stored_struct_rec = _req_num(sec, "structural_recall", errors, key)
+        stored_disg_rec = _req_num(sec, "disguised_semantic_recall", errors, key)
+        p50 = _req_num(sec, "latency_p50_ms", errors, key)
+        p99 = _req_num(sec, "latency_p99_ms", errors, key)
+        if None in (tp, fp, fn, tn, struct_tp, disg_tp, stored_prec, stored_rec, stored_f1, stored_struct_rec, stored_disg_rec, p50, p99):
+            continue
+
+        if tp + fp + fn + tn != eval_total:
             errors.append(f"embedding_comparison {key}: confusion sum {tp + fp + fn + tn} != eval_total {eval_total}")
+        if tp + fn != eval_attacks:
+            errors.append(f"embedding_comparison {key}: tp+fn ({tp + fn}) != attack windows ({eval_attacks})")
+        if tn + fp != eval_benign:
+            errors.append(f"embedding_comparison {key}: tn+fp ({tn + fp}) != benign windows ({eval_benign})")
+        if struct_tp + disg_tp != tp:
+            errors.append(f"embedding_comparison {key}: structural_tp({struct_tp}) + disguised_semantic_tp({disg_tp}) != tp({tp})")
+        if struct_tp > eval_struct or disg_tp > eval_disg:
+            errors.append(f"embedding_comparison {key}: subgroup tp exceeds subgroup window count")
+
         prec = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
         rec = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
-        f1 = round((2 * prec * rec) / (prec + rec), 4) if (prec + rec) > 0 else 0.0
-        if abs(prec - sec.get("precision", -1.0)) > 0.0005:
-            errors.append(f"embedding_comparison {key} precision mismatch: stored {sec.get('precision')}, calc {prec}")
-        if abs(rec - sec.get("recall", -1.0)) > 0.0005:
-            errors.append(f"embedding_comparison {key} recall mismatch: stored {sec.get('recall')}, calc {rec}")
-        if abs(f1 - sec.get("f1", -1.0)) > 0.0005:
-            errors.append(f"embedding_comparison {key} f1 mismatch: stored {sec.get('f1')}, calc {f1}")
-        p50 = sec.get("latency_p50_ms", 0.0)
-        p99 = sec.get("latency_p99_ms", 0.0)
+        f1 = round((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
+        struct_rec = round(struct_tp / max(eval_struct, 1), 4)
+        disg_rec = round(disg_tp / max(eval_disg, 1), 4)
+        if abs(prec - stored_prec) > 0.0005:
+            errors.append(f"embedding_comparison {key} precision mismatch: stored {stored_prec}, calc {prec}")
+        if abs(rec - stored_rec) > 0.0005:
+            errors.append(f"embedding_comparison {key} recall mismatch: stored {stored_rec}, calc {rec}")
+        if abs(f1 - stored_f1) > 0.0005:
+            errors.append(f"embedding_comparison {key} f1 mismatch: stored {stored_f1}, calc {f1}")
+        if abs(struct_rec - stored_struct_rec) > 0.0005:
+            errors.append(f"embedding_comparison {key} structural_recall mismatch: stored {stored_struct_rec}, calc {struct_rec}")
+        if abs(disg_rec - stored_disg_rec) > 0.0005:
+            errors.append(f"embedding_comparison {key} disguised_semantic_recall mismatch: stored {stored_disg_rec}, calc {disg_rec}")
         if not (0 < p50 <= p99):
             errors.append(f"embedding_comparison {key} latency ordering invalid: p50={p50}, p99={p99}")
+        recomputed[key] = {"f1": f1, "disg_rec": disg_rec, "fp": fp}
 
-    lk = data.get("pure_laplace_lk", {})
-    hyb = data.get("hybrid_laplace_lk_minilm", {})
-    cmp_sec = data.get("comparison", {})
-    exp_f1_delta = round(hyb.get("f1", 0.0) - lk.get("f1", 0.0), 4)
-    if abs(exp_f1_delta - cmp_sec.get("f1_delta", -99.0)) > 0.0005:
-        errors.append(f"embedding_comparison f1_delta mismatch: stored {cmp_sec.get('f1_delta')}, calc {exp_f1_delta}")
-
-    exp_disg_delta = round(hyb.get("disguised_semantic_recall", 0.0) - lk.get("disguised_semantic_recall", 0.0), 4)
-    if abs(exp_disg_delta - cmp_sec.get("disguised_semantic_recall_delta", -99.0)) > 0.0005:
-        errors.append(
-            f"embedding_comparison disguised_semantic_recall_delta mismatch: "
-            f"stored {cmp_sec.get('disguised_semantic_recall_delta')}, calc {exp_disg_delta}"
-        )
+    if "pure_laplace_lk" in recomputed and "hybrid_laplace_lk_minilm" in recomputed:
+        stored_f1_delta = _req_num(cmp_sec, "f1_delta", errors, "comparison")
+        stored_disg_delta = _req_num(cmp_sec, "disguised_semantic_recall_delta", errors, "comparison")
+        if stored_f1_delta is not None:
+            exp_f1_delta = round(recomputed["hybrid_laplace_lk_minilm"]["f1"] - recomputed["pure_laplace_lk"]["f1"], 4)
+            if abs(exp_f1_delta - stored_f1_delta) > 0.0005:
+                errors.append(f"embedding_comparison f1_delta mismatch: stored {stored_f1_delta}, calc {exp_f1_delta}")
+        if stored_disg_delta is not None:
+            exp_disg_delta = round(recomputed["hybrid_laplace_lk_minilm"]["disg_rec"] - recomputed["pure_laplace_lk"]["disg_rec"], 4)
+            if abs(exp_disg_delta - stored_disg_delta) > 0.0005:
+                errors.append(
+                    f"embedding_comparison disguised_semantic_recall_delta mismatch: "
+                    f"stored {stored_disg_delta}, calc {exp_disg_delta}"
+                )
 
     return len(errors) == 0, errors
 

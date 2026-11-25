@@ -343,7 +343,19 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
         ),
         (
             "github.com/knowthankyew/genesis-sentinel/cmd/sentinel-bench",
-            "TestBenchmarkRejectsBitNetModel",
+            "TestRunBenchmarksLiveTier2OverrideAccountingAndFailedProbeGate",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/cmd/sentinel-bench",
+            "TestBenchmarkRejectsBitNetModelAndExternalReportPath",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/template",
+            "TestDrainLeafCapPreservesExistingMatchesAndOverflowsExcess",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/rules",
+            "TestRuleLiteralPrefilterMatchesRawRE2Soundness",
         ),
         (
             "github.com/knowthankyew/genesis-sentinel/internal/triage",
@@ -375,6 +387,8 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/config",
             "./internal/cli",
             "./internal/pipeline",
+            "./internal/rules",
+            "./internal/template",
             "./internal/triage",
             "./internal/feedback",
             "./internal/train",

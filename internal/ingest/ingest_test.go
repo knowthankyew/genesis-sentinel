@@ -809,3 +809,51 @@ func TestSegReaderQuietIncompleteCandidateForwardScanAndParseFailureBudget(t *te
 		t.Fatalf("expected 00000000.seg to be excluded from discovery, got ids=%v err=%v", ids8, err)
 	}
 }
+
+func TestSegReaderScratchBufferDoesNotAliasEvents(t *testing.T) {
+	segDir := t.TempDir()
+	segPath := filepath.Join(segDir, "00000001.seg")
+	f, err := os.Create(segPath)
+	if err != nil {
+		t.Fatalf("create seg: %v", err)
+	}
+	frames := []string{
+		`{"timestamp":1700000001,"service":"alpha","level":"INFO","trace_id":"t-1","message":"first-payload-aaaa"}`,
+		`{"timestamp":1700000002,"service":"bravo","level":"WARN","trace_id":"t-2","message":"secnd-payload-bbbb"}`,
+		`1700000003|charlie|ERROR|t-3|third-payload-cccc`,
+		`plain-fourth-payload-dddd`,
+	}
+	for _, raw := range frames {
+		if err := WriteSegmentFrame(f, []byte(raw)); err != nil {
+			_ = f.Close()
+			t.Fatalf("write frame: %v", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close seg: %v", err)
+	}
+
+	r, err := NewSegReader(segDir, "", 0)
+	if err != nil {
+		t.Fatalf("NewSegReader: %v", err)
+	}
+	evs, err := r.ReadBatch(10)
+	if err != nil {
+		t.Fatalf("ReadBatch: %v", err)
+	}
+	if len(evs) != len(frames) {
+		t.Fatalf("expected %d events, got %d", len(frames), len(evs))
+	}
+	if evs[0].Service != "alpha" || evs[0].Message != "first-payload-aaaa" {
+		t.Fatalf("frame 0 aliased/corrupted by subsequent scratch writes: %+v", evs[0])
+	}
+	if evs[1].Service != "bravo" || evs[1].Message != "secnd-payload-bbbb" {
+		t.Fatalf("frame 1 aliased/corrupted: %+v", evs[1])
+	}
+	if evs[2].Service != "charlie" || evs[2].Message != "third-payload-cccc" {
+		t.Fatalf("frame 2 aliased/corrupted: %+v", evs[2])
+	}
+	if evs[3].Message != "plain-fourth-payload-dddd" {
+		t.Fatalf("frame 3 aliased/corrupted: %+v", evs[3])
+	}
+}

@@ -284,7 +284,7 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok4)
             self.assertTrue(any("/Users/" in e for e in errs4), errs4)
 
-            # 5. Tampered embedding comparison F1 delta
+            # 5. Tampered embedding comparison F1 delta & subgroup recall
             emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
             if emb_json.is_file():
                 bad_emb = json.loads(emb_json.read_text(encoding="utf-8"))
@@ -294,6 +294,57 @@ class TestClaimsLinter(unittest.TestCase):
                 ok5, errs5 = sync_docs.independent_recompute_embedding_comparison(p5)
                 self.assertFalse(ok5)
                 self.assertTrue(any("f1_delta mismatch" in e for e in errs5), errs5)
+
+                # Tampering subgroup recall and matching delta must STILL fail against subgroup_tp!
+                bad_sub = json.loads(emb_json.read_text(encoding="utf-8"))
+                bad_sub["pure_laplace_lk"]["disguised_semantic_recall"] = 0.5
+                bad_sub["comparison"]["disguised_semantic_recall_delta"] = round(
+                    bad_sub["hybrid_laplace_lk_minilm"]["disguised_semantic_recall"] - 0.5, 4
+                )
+                p_sub = tmp_root / "bad_sub.json"
+                p_sub.write_text(json.dumps(bad_sub), encoding="utf-8")
+                ok_sub, errs_sub = sync_docs.independent_recompute_embedding_comparison(p_sub)
+                self.assertFalse(ok_sub)
+                self.assertTrue(any("disguised_semantic_recall mismatch" in e for e in errs_sub), errs_sub)
+
+                # Non-finite NaN constant in embedding JSON must be rejected!
+                p_emb_nan = tmp_root / "emb_nan.json"
+                p_emb_nan.write_text(emb_json.read_text(encoding="utf-8").replace('"f1_delta": 0.25', '"f1_delta": NaN'), encoding="utf-8")
+                ok_en, errs_en = sync_docs.independent_recompute_embedding_comparison(p_emb_nan)
+                self.assertFalse(ok_en, f"Expected NaN rejection in embedding JSON, got {errs_en}")
+
+            # 6. Non-finite NaN constant and malformed top-level/field types in benchmark JSON
+            p_nan = tmp_root / "bench_nan.json"
+            p_nan.write_text(bench_json.read_text(encoding="utf-8").replace('"separation_nats":', '"separation_nats": NaN, "_ignored":'), encoding="utf-8")
+            ok_nan, _ = sync_docs.independent_recompute_metrics(p_nan, repo_root=tmp_root)
+            self.assertFalse(ok_nan)
+
+            p_list = tmp_root / "bench_list.json"
+            p_list.write_text("[]", encoding="utf-8")
+            ok_list, errs_list = sync_docs.independent_recompute_metrics(p_list, repo_root=tmp_root)
+            self.assertFalse(ok_list)
+            self.assertTrue(any("must be an object" in e for e in errs_list), errs_list)
+
+            bad_type = json.loads(json.dumps(base_data))
+            bad_type["tier0_replay"]["lines_read"] = "100000"
+            p_type = tmp_root / "bad_type.json"
+            p_type.write_text(json.dumps(bad_type), encoding="utf-8")
+            ok_type, errs_type = sync_docs.independent_recompute_metrics(p_type, repo_root=tmp_root)
+            self.assertFalse(ok_type)
+            self.assertTrue(any("must be an integer" in e for e in errs_type), errs_type)
+
+            # 7. Boundary throughput status must use RECOMPUTED throughput (49999.99 < 50000 -> MISSED TARGET)
+            boundary = json.loads(json.dumps(base_data))
+            boundary["tier0_replay"]["lines_written"] = 4999999
+            boundary["tier0_replay"]["lines_read"] = 4999999
+            boundary["tier0_replay"]["duration_seconds"] = 100.0
+            boundary["tier0_replay"]["throughput_lps"] = 50000.00
+            boundary["tier0_replay"]["throughput_gate_status"] = "PASSED"
+            p_bnd = tmp_root / "boundary_tps.json"
+            p_bnd.write_text(json.dumps(boundary), encoding="utf-8")
+            ok_bnd, errs_bnd = sync_docs.independent_recompute_metrics(p_bnd, repo_root=tmp_root)
+            self.assertFalse(ok_bnd)
+            self.assertTrue(any("throughput_gate_status mismatch" in e for e in errs_bnd), errs_bnd)
 
 
 if __name__ == "__main__":

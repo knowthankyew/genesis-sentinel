@@ -290,14 +290,22 @@ func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bo
 }
 
 // DetectInjectionSignals inspects raw untrusted log text for chat-template delimiters
-// and semantic prompt-injection cues without allocating a sanitized copy of the string.
+// and semantic prompt-injection cues without allocating a sanitized copy on clean ASCII inputs.
+// Unsafe control characters are normalized before inspection so control-split tokens
+// (e.g. "[IN\u0085ST]" or "<|im_\x00end|>") cannot evade detection.
 func DetectInjectionSignals(raw string) []string {
+	norm := stripUnsafeControlRunes(raw)
+	return detectInjectionSignalsNormalized(norm)
+}
+
+func detectInjectionSignalsNormalized(norm string) []string {
 	var signals []string
-	if hasSpecialTemplateDelimiter(raw) {
+	if hasSpecialTemplateDelimiter(norm) {
 		signals = append(signals, "template_delimiter_escape")
 	}
+	pureASCII := isPureASCII(norm)
 	for _, h := range injectionHeuristics {
-		if maybeMatchesHeuristic(h.name, raw) && h.re.MatchString(raw) {
+		if (!pureASCII || maybeMatchesHeuristic(h.name, norm)) && h.re.MatchString(norm) {
 			signals = append(signals, h.name)
 		}
 	}
@@ -314,7 +322,58 @@ func hasSpecialTemplateDelimiter(raw string) bool {
 	if (strings.Contains(raw, "SYS>>") || strings.Contains(raw, "INST]")) && llamaInstPattern.MatchString(raw) {
 		return true
 	}
+	if strings.Contains(raw, "<s>") || strings.Contains(raw, "</s>") {
+		return true
+	}
 	return false
+}
+
+func isPureASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func stripUnsafeControlRunes(raw string) string {
+	cleanASCII := true
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c < 0x20 && c != '\n' && c != '\t') || c >= 0x7f {
+			cleanASCII = false
+			break
+		}
+	}
+	if cleanASCII {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if r == '\r' {
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			r = ' '
+		} else if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f) || isBidiControlRune(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func maybeMatchesHeuristic(name, raw string) bool {
@@ -373,87 +432,58 @@ func containsASCIIFold(s, lowerNeedle string) bool {
 	return false
 }
 
-// SanitizeUntrustedLogText neutralizes chat-template delimiters and unsafe control bytes
-// in untrusted log payloads before they are embedded in Tier 2 triage prompts.
-// It also returns any detected prompt-injection heuristic signal names.
+// SanitizeUntrustedLogText strips unsafe control bytes first (preventing control-split
+// token reassembly such as "[IN\u0085ST]" or "<|im_\x00end|>"), detects prompt-injection
+// signals, neutralizes chat-template delimiters, and enforces maxBytes on a UTF-8 boundary.
 func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	if maxBytes <= 0 {
 		maxBytes = 2048
 	}
 
-	// Detect adversarial injection patterns before rewriting delimiters.
-	signals := DetectInjectionSignals(raw)
+	// 1. Strip unsafe ASCII/C1/BiDi controls and flatten U+2028/U+2029 BEFORE delimiter detection
+	// and neutralization so stripping controls can never reassemble a live delimiter token.
+	cleaned := stripUnsafeControlRunes(raw)
 
-	// Neutralize model control tokens only when candidate markers appear.
-	cleaned := raw
-	if strings.Contains(cleaned, "<|") {
-		cleaned = specialTokenPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
-			inner := tok[2 : len(tok)-2]
-			return "[" + inner + "]"
-		})
-	}
-	if strings.Contains(cleaned, "_of_turn>") {
-		cleaned = gemmaTurnPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
-			inner := tok[1 : len(tok)-1]
-			return "[" + inner + "]"
-		})
-	}
-	if strings.Contains(cleaned, "SYS>>") || strings.Contains(cleaned, "INST]") {
-		cleaned = llamaInstPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
-			switch tok {
-			case "<<SYS>>":
-				return "(SYS)"
-			case "<</SYS>>":
-				return "(/SYS)"
-			case "[INST]":
-				return "(INST)"
-			case "[/INST]":
-				return "(/INST)"
-			default:
-				return "[delim]"
-			}
-		})
-	}
-	if strings.Contains(cleaned, "<") {
-		cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
-		cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
-	}
+	// 2. Detect adversarial injection patterns on the control-normalized text.
+	signals := detectInjectionSignalsNormalized(cleaned)
 
-	// Fast path: if cleaned is already printable ASCII (+ \n/\t) within maxBytes, avoid copying.
-	if len(cleaned) <= maxBytes {
-		cleanASCII := true
-		for i := 0; i < len(cleaned); i++ {
-			c := cleaned[i]
-			if (c < 0x20 && c != '\n' && c != '\t') || c >= 0x7f {
-				cleanASCII = false
-				break
-			}
+	// 3. Neutralize model control tokens (bounded multi-pass to prevent nested reassembly).
+	for pass := 0; pass < 3 && hasSpecialTemplateDelimiter(cleaned); pass++ {
+		if strings.Contains(cleaned, "<|") {
+			cleaned = specialTokenPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+				inner := tok[2 : len(tok)-2]
+				return "[" + inner + "]"
+			})
 		}
-		if cleanASCII {
-			return cleaned, signals
+		if strings.Contains(cleaned, "_of_turn>") {
+			cleaned = gemmaTurnPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+				inner := tok[1 : len(tok)-1]
+				return "[" + inner + "]"
+			})
+		}
+		if strings.Contains(cleaned, "SYS>>") || strings.Contains(cleaned, "INST]") {
+			cleaned = llamaInstPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+				switch tok {
+				case "<<SYS>>":
+					return "(SYS)"
+				case "<</SYS>>":
+					return "(/SYS)"
+				case "[INST]":
+					return "(INST)"
+				case "[/INST]":
+					return "(/INST)"
+				default:
+					return "[delim]"
+				}
+			})
+		}
+		if strings.Contains(cleaned, "<s>") || strings.Contains(cleaned, "</s>") {
+			cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
+			cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
 		}
 	}
 
-	// Strip non-printable ASCII/C1 control characters (except horizontal tab and newline),
-	// Unicode line/paragraph separators (flattened to space), and BiDi override/isolate controls.
-	var b strings.Builder
-	b.Grow(min(len(cleaned), maxBytes))
-	for _, r := range cleaned {
-		if r == '\r' {
-			continue
-		}
-		if r == '\u2028' || r == '\u2029' {
-			r = ' '
-		} else if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f) || isBidiControlRune(r) {
-			continue
-		}
-		if b.Len()+utf8.RuneLen(r) > maxBytes {
-			break
-		}
-		b.WriteRune(r)
-	}
-
-	return b.String(), signals
+	return truncateUTF8Bytes(cleaned, maxBytes), signals
 }
 
 func isBidiControlRune(r rune) bool {

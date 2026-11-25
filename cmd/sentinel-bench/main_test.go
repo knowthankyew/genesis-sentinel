@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,8 +33,8 @@ func TestRunBenchmarksOfflineAndMarkdownParity(t *testing.T) {
 	}
 	report.Metadata.ReportMarkdown = "docs/benchmarks/test-report.md"
 
-	if report.Tier0Replay.LinesRead != 2000 || report.Tier0Replay.LinesDropped != 0 {
-		t.Fatalf("unexpected Tier 0 counts: %+v", report.Tier0Replay)
+	if report.Tier0Replay.LinesRead != 2000 || report.Tier0Replay.LinesDropped != 0 || !report.Tier0Replay.ContentDigestMatched {
+		t.Fatalf("unexpected Tier 0 lossless result: %+v", report.Tier0Replay)
 	}
 	if report.Tier0Replay.LosslessGateStatus != "PASSED" {
 		t.Fatalf("expected lossless PASSED, got %q", report.Tier0Replay.LosslessGateStatus)
@@ -67,33 +70,54 @@ func TestRunBenchmarksOfflineAndMarkdownParity(t *testing.T) {
 		t.Fatal("written benchmark JSON leaked /Users/ path")
 	}
 
-	md := RenderMarkdownReport(report)
+	var decoded BenchmarkReport
+	if err := json.Unmarshal(rawJSON, &decoded); err != nil {
+		t.Fatalf("decode written JSON: %v", err)
+	}
+
+	md := RenderMarkdownReport(decoded)
 	if strings.Contains(md, "/Users/") {
 		t.Fatal("rendered Markdown report leaked /Users/ path")
 	}
-	for _, want := range []string{
-		report.Metadata.SentinelVersion,
-		report.Tier0Replay.ThroughputGateStatus,
-		report.Tier1Surprisal.P99GateStatus,
-		report.DetectionAccuracy.F1GateStatus,
-		report.MemoryProfile.HeapGateStatus,
-		report.AdversarialChecks.GateStatus,
-	} {
-		if !strings.Contains(md, want) {
-			t.Errorf("rendered Markdown missing expected token %q", want)
+
+	// Verify row-level parity between decoded JSON fields and their labeled Markdown rows
+	// (distinct values prevent swapped metrics or mismatched gates from passing).
+	wantRows := []string{
+		fmt.Sprintf("| **Lines Written / Read** | `%d` written / `%d` read (`%d` dropped, digest matched=`%t`) | `%s` |",
+			decoded.Tier0Replay.LinesWritten, decoded.Tier0Replay.LinesRead, decoded.Tier0Replay.LinesDropped, decoded.Tier0Replay.ContentDigestMatched, decoded.Tier0Replay.LosslessGateStatus),
+		fmt.Sprintf("| **Tier 0+1 Throughput** | `%.2f lines/sec` (target >= %.0f lines/sec) | `%s` |",
+			decoded.Tier0Replay.ThroughputLPS, decoded.AcceptanceGates.ThroughputTargetLPS, decoded.Tier0Replay.ThroughputGateStatus),
+		fmt.Sprintf("| **Latency P50 / P90 / P99 / Max** | `%.3f us` / `%.3f us` / `%.3f us` / `%.3f us` | `%s` |",
+			decoded.Tier1Surprisal.P50US, decoded.Tier1Surprisal.P90US, decoded.Tier1Surprisal.P99US, decoded.Tier1Surprisal.MaxUS, decoded.Tier1Surprisal.P99GateStatus),
+		fmt.Sprintf("| **Precision / Recall / F1** | `%.4f` / `%.4f` / `%.4f` (target F1 >= %.2f) | `%s` |",
+			decoded.DetectionAccuracy.Precision, decoded.DetectionAccuracy.Recall, decoded.DetectionAccuracy.F1Score, decoded.AcceptanceGates.DetectionF1Target, decoded.DetectionAccuracy.F1GateStatus),
+		fmt.Sprintf("| **Sampled Go Heap Plateau / Peak** | `%.2f MB` plateau / `%.2f MB` sampled peak (ceiling `%.0f MB`, method=`%s`) | `%s` |",
+			decoded.MemoryProfile.HeapAllocPlateauMB, decoded.MemoryProfile.HeapAllocPeakMB, decoded.AcceptanceGates.MemoryCeilingMB, decoded.MemoryProfile.HeapSamplingMethod, decoded.MemoryProfile.HeapGateStatus),
+		fmt.Sprintf("| **Adversarial Hostile-Log Self-Checks** | `%d/%d` passed (`%.2f%%`) | `%s` |",
+			decoded.AdversarialChecks.PassedChecks, decoded.AdversarialChecks.TotalChecks, decoded.AdversarialChecks.PassRatePct, decoded.AdversarialChecks.GateStatus),
+	}
+	for _, row := range wantRows {
+		if !strings.Contains(md, row) {
+			t.Errorf("Markdown row parity mismatch; expected exact row:\n  %s", row)
 		}
+	}
+
+	// Verify unrounded confusion-matrix F1 calculation on a rounding-sensitive case (TP=81, FP=11, FN=19 -> 162/192 = 0.8438).
+	prec, rec, f1 := computeConfusionMetrics(81, 11, 19)
+	if prec != 0.8804 || rec != 0.81 || f1 != 0.8438 {
+		t.Fatalf("computeConfusionMetrics(81,11,19) = (%.4f, %.4f, %.4f), want (0.8804, 0.8100, 0.8438)", prec, rec, f1)
 	}
 }
 
-func TestRunBenchmarksLiveTier2MockAndInjectionOverride(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestRunBenchmarksLiveTier2OverrideAccountingAndFailedProbeGate(t *testing.T) {
+	// 1. Coerced BENIGN-NOISE server: must record 1 actual override and 1 safe verdict -> PASSED.
+	coercedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case "/api/v1/inference/generate":
 			w.Header().Set("Content-Type", "application/json")
-			// Always try to return BENIGN-NOISE so we verify fail-closed override during benchmark!
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"completion": "[BENIGN-NOISE] severity=LOW mitre=NONE explanation=mocked",
 				"model":      model.ModelSmolLM2135MInstruct,
@@ -103,31 +127,112 @@ func TestRunBenchmarksLiveTier2MockAndInjectionOverride(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
+	defer coercedSrv.Close()
 
-	report, err := runBenchmarks(benchOptions{
+	repCoerced, err := runBenchmarks(benchOptions{
 		lines:          500,
 		windowEvents:   250,
 		surprisalEvals: 50,
 		baselineSize:   100,
 		seed:           42,
-		inferenceHTTP:  srv.URL,
+		inferenceHTTP:  coercedSrv.URL,
 		baseModel:      model.ModelSmolLM2135MInstruct,
 		triageSamples:  4,
 		triageTimeout:  5 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("live mock runBenchmarks failed: %v", err)
+		t.Fatalf("coerced live mock failed: %v", err)
 	}
-	if !report.Tier2Triage.Enabled || report.Tier2Triage.SamplesEvaluated != 4 {
-		t.Fatalf("unexpected Tier 2 results: %+v", report.Tier2Triage)
+	if repCoerced.Tier2Triage.InjectionProbesAttempted != 1 || repCoerced.Tier2Triage.InjectionProbesSafe != 1 ||
+		repCoerced.Tier2Triage.InjectionOverridesActual != 1 || repCoerced.Tier2Triage.InjectionOverrideGateStatus != "PASSED" {
+		t.Fatalf("unexpected coerced override accounting: %+v", repCoerced.Tier2Triage)
 	}
-	if report.Tier2Triage.InjectionProbesTested != 1 || report.Tier2Triage.InjectionOverridesEnforced != 1 || report.Tier2Triage.InjectionOverrideGateStatus != "PASSED" {
-		t.Fatalf("expected injection override PASSED on coerced mock server, got %+v", report.Tier2Triage)
+
+	// 2. Non-benign model server: safe verdict without actual override (actual=0, safe=1, gate=PASSED).
+	nonBenignSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/api/v1/inference/generate":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"completion": "[INJECTION-ATTEMPT] severity=CRITICAL mitre=TA0001 explanation=detected",
+				"model":      model.ModelSmolLM2135MInstruct,
+				"adapter":    "base",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer nonBenignSrv.Close()
+
+	repNonBenign, err := runBenchmarks(benchOptions{
+		lines:          200,
+		windowEvents:   100,
+		surprisalEvals: 20,
+		baselineSize:   50,
+		seed:           42,
+		inferenceHTTP:  nonBenignSrv.URL,
+		baseModel:      model.ModelSmolLM2135MInstruct,
+		triageSamples:  4,
+		triageTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("non-benign live mock failed: %v", err)
+	}
+	if repNonBenign.Tier2Triage.InjectionProbesAttempted != 1 || repNonBenign.Tier2Triage.InjectionProbesSafe != 1 ||
+		repNonBenign.Tier2Triage.InjectionOverridesActual != 0 || repNonBenign.Tier2Triage.InjectionOverrideGateStatus != "PASSED" {
+		t.Fatalf("expected actual=0 and safe=1 on non-benign response, got %+v", repNonBenign.Tier2Triage)
+	}
+
+	// 3. Failing injection probe: the second injection probe (9th call including warmup, after the first
+	// injection probe succeeded) returns HTTP 500 -> gate must be INCOMPLETE (not 1/1 PASSED)!
+	var callNum atomic.Int32
+	flakySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/api/v1/inference/generate":
+			n := callNum.Add(1)
+			if n == 9 { // warmup=1, samples 0..6 = calls 2..8, sample 7 (2nd injection probe) = call 9
+				http.Error(w, "simulated timeout/error", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"completion": "[INJECTION-ATTEMPT] severity=HIGH mitre=TA0001 explanation=ok",
+				"model":      model.ModelSmolLM2135MInstruct,
+				"adapter":    "base",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer flakySrv.Close()
+
+	repFlaky, err := runBenchmarks(benchOptions{
+		lines:          200,
+		windowEvents:   100,
+		surprisalEvals: 20,
+		baselineSize:   50,
+		seed:           42,
+		inferenceHTTP:  flakySrv.URL,
+		baseModel:      model.ModelSmolLM2135MInstruct,
+		triageSamples:  8,
+		triageTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("flaky live mock failed: %v", err)
+	}
+	if repFlaky.Tier2Triage.InjectionProbesAttempted != 2 || repFlaky.Tier2Triage.InjectionProbesSafe != 1 ||
+		repFlaky.Tier2Triage.InjectionProbesFailed != 1 || repFlaky.Tier2Triage.InjectionOverrideGateStatus != "INCOMPLETE" {
+		t.Fatalf("expected INCOMPLETE gate (attempted=2, safe=1, failed=1), got %+v", repFlaky.Tier2Triage)
 	}
 }
 
-func TestBenchmarkRejectsBitNetModel(t *testing.T) {
+func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 	_, err := runBenchmarks(benchOptions{
 		lines:          100,
 		windowEvents:   50,
@@ -136,7 +241,12 @@ func TestBenchmarkRejectsBitNetModel(t *testing.T) {
 		seed:           42,
 		baseModel:      "microsoft/BitNet-b1.58-2B-4T",
 	})
-	if err == nil {
-		t.Fatal("expected runBenchmarks to reject excluded BitNet model")
+	if !errors.Is(err, model.ErrExperimentalModelExcluded) {
+		t.Fatalf("expected ErrExperimentalModelExcluded for BitNet model, got %v", err)
+	}
+
+	extPath := filepath.Join(t.TempDir(), "outside.md")
+	if _, relErr := resolveReportMarkdownPath(extPath, true); relErr == nil {
+		t.Fatalf("expected external --out-md %q to be rejected when publishing JSON", extPath)
 	}
 }
