@@ -1240,6 +1240,16 @@ func writeJSONReport(path string, r BenchmarkReport) error {
 // publishReportPair stages both Markdown and JSON artifacts before replacing either destination
 // and restores any previous Markdown file if JSON replacement fails, preserving prior pair parity.
 func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkReport) error {
+	if outMD != "" && outJSON != "" {
+		sameDest, err := sameDestinationPath(outMD, outJSON)
+		if err != nil {
+			return fmt.Errorf("validate output destinations: %w", err)
+		}
+		if sameDest {
+			return fmt.Errorf("refusing to publish markdown and json reports to the same destination (%q and %q)", outMD, outJSON)
+		}
+	}
+
 	var jsonBytes []byte
 	if outJSON != "" {
 		var err error
@@ -1267,12 +1277,20 @@ func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkRe
 	}()
 
 	if outMD != "" {
-		if fi, statErr := os.Stat(outMD); statErr == nil && fi.Mode().IsRegular() {
-			if orig, readErr := os.ReadFile(outMD); readErr == nil {
-				prevMD = orig
-				hadPrevMD = true
-				prevMDMode = fi.Mode().Perm()
+		fi, statErr := os.Stat(outMD)
+		if statErr == nil {
+			if !fi.Mode().IsRegular() {
+				return fmt.Errorf("markdown report destination %q exists and is not a regular file", outMD)
 			}
+			orig, readErr := os.ReadFile(outMD)
+			if readErr != nil {
+				return fmt.Errorf("backup existing markdown report %q before replacement: %w", outMD, readErr)
+			}
+			prevMD = orig
+			hadPrevMD = true
+			prevMDMode = fi.Mode().Perm()
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("stat existing markdown report %q: %w", outMD, statErr)
 		}
 		var err error
 		mdTmp, err = stageTempFile(outMD, mdBytes, 0644)
@@ -1309,6 +1327,34 @@ func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkRe
 		jsonTmp = ""
 	}
 	return nil
+}
+
+func sameDestinationPath(a, b string) (bool, error) {
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	if absA == absB {
+		return true, nil
+	}
+	// Resolve existing symlinks on parent directories when available to catch symlinked aliases.
+	if dirA, err := filepath.EvalSymlinks(filepath.Dir(absA)); err == nil {
+		if dirB, err := filepath.EvalSymlinks(filepath.Dir(absB)); err == nil {
+			if filepath.Join(dirA, filepath.Base(absA)) == filepath.Join(dirB, filepath.Base(absB)) {
+				return true, nil
+			}
+		}
+	}
+	if fiA, errA := os.Stat(absA); errA == nil {
+		if fiB, errB := os.Stat(absB); errB == nil && os.SameFile(fiA, fiB) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func stageTempFile(path string, data []byte, perm os.FileMode) (string, error) {

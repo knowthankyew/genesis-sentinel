@@ -6,6 +6,21 @@
 # For host-native Genesis deployments on 127.0.0.1:9000, use deploy/systemd or deploy/launchd.
 
 services:
+  init-volumes:
+    # One-shot volume permission initializer: distroless static-debian12:nonroot images do not
+    # pre-create /var/lib/genesis, so fresh Docker named volumes default to root:root 0755.
+    # Establish 65532:65532 ownership once before Genesis and Sentinel start.
+    image: alpine:3.20
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - chown 65532:65532 /var/lib/genesis /var/lib/genesis-sentinel && chmod 0750 /var/lib/genesis && chmod 0700 /var/lib/genesis-sentinel
+    volumes:
+      - genesis-segs:/var/lib/genesis
+      - sentinel-state:/var/lib/genesis-sentinel
+    restart: "no"
+
   genesis:
     image: ghcr.io/knowthankyew/genesis:latest
     # Match distroless static-debian12 nonroot UID/GID (65532:65532) across both containers
@@ -24,6 +39,9 @@ services:
       - GENESIS_ALLOW_ALL_INTERFACES=true
     volumes:
       - genesis-segs:/var/lib/genesis
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
     networks:
       - sentinel-local
     security_opt:
@@ -56,7 +74,10 @@ services:
       - genesis-segs:/var/lib/genesis:ro
       - sentinel-state:/var/lib/genesis-sentinel
     depends_on:
-      - genesis
+      init-volumes:
+        condition: service_completed_successfully
+      genesis:
+        condition: service_started
     networks:
       - sentinel-local
     read_only: true

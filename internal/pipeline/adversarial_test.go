@@ -632,6 +632,11 @@ func TestAdversarialSelfAlertLoopImmunityAndBaselinePoisoningResistance(t *testi
 		if len(alerts) == 0 {
 			t.Fatalf("poisoning attempt %d produced zero alerts", p)
 		}
+		if p%3 == 2 {
+			if len(alerts) != 1 || alerts[0].Tier != "tier1" || len(alerts[0].RuleIDs) != 1 || alerts[0].RuleIDs[0] != "SURPRISAL-001" {
+				t.Fatalf("poisoning attempt %d expected pure Tier 1 alert (SURPRISAL-001 only, zero Tier 0 rule hits), got %+v", p, alerts)
+			}
+		}
 	}
 
 	stAfter := pipe.Stats()

@@ -353,8 +353,9 @@ def main() -> int:
         f"In this Python proxy comparison, the Laplace-LK baseline scored P50 {lk_p50:.4f} ms vs hybrid "
         f"all-MiniLM-L6-v2 P50 {hyb_p50:.4f} ms (~{latency_ratio}x slower in Python, +{rss_delta:.2f} MB peak "
         f"process RSS delta after PyTorch/Transformers imports). {recall_summary} Because neural embedding "
-        f"inference adds multi-millisecond latency and >100 MB memory overhead, semantic embeddings remain "
-        f"optional for sidecar or offline evaluation rather than embedded in the zero-dependency Go binary."
+        f"inference measured {hyb_p50:.4f} ms P50 latency and +{rss_delta:.2f} MB post-import peak process RSS "
+        f"overhead in this benchmark, semantic embeddings remain optional for sidecar or offline evaluation "
+        f"rather than embedded in the zero-dependency Go binary."
     )
 
     result = {
@@ -400,8 +401,8 @@ def main() -> int:
     }
 
     encoded = json.dumps(result, indent=2, allow_nan=False) + "\n"
-    if "/Users/" in encoded:
-        raise RuntimeError("Refusing to write embedding comparison JSON containing '/Users/' path")
+    if "/Users/" in encoded or "/home/" in encoded:
+        raise RuntimeError("Refusing to write embedding comparison JSON containing personal host path")
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(encoded, encoding="utf-8")

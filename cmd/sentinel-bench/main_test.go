@@ -268,4 +268,45 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 	if err != nil || string(gotMD) != string(origMD) {
 		t.Fatalf("expected prior Markdown to be preserved after failed JSON publish, got %q (err=%v)", string(gotMD), err)
 	}
+
+	// Reject matching Markdown and JSON destinations (including equivalent relative/cleaned paths).
+	sameAlias := filepath.Join(pairDir, ".", "report.md")
+	if err := publishReportPair(mdPath, sameAlias, []byte("# collision\n"), BenchmarkReport{}); err == nil {
+		t.Fatal("expected publishReportPair to reject matching Markdown and JSON destinations")
+	}
+	gotAfterCollision, err := os.ReadFile(mdPath)
+	if err != nil || string(gotAfterCollision) != string(origMD) {
+		t.Fatalf("expected prior Markdown untouched after destination collision rejection, got %q (err=%v)", string(gotAfterCollision), err)
+	}
+
+	// Fail closed if existing Markdown destination is not a regular file or cannot be backed up.
+	if err := publishReportPair(badJSONTarget, filepath.Join(pairDir, "out.json"), []byte("# new\n"), BenchmarkReport{}); err == nil {
+		t.Fatal("expected publishReportPair to reject non-regular existing Markdown destination")
+	}
+	if os.Geteuid() != 0 {
+		unreadableMD := filepath.Join(pairDir, "unreadable.md")
+		if err := os.WriteFile(unreadableMD, []byte("# secret\n"), 0000); err != nil {
+			t.Fatalf("write unreadable md: %v", err)
+		}
+		defer func() { _ = os.Chmod(unreadableMD, 0644) }()
+		if err := publishReportPair(unreadableMD, filepath.Join(pairDir, "out2.json"), []byte("# replacement\n"), BenchmarkReport{}); err == nil {
+			t.Fatal("expected publishReportPair to fail closed when existing Markdown cannot be read for backup")
+		}
+		if _, statErr := os.Stat(unreadableMD); statErr != nil {
+			t.Fatalf("unreadable prior Markdown was unexpectedly removed: %v", statErr)
+		}
+	}
+
+	// Fresh distinct destinations must publish cleanly.
+	freshMD := filepath.Join(pairDir, "fresh.md")
+	freshJSON := filepath.Join(pairDir, "fresh.json")
+	if err := publishReportPair(freshMD, freshJSON, []byte("# fresh\n"), BenchmarkReport{}); err != nil {
+		t.Fatalf("expected publishReportPair to succeed for distinct fresh paths: %v", err)
+	}
+	if b, err := os.ReadFile(freshMD); err != nil || string(b) != "# fresh\n" {
+		t.Fatalf("fresh Markdown mismatch: %q (err=%v)", string(b), err)
+	}
+	if _, err := os.Stat(freshJSON); err != nil {
+		t.Fatalf("fresh JSON not created: %v", err)
+	}
 }

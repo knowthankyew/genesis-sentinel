@@ -348,26 +348,80 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("Failed to read" in e for e in errs_utf8), errs_utf8)
 
             abs_md = json.loads(json.dumps(base_data))
-            abs_md["metadata"]["report_markdown"] = str((tmp_root / md_rel).resolve())
+            # Synthetic absolute path outside /Users/ and /home/ so TMPDIR location cannot mask the check.
+            abs_md["metadata"]["report_markdown"] = "/opt/external/benchmark-report.md"
             p_abs = tmp_root / "abs_md.json"
             p_abs.write_text(json.dumps(abs_md), encoding="utf-8")
             ok_abs, errs_abs = sync_docs.independent_recompute_metrics(p_abs, repo_root=tmp_root)
             self.assertFalse(ok_abs)
             self.assertTrue(any("repository-relative" in e for e in errs_abs), errs_abs)
 
-            # HTML-commented correct row with stale visible row must fail published-table parity!
-            comment_md_root = tmp_root / "comment_case"
-            (comment_md_root / "docs" / "benchmarks").mkdir(parents=True)
+            # Invalid report_markdown containing NUL byte must return a clean validation error (no traceback).
+            nul_md = json.loads(json.dumps(base_data))
+            nul_md["metadata"]["report_markdown"] = "docs/benchmarks/bad\x00report.md"
+            p_nul = tmp_root / "nul_md.json"
+            p_nul.write_text(json.dumps(nul_md), encoding="utf-8")
+            ok_nul, errs_nul = sync_docs.independent_recompute_metrics(p_nul, repo_root=tmp_root)
+            self.assertFalse(ok_nul)
+            self.assertTrue(any("path is invalid" in e for e in errs_nul), errs_nul)
+
+            # Duplicate JSON object keys (e.g., hiding an escaped personal path in an overwritten first member) must fail.
+            dup_json_raw = json.dumps(base_data).replace(
+                '"cpu":',
+                '"cpu": "\\/home\\/alice\\/cpu", "cpu":',
+                1,
+            )
+            p_dup_key = tmp_root / "dup_key.json"
+            p_dup_key.write_text(dup_json_raw, encoding="utf-8")
+            ok_dk, errs_dk = sync_docs.independent_recompute_metrics(p_dup_key, repo_root=tmp_root)
+            self.assertFalse(ok_dk)
+            self.assertTrue(any("Duplicate JSON object member" in e for e in errs_dk), errs_dk)
+
+            # Missing tier0_replay.clusters_active must fail instead of defaulting to 0.
+            no_clusters = json.loads(json.dumps(base_data))
+            del no_clusters["tier0_replay"]["clusters_active"]
+            p_nc = tmp_root / "no_clusters.json"
+            p_nc.write_text(json.dumps(no_clusters), encoding="utf-8")
+            ok_nc, errs_nc = sync_docs.independent_recompute_metrics(p_nc, repo_root=tmp_root)
+            self.assertFalse(ok_nc)
+            self.assertTrue(any("clusters_active" in e for e in errs_nc), errs_nc)
+
+            # HTML-commented, unclosed-commented, tilde-fenced, 4-backtick-fenced, and delimiter-less table rows must fail parity!
             tps_val = base_data["tier0_replay"]["throughput_lps"]
-            real_row = f"| **Tier 0+1 Throughput** | `{tps_val:.2f} lines/sec` (target >= 50000 lines/sec) | `PASSED` |"
-            stale_row = "| **Tier 0+1 Throughput** | `12345.00 lines/sec` (target >= 50000 lines/sec) | `MISSED TARGET` |"
-            commented_md = md_text.replace(real_row, f"<!-- {real_row} -->\n{stale_row}")
-            (comment_md_root / md_rel).write_text(commented_md, encoding="utf-8")
-            p_cmt = comment_md_root / "bench.json"
-            p_cmt.write_text(json.dumps(base_data), encoding="utf-8")
-            ok_cmt, errs_cmt = sync_docs.independent_recompute_metrics(p_cmt, repo_root=comment_md_root)
-            self.assertFalse(ok_cmt)
-            self.assertTrue(any("published-table parity error" in e for e in errs_cmt), errs_cmt)
+            tps_target = base_data["acceptance_gates"]["throughput_target_lps"]
+            tps_status = base_data["tier0_replay"]["throughput_gate_status"]
+            real_row = f"| **Tier 0+1 Throughput** | `{tps_val:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{tps_status}` |"
+            stale_row = f"| **Tier 0+1 Throughput** | `12345.00 lines/sec` (target >= {tps_target:.0f} lines/sec) | `MISSED TARGET` |"
+            self.assertIn(real_row, md_text)
+
+            md_variants = [
+                ("comment_case", md_text.replace(real_row, f"<!-- {real_row} -->\n{stale_row}")),
+                ("unclosed_comment_case", md_text.replace(real_row, f"<!-- unclosed comment\n{real_row}")),
+                ("tilde_fence_case", md_text.replace(real_row, f"~~~\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n{real_row}\n~~~\n{stale_row}")),
+                ("four_backtick_fence_case", md_text.replace(real_row, f"````markdown\n```\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n{real_row}\n```\n````\n{stale_row}")),
+                ("missing_delimiter_case", md_text.replace("| :--- | :--- | :--- |\n", "")),
+            ]
+            for case_name, variant_md in md_variants:
+                self.assertNotEqual(variant_md, md_text, f"{case_name} did not mutate md_text")
+                case_root = tmp_root / case_name
+                (case_root / "docs" / "benchmarks").mkdir(parents=True)
+                (case_root / md_rel).write_text(variant_md, encoding="utf-8")
+                p_var = case_root / "bench.json"
+                p_var.write_text(json.dumps(base_data), encoding="utf-8")
+                ok_var, errs_var = sync_docs.independent_recompute_metrics(p_var, repo_root=case_root)
+                self.assertFalse(ok_var, f"{case_name} unexpectedly passed")
+                self.assertTrue(any("published-table parity error" in e for e in errs_var), (case_name, errs_var))
+
+            # Stale Tier 2 rows in Markdown when tier2_triage.enabled is false must be rejected!
+            if base_data["tier2_triage"].get("enabled"):
+                disabled_t2 = json.loads(json.dumps(base_data))
+                disabled_t2["tier2_triage"]["enabled"] = False
+                disabled_t2["tier2_triage"]["injection_override_gate_status"] = "SKIPPED"
+                p_stale_t2 = tmp_root / "stale_t2.json"
+                p_stale_t2.write_text(json.dumps(disabled_t2), encoding="utf-8")
+                ok_st2, errs_st2 = sync_docs.independent_recompute_metrics(p_stale_t2, repo_root=tmp_root)
+                self.assertFalse(ok_st2)
+                self.assertTrue(any("stale Tier 2 row" in e for e in errs_st2), errs_st2)
 
             p_list = tmp_root / "bench_list.json"
             p_list.write_text("[]", encoding="utf-8")
@@ -385,6 +439,7 @@ class TestClaimsLinter(unittest.TestCase):
 
             # 7. Boundary throughput status must use RECOMPUTED throughput (49999.99 < 50000 -> MISSED TARGET)
             boundary = json.loads(json.dumps(base_data))
+            boundary["acceptance_gates"]["throughput_target_lps"] = 50000
             boundary["tier0_replay"]["lines_written"] = 4999999
             boundary["tier0_replay"]["lines_read"] = 4999999
             boundary["tier0_replay"]["duration_seconds"] = 100.0

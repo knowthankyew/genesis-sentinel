@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
+	"github.com/knowthankyew/genesis-sentinel/internal/security"
 	"github.com/knowthankyew/genesis-sentinel/internal/template"
 )
 
@@ -682,5 +683,66 @@ func TestRuleLiteralPrefilterMatchesRawRE2Soundness(t *testing.T) {
 	longPattern := strings.Repeat("a", maxPrefilterLiteralBytes+32) + "b"
 	if lits := extractRequiredASCIILiterals(longPattern); lits != nil {
 		t.Fatalf("expected long literal pattern (%d bytes) to bypass prefilter, got %v", len(longPattern), lits)
+	}
+}
+
+func TestMatchEventControlSplitDelimiterDetection(t *testing.T) {
+	eng, err := NewEngine(DefaultRulePack())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	vectors := []struct {
+		name      string
+		message   string
+		forbidden string
+	}{
+		{
+			name:      "c1_nel_split_llama_inst",
+			message:   "[IN\u0085ST]",
+			forbidden: "[INST]",
+		},
+		{
+			name:      "nul_split_chatml_im_end",
+			message:   "<|im_\x00end|>",
+			forbidden: "<|im_end|>",
+		},
+	}
+
+	for _, tc := range vectors {
+		t.Run(tc.name, func(t *testing.T) {
+			detSigs := security.DetectInjectionSignals(tc.message)
+			sanText, sanSigs := security.SanitizeUntrustedLogText(tc.message, 512)
+			if strings.Join(detSigs, ",") != strings.Join(sanSigs, ",") {
+				t.Fatalf("DetectInjectionSignals (%v) diverged from SanitizeUntrustedLogText (%v) on %q", detSigs, sanSigs, tc.message)
+			}
+			if strings.Contains(sanText, tc.forbidden) {
+				t.Fatalf("sanitized text still contains live delimiter %q: %q", tc.forbidden, sanText)
+			}
+
+			ev := model.LogEvent{
+				ID:        1,
+				Timestamp: 1700000000,
+				Service:   "api",
+				Level:     "INFO",
+				Message:   tc.message,
+			}
+			eval := eng.MatchEvent(ev, 1.0, 512)
+			if !eval.InjectionSuspected {
+				t.Fatalf("MatchEvent missed control-split delimiter %q (signals=%v)", tc.message, eval.InjectionSignals)
+			}
+			foundSENT006 := false
+			for _, m := range eval.Matches {
+				if m.RuleHit.RuleID == "SENT-006" {
+					foundSENT006 = true
+				}
+			}
+			if !foundSENT006 {
+				t.Fatalf("MatchEvent did not emit SENT-006 for isolated control-split vector %q: %+v", tc.message, eval.Matches)
+			}
+			if strings.Contains(eval.InjectionSample, tc.forbidden) {
+				t.Fatalf("MatchEvent InjectionSample retained live delimiter %q: %q", tc.forbidden, eval.InjectionSample)
+			}
+		})
 	}
 }

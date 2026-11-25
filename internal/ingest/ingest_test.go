@@ -818,10 +818,13 @@ func TestSegReaderScratchBufferDoesNotAliasEvents(t *testing.T) {
 		t.Fatalf("create seg: %v", err)
 	}
 	frames := []string{
+		`plain-alpha-payload-11111`,
+		`plain-bravo-payload-22222`,
 		`{"timestamp":1700000001,"service":"alpha","level":"INFO","trace_id":"t-1","message":"first-payload-aaaa"}`,
 		`{"timestamp":1700000002,"service":"bravo","level":"WARN","trace_id":"t-2","message":"secnd-payload-bbbb"}`,
 		`1700000003|charlie|ERROR|t-3|third-payload-cccc`,
-		`plain-fourth-payload-dddd`,
+		`<131>1 2026-11-25T10:00:00Z host1 sys5424 99 trace5424 - syslog-5424-payload-eeee`,
+		`<36>Nov 25 10:00:01 host2 sys3164[42]: syslog-3164-payload-ffff`,
 	}
 	for _, raw := range frames {
 		if err := WriteSegmentFrame(f, []byte(raw)); err != nil {
@@ -844,16 +847,25 @@ func TestSegReaderScratchBufferDoesNotAliasEvents(t *testing.T) {
 	if len(evs) != len(frames) {
 		t.Fatalf("expected %d events, got %d", len(frames), len(evs))
 	}
-	if evs[0].Service != "alpha" || evs[0].Level != "INFO" || evs[0].TraceID != "t-1" || evs[0].Timestamp != 1700000001 || evs[0].Message != "first-payload-aaaa" {
-		t.Fatalf("frame 0 aliased/corrupted by subsequent scratch writes: %+v", evs[0])
+	if evs[0].Message != "plain-alpha-payload-11111" {
+		t.Fatalf("plain frame 0 aliased/corrupted by subsequent equal-length scratch write: %+v", evs[0])
 	}
-	if evs[1].Service != "bravo" || evs[1].Level != "WARN" || evs[1].TraceID != "t-2" || evs[1].Timestamp != 1700000002 || evs[1].Message != "secnd-payload-bbbb" {
-		t.Fatalf("frame 1 aliased/corrupted: %+v", evs[1])
+	if evs[1].Message != "plain-bravo-payload-22222" {
+		t.Fatalf("plain frame 1 aliased/corrupted by subsequent scratch writes: %+v", evs[1])
 	}
-	if evs[2].Service != "charlie" || evs[2].Level != "ERROR" || evs[2].TraceID != "t-3" || evs[2].Timestamp != 1700000003 || evs[2].Message != "third-payload-cccc" {
-		t.Fatalf("frame 2 aliased/corrupted: %+v", evs[2])
+	if evs[2].Service != "alpha" || evs[2].Level != "INFO" || evs[2].TraceID != "t-1" || evs[2].Timestamp != 1700000001 || evs[2].Message != "first-payload-aaaa" {
+		t.Fatalf("json frame 2 aliased/corrupted by subsequent scratch writes: %+v", evs[2])
 	}
-	if evs[3].Message != "plain-fourth-payload-dddd" {
-		t.Fatalf("frame 3 aliased/corrupted: %+v", evs[3])
+	if evs[3].Service != "bravo" || evs[3].Level != "WARN" || evs[3].TraceID != "t-2" || evs[3].Timestamp != 1700000002 || evs[3].Message != "secnd-payload-bbbb" {
+		t.Fatalf("json frame 3 aliased/corrupted: %+v", evs[3])
+	}
+	if evs[4].Service != "charlie" || evs[4].Level != "ERROR" || evs[4].TraceID != "t-3" || evs[4].Timestamp != 1700000003 || evs[4].Message != "third-payload-cccc" {
+		t.Fatalf("pipe frame 4 aliased/corrupted: %+v", evs[4])
+	}
+	if evs[5].Service != "sys5424" || evs[5].TraceID != "trace5424" || evs[5].Message != "syslog-5424-payload-eeee" {
+		t.Fatalf("syslog 5424 frame 5 aliased/corrupted: %+v", evs[5])
+	}
+	if evs[6].Service != "sys3164" || evs[6].Message != "syslog-3164-payload-ffff" {
+		t.Fatalf("syslog 3164 frame 6 aliased/corrupted: %+v", evs[6])
 	}
 }

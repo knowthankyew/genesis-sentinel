@@ -141,7 +141,7 @@ def resolve_claim_value(claim_id: str, claim_cfg: dict, repo_root: Path = REPO_R
         return apply_format_rule(claim_id, fmt, val)
 
     if "json_path" in claim_cfg:
-        data = json.loads(artifact_path.read_text(encoding="utf-8"))
+        data = _loads_strict_json(artifact_path.read_text(encoding="utf-8"))
         cur = data
         for part in claim_cfg["json_path"].split("."):
             if isinstance(cur, dict) and part in cur:
@@ -162,8 +162,30 @@ def _reject_nonfinite_json_constant(const: str) -> None:
     raise ValueError(f"Non-standard non-finite JSON constant not permitted: {const!r}")
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"Duplicate JSON object member not permitted: {k!r}")
+        out[k] = v
+    return out
+
+
 def _loads_strict_json(raw: str):
-    return json.loads(raw, parse_constant=_reject_nonfinite_json_constant)
+    return json.loads(
+        raw,
+        parse_constant=_reject_nonfinite_json_constant,
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
+
+
+def _round_go(val: float, digits: int) -> float:
+    """Match Go's math.Round(v * 10^digits) / 10^digits (IEEE 754 half away from zero)."""
+    scale = 10 ** digits
+    scaled = val * scale
+    frac, whole = math.modf(abs(scaled))
+    rounded = whole + (1.0 if frac >= 0.5 else 0.0)
+    return math.copysign(rounded / scale, scaled)
 
 
 def _contains_personal_host_path(obj) -> bool:
@@ -227,29 +249,106 @@ def _req_num(section: dict, key: str, errors: list[str], prefix: str) -> float |
     return float(val)
 
 
-def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], list[str]]:
+def _parse_gfm_pipe_row(raw_line: str) -> tuple[str, list[str]] | None:
+    """Parse an outer-pipe GFM table row outside 4-space/tab indented code blocks."""
+    if raw_line.startswith("    ") or raw_line.startswith("\t"):
+        return None
+    line = raw_line.strip()
+    if not (line.startswith("|") and line.endswith("|") and len(line) >= 3):
+        return None
+    cells = [c.strip() for c in re.split(r"(?<!\\)\|", line[1:-1])]
+    if len(cells) < 2:
+        return None
+    return line, cells
+
+
+def _is_gfm_delimiter_row(cells: list[str]) -> bool:
+    return len(cells) >= 2 and all(re.fullmatch(r":?-{1,}:?", c) is not None for c in cells)
+
+
+def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[str], list[str]]:
     """
-    Strip HTML comments and fenced code blocks, then return (published_table_rows, duplicate_labels)
-    so hidden comments or stale duplicate metric rows cannot satisfy parity verification.
+    Strip CommonMark fenced code blocks (backticks and tildes of length >= 3, honoring fence
+    character and minimum closing length with trailing whitespace only) and HTML comments
+    (including unclosed '<!--' comments running through EOF), then collect body rows strictly
+    from valid GFM tables (header row immediately followed by a matching-column delimiter row).
+    Returns (published_table_rows, seen_bold_labels, duplicate_bold_labels).
     """
-    cleaned = re.sub(r"<!--.*?-->", "", md_text, flags=re.DOTALL)
-    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL)
+    cleaned_lines: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+    in_comment = False
+
+    for raw_line in md_text.splitlines():
+        if fence_char is not None:
+            close_m = re.match(r"^ {0,3}(" + re.escape(fence_char) + r"{3,})[ \t]*$", raw_line)
+            if close_m and len(close_m.group(1)) >= fence_len:
+                fence_char = None
+                fence_len = 0
+            cleaned_lines.append("")
+            continue
+
+        line = raw_line
+        if in_comment:
+            end_idx = line.find("-->")
+            if end_idx == -1:
+                cleaned_lines.append("")
+                continue
+            in_comment = False
+            line = line[end_idx + 3:]
+
+        open_m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if open_m:
+            marker, info = open_m.group(1), open_m.group(2)
+            # CommonMark §4.5: backtick info strings may not contain backticks.
+            if marker[0] == "~" or "`" not in info:
+                fence_char = marker[0]
+                fence_len = len(marker)
+                cleaned_lines.append("")
+                continue
+
+        out_parts: list[str] = []
+        pos = 0
+        while True:
+            start_idx = line.find("<!--", pos)
+            if start_idx == -1:
+                out_parts.append(line[pos:])
+                break
+            out_parts.append(line[pos:start_idx])
+            end_idx = line.find("-->", start_idx + 4)
+            if end_idx == -1:
+                in_comment = True
+                break
+            pos = end_idx + 3
+        cleaned_lines.append("".join(out_parts))
+
     rows: set[str] = set()
     seen_labels: set[str] = set()
     dup_labels: list[str] = []
-    for raw_line in cleaned.splitlines():
-        line = raw_line.strip()
-        if not (line.startswith("|") and line.endswith("|")):
-            continue
-        rows.add(line)
-        parts = [p.strip() for p in line.split("|")[1:-1]]
-        if len(parts) >= 2 and parts[0].startswith("**") and parts[0].endswith("**"):
-            lbl = parts[0]
-            if lbl in seen_labels:
-                dup_labels.append(lbl)
-            else:
-                seen_labels.add(lbl)
-    return rows, dup_labels
+    i = 0
+    total_lines = len(cleaned_lines)
+    while i < total_lines:
+        hdr = _parse_gfm_pipe_row(cleaned_lines[i])
+        if hdr is not None and i + 1 < total_lines:
+            delim = _parse_gfm_pipe_row(cleaned_lines[i + 1])
+            if delim is not None and len(delim[1]) == len(hdr[1]) and _is_gfm_delimiter_row(delim[1]):
+                i += 2
+                while i < total_lines:
+                    body = _parse_gfm_pipe_row(cleaned_lines[i])
+                    if body is None:
+                        break
+                    line, parts = body
+                    rows.add(line)
+                    if parts[0].startswith("**") and parts[0].endswith("**"):
+                        lbl = parts[0]
+                        if lbl in seen_labels:
+                            dup_labels.append(lbl)
+                        else:
+                            seen_labels.add(lbl)
+                    i += 1
+                continue
+        i += 1
+    return rows, seen_labels, dup_labels
 
 
 def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = REPO_ROOT) -> tuple[bool, list[str]]:
@@ -315,6 +414,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     stored_tps = _req_num(t0, "throughput_lps", errors, "tier0_replay")
     tmpls = _req_int(t0, "templates_emitted", errors, "tier0_replay", min_val=1)
     stored_collapse = _req_num(t0, "collapse_ratio", errors, "tier0_replay")
+    clusters_active = _req_int(t0, "clusters_active", errors, "tier0_replay", min_val=0)
 
     calc_tps = None
     calc_collapse = None
@@ -326,7 +426,9 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if lines_dropped != exp_dropped:
                 errors.append(f"tier0_replay lines_dropped mismatch: stored {lines_dropped}, expected {exp_dropped}")
 
-            calc_tps = round(lines_read / dur_sec, 2)
+            # Match cmd/sentinel-bench/main.go exactly: durSec is rounded to 6 decimals before dividing,
+            # tps is rounded half-away-from-zero to 2 decimals, and the gate compares that rounded tps.
+            calc_tps = _round_go(lines_read / dur_sec, 2)
             # Require stored and recomputed throughput to match at the published 2-decimal precision.
             if f"{stored_tps:.2f}" != f"{calc_tps:.2f}":
                 errors.append(
@@ -342,7 +444,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                     )
 
         if tmpls is not None and stored_collapse is not None:
-            calc_collapse = round(lines_read / tmpls, 2)
+            calc_collapse = _round_go(lines_read / tmpls, 2)
             if f"{stored_collapse:.2f}" != f"{calc_collapse:.2f}":
                 errors.append(
                     f"Tier 0 collapse_ratio recomputation mismatch: stored {stored_collapse:.2f}, calculated {calc_collapse:.2f}"
@@ -381,7 +483,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                 errors.append(f"tier1_surprisal p99_gate_status mismatch: expected {exp_p99_status!r}")
 
     if benign_mean is not None and anom_mean is not None and stored_sep is not None:
-        calc_sep = round(anom_mean - benign_mean, 4)
+        calc_sep = _round_go(anom_mean - benign_mean, 4)
         if abs(calc_sep - stored_sep) > 0.001:
             errors.append(f"Tier 1 separation_nats mismatch: stored {stored_sep}, calculated {calc_sep}")
 
@@ -413,9 +515,9 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
         if t0_det + t1_det != tp:
             errors.append(f"Detection tier breakdown mismatch: tier0({t0_det}) + tier1_only({t1_det}) != tp({tp})")
 
-        calc_prec = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
-        calc_rec = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
-        calc_f1 = round((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
+        calc_prec = _round_go(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+        calc_rec = _round_go(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+        calc_f1 = _round_go((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
         if abs(calc_prec - stored_prec) > 0.0005:
             errors.append(f"Detection precision mismatch: stored {stored_prec}, calculated {calc_prec}")
         if abs(calc_rec - stored_rec) > 0.0005:
@@ -482,7 +584,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if mem.get("heap_gate_status") != exp_heap_status:
                 errors.append(f"memory_profile heap_gate_status mismatch: expected {exp_heap_status!r}")
     if rss_kb is not None and rss_mb is not None:
-        calc_rss_mb = round(rss_kb / 1024.0, 2)
+        calc_rss_mb = _round_go(rss_kb / 1024.0, 2)
         if f"{rss_mb:.2f}" != f"{calc_rss_mb:.2f}":
             errors.append(f"rss_peak_mb mismatch: stored {rss_mb:.2f}, calculated {calc_rss_mb:.2f}")
 
@@ -496,7 +598,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
         if adv_passed > adv_total:
             errors.append(f"adversarial_checks passed_checks ({adv_passed}) > total_checks ({adv_total})")
         else:
-            calc_adv_pct = round(adv_passed * 100.0 / adv_total, 2)
+            calc_adv_pct = _round_go(adv_passed * 100.0 / adv_total, 2)
             if f"{adv_pct:.2f}" != f"{calc_adv_pct:.2f}":
                 errors.append(f"adversarial_checks pass_rate_pct mismatch: stored {adv_pct:.2f}, calculated {calc_adv_pct:.2f}")
             if adv_target is not None:
@@ -512,16 +614,21 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     elif Path(report_rel).is_absolute():
         errors.append(f"Referenced markdown benchmark report must be repository-relative, got absolute path: {report_rel!r}")
     else:
-        cand = (repo_root / report_rel).resolve()
         try:
-            cand.relative_to(repo_root.resolve())
-        except ValueError:
-            errors.append(f"Referenced markdown benchmark report escapes repository root: {report_rel!r}")
+            cand = (repo_root / report_rel).resolve()
+            resolved_root = repo_root.resolve()
+        except (ValueError, OSError) as exc:
+            errors.append(f"Referenced markdown benchmark report path is invalid: {report_rel!r} ({exc})")
         else:
-            if not cand.is_file():
-                errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
+            try:
+                cand.relative_to(resolved_root)
+            except ValueError:
+                errors.append(f"Referenced markdown benchmark report escapes repository root: {report_rel!r}")
             else:
-                report_path = cand
+                if not cand.is_file():
+                    errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
+                else:
+                    report_path = cand
 
     if report_path is not None and not errors:
         try:
@@ -531,14 +638,14 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
         if "/Users/" in md_text or "/home/" in md_text:
             errors.append(f"Markdown benchmark report {report_rel} contains leaked personal host path")
 
-        published_rows, dup_labels = _extract_published_markdown_table_rows(md_text)
+        published_rows, seen_labels, dup_labels = _extract_published_markdown_table_rows(md_text)
         if dup_labels:
             errors.append(f"Markdown benchmark report {report_rel} contains duplicate metric row labels: {dup_labels}")
 
         expected_rows = [
             f"| **Lines Written / Read** | `{lines_written}` written / `{lines_read}` read (`{lines_dropped}` dropped, digest matched=`{'true' if digest_matched else 'false'}`) | `{t0['lossless_gate_status']}` |",
             f"| **Tier 0+1 Throughput** | `{calc_tps:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{t0['throughput_gate_status']}` |",
-            f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{calc_collapse:.2f}x` collapse, `{t0.get('clusters_active', 0)}` active clusters) | — |",
+            f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{calc_collapse:.2f}x` collapse, `{clusters_active}` active clusters) | — |",
             f"| **Latency P50 / P90 / P99 / Max** | `{p50_us:.3f} us` / `{p90_us:.3f} us` / `{p99_us:.3f} us` / `{max_us:.3f} us` | `{t1['p99_gate_status']}` |",
             f"| **Precision / Recall / F1** | `{calc_prec:.4f}` / `{calc_rec:.4f}` / `{calc_f1:.4f}` (target F1 >= {f1_target:.2f}) | `{det['f1_gate_status']}` |",
             f"| **Sampled Go Heap Plateau / Peak** | `{plateau_mb:.2f} MB` plateau / `{peak_mb:.2f} MB` sampled peak (ceiling `{ceiling_mb:.0f} MB`, method=`{mem.get('heap_sampling_method', '')}`) | `{mem['heap_gate_status']}` |",
@@ -550,6 +657,17 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                 f"| **Inference Latency P50 / P90 / P99 / Max** | `{t2['p50_ms']:.3f} ms` / `{t2['p90_ms']:.3f} ms` / `{t2['p99_ms']:.3f} ms` / `{t2['max_ms']:.3f} ms` | — |",
                 f"| **Hostile Injection Safety** | `{t2['injection_probes_safe']}/{t2['injection_probes_attempted']}` safe non-benign verdicts (`{t2['injection_overrides_actual']}` actual overrides, `{t2['injection_probes_failed']}` failed) | `{t2['injection_override_gate_status']}` |",
             ])
+        else:
+            for stale_lbl in (
+                "**Model / Adapter**",
+                "**Samples / Structured / Fallbacks**",
+                "**Inference Latency P50 / P90 / P99 / Max**",
+                "**Hostile Injection Safety**",
+            ):
+                if stale_lbl in seen_labels:
+                    errors.append(
+                        f"Benchmark Markdown report {report_rel} contains stale Tier 2 row {stale_lbl!r} while tier2_triage.enabled is false"
+                    )
         for row in expected_rows:
             if row not in published_rows:
                 errors.append(f"Benchmark JSON/Markdown published-table parity error: expected row {row!r} missing from {report_rel}")
@@ -936,6 +1054,9 @@ def main() -> int:
         else:
             print("[PASS] Independent semantic embedding comparison math verified.")
 
+    # Refresh contract: cmd/sentinel-bench atomically regenerates empirical_benchmarks.json and its
+    # paired Markdown report (which contains no claim markers). sync_docs.py --write only propagates
+    # verified artifacts into registered claim markers in README.md and docs/ after parity passes.
     if do_write and not overall_success:
         print("\nAborting --write because benchmark artifact recomputation failed.", file=sys.stderr)
         return 1

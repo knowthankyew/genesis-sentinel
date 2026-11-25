@@ -1,16 +1,16 @@
 {
   "metadata": {
-    "date": "2026-11-25T13:11:14Z",
+    "date": "2026-11-25T13:26:38Z",
     "model_id": "sentence-transformers/all-MiniLM-L6-v2",
     "offline_mode": true,
     "platform": "Darwin x86_64",
     "python_version": "3.12.1",
     "torch_version": "2.2.2",
-    "model_load_seconds": 0.524,
+    "model_load_seconds": 0.555,
     "rss_measurement_method": "ru_maxrss_peak_process_post_import",
-    "rss_before_model_mb": 176.3,
-    "rss_after_model_mb": 309.68,
-    "rss_delta_mb": 133.38
+    "rss_before_model_mb": 176.37,
+    "rss_after_model_mb": 310.0,
+    "rss_delta_mb": 133.63
   },
   "dataset": {
     "warmup_benign_windows": 30,
@@ -33,8 +33,8 @@
     "f1": 0.75,
     "structural_recall": 1.0,
     "disguised_semantic_recall": 0.3333,
-    "latency_p50_ms": 0.0229,
-    "latency_p99_ms": 0.1084
+    "latency_p50_ms": 0.0239,
+    "latency_p99_ms": 0.0582
   },
   "hybrid_laplace_lk_minilm": {
     "tp": 25,
@@ -48,14 +48,14 @@
     "f1": 1.0,
     "structural_recall": 1.0,
     "disguised_semantic_recall": 1.0,
-    "latency_p50_ms": 7.2134,
-    "latency_p99_ms": 13.5286
+    "latency_p50_ms": 7.1991,
+    "latency_p99_ms": 12.3299
   },
   "comparison": {
     "f1_delta": 0.25,
     "fp_delta": 0,
     "disguised_semantic_recall_delta": 0.6667,
-    "p50_latency_slowdown_x": 315.0,
-    "recommendation": "In this Python proxy comparison, the Laplace-LK baseline scored P50 0.0229 ms vs hybrid all-MiniLM-L6-v2 P50 7.2134 ms (~315.0x slower in Python, +133.38 MB peak process RSS delta after PyTorch/Transformers imports). On this synthetic corpus at fixed threshold 5.0 nats (semantic_weight=12), disguised-semantic recall changed by +0.6667 (0.3333 -> 1.0000) with FP delta +0 (0 -> 0). Because neural embedding inference adds multi-millisecond latency and >100 MB memory overhead, semantic embeddings remain optional for sidecar or offline evaluation rather than embedded in the zero-dependency Go binary."
+    "p50_latency_slowdown_x": 301.2,
+    "recommendation": "In this Python proxy comparison, the Laplace-LK baseline scored P50 0.0239 ms vs hybrid all-MiniLM-L6-v2 P50 7.1991 ms (~301.2x slower in Python, +133.63 MB peak process RSS delta after PyTorch/Transformers imports). On this synthetic corpus at fixed threshold 5.0 nats (semantic_weight=12), disguised-semantic recall changed by +0.6667 (0.3333 -> 1.0000) with FP delta +0 (0 -> 0). Because neural embedding inference measured 7.1991 ms P50 latency and +133.63 MB post-import peak process RSS overhead in this benchmark, semantic embeddings remain optional for sidecar or offline evaluation rather than embedded in the zero-dependency Go binary."
   }
 }
