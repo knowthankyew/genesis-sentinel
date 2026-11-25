@@ -75,16 +75,20 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	}
 	defer unlock()
 
-	existing, err := j.readAllLocked()
-	if err != nil {
-		return fmt.Errorf("read alert journal %q: %w", j.path, err)
-	}
 	incoming := make([]emit.Alert, len(alerts))
 	for i, a := range alerts {
+		if strings.TrimSpace(a.AlertID) == "" {
+			return fmt.Errorf("alert journal refuses alert %d with empty alert_id", i+1)
+		}
 		if j.requireRedaction {
 			a = redactAlertForPersistence(a)
 		}
 		incoming[i] = a
+	}
+
+	existing, err := j.readAllLocked()
+	if err != nil {
+		return fmt.Errorf("read alert journal %q: %w", j.path, err)
 	}
 
 	combined := append(existing, incoming...)
@@ -95,10 +99,41 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 }
 
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
+	a.SourceService, _ = RedactText(a.SourceService)
+	a.SourceLevel, _ = RedactText(a.SourceLevel)
 	a.Message, _ = RedactText(a.Message)
 	a.Template, _ = RedactText(a.Template)
 	a.SanitizedSample, _ = RedactText(a.SanitizedSample)
 	a.TriageExplanation, _ = RedactText(a.TriageExplanation)
+	if len(a.RuleIDs) > 0 {
+		out := make([]string, len(a.RuleIDs))
+		for i, r := range a.RuleIDs {
+			out[i], _ = RedactText(r)
+		}
+		a.RuleIDs = out
+	}
+	if len(a.Categories) > 0 {
+		out := make([]string, len(a.Categories))
+		for i, c := range a.Categories {
+			out[i], _ = RedactText(c)
+		}
+		a.Categories = out
+	}
+	if len(a.InjectionSignals) > 0 {
+		out := make([]string, len(a.InjectionSignals))
+		for i, s := range a.InjectionSignals {
+			out[i], _ = RedactText(s)
+		}
+		a.InjectionSignals = out
+	}
+	if len(a.TopSurprisalFeatures) > 0 {
+		out := make(map[string]float64, len(a.TopSurprisalFeatures))
+		for k, v := range a.TopSurprisalFeatures {
+			rk, _ := RedactText(k)
+			out[rk] = v
+		}
+		a.TopSurprisalFeatures = out
+	}
 	return a
 }
 
@@ -198,15 +233,21 @@ func (j *AlertJournal) readAllLocked() ([]emit.Alert, error) {
 	scanner := bufio.NewScanner(io.LimitReader(f, j.maxBytes*2+1))
 	scanner.Buffer(make([]byte, 64*1024), scanMax)
 	var out []emit.Alert
+	lineNo := 0
 	for scanner.Scan() {
+		lineNo++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		var a emit.Alert
-		if err := json.Unmarshal([]byte(line), &a); err == nil && a.AlertID != "" {
-			out = append(out, a)
+		if err := json.Unmarshal([]byte(line), &a); err != nil {
+			return nil, fmt.Errorf("alert journal %q line %d: malformed JSON: %w", j.path, lineNo, err)
 		}
+		if strings.TrimSpace(a.AlertID) == "" {
+			return nil, fmt.Errorf("alert journal %q line %d: missing alert_id", j.path, lineNo)
+		}
+		out = append(out, a)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -221,10 +262,12 @@ func (j *AlertJournal) writeAtomicLocked(alerts []emit.Alert) error {
 	}
 
 	recCap := j.effectiveMaxRecordBytes()
-	// Pre-serialize and validate per-record / total byte ceilings before touching disk.
-	lines := make([][]byte, 0, len(alerts))
+	// Serialize from newest to oldest, enforcing per-record and total byte limits while
+	// bounding peak serialized buffer memory strictly to j.maxBytes.
+	keptRev := make([][]byte, 0, min(len(alerts), 64))
 	var totalBytes int64
-	for _, a := range alerts {
+	for i := len(alerts) - 1; i >= 0; i-- {
+		a := alerts[i]
 		b, err := json.Marshal(a)
 		if err != nil {
 			return fmt.Errorf("marshal alert %q: %w", a.AlertID, err)
@@ -233,21 +276,20 @@ func (j *AlertJournal) writeAtomicLocked(alerts []emit.Alert) error {
 		if len(b) > recCap || int64(len(b)) > j.maxBytes {
 			return fmt.Errorf("alert %q serialized size (%d bytes) exceeds journal limit (%d bytes)", a.AlertID, len(b), recCap)
 		}
-		lines = append(lines, b)
+		if totalBytes+int64(len(b)) > j.maxBytes {
+			break
+		}
+		keptRev = append(keptRev, b)
 		totalBytes += int64(len(b))
 	}
-	if len(lines) == 0 {
-		return nil
-	}
-	startIdx := 0
-	for startIdx < len(lines) && totalBytes > j.maxBytes {
-		totalBytes -= int64(len(lines[startIdx]))
-		startIdx++
-	}
-	lines = lines[startIdx:]
-	if len(lines) == 0 {
+	if len(keptRev) == 0 {
 		return fmt.Errorf("no alerts fit within alert journal byte budget (%d bytes)", j.maxBytes)
 	}
+	// Reverse back into chronological (oldest -> newest) order for disk persistence.
+	for l, r := 0, len(keptRev)-1; l < r; l, r = l+1, r-1 {
+		keptRev[l], keptRev[r] = keptRev[r], keptRev[l]
+	}
+	lines := keptRev
 
 	tmp, err := os.CreateTemp(dir, ".alerts-*.tmp")
 	if err != nil {

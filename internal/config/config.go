@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -212,6 +213,11 @@ func (c *Config) Validate() error {
 			if seg == ".." {
 				return fmt.Errorf("adapter_path %q must not contain path traversal segments", c.AdapterPath)
 			}
+		}
+		cleanedAdapter := path.Clean(trimmedAdapter)
+		if cleanedAdapter == "." || cleanedAdapter == ".." || strings.HasPrefix(cleanedAdapter, "../") ||
+			strings.HasPrefix(cleanedAdapter, "/") || (len(cleanedAdapter) >= 2 && cleanedAdapter[1] == ':') {
+			return fmt.Errorf("adapter_path %q must be a relative forward-slash path under artifacts/", c.AdapterPath)
 		}
 	}
 

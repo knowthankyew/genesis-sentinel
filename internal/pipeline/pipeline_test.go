@@ -1174,4 +1174,33 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 	if st := pipeJournalErr.Stats(); st.JournalErrors != 1 || st.SinkErrors != 0 {
 		t.Fatalf("expected JournalErrors=1 SinkErrors=0, got %+v", st)
 	}
+
+	// 4. Reject trailing JSON tokens in HandleAdapter before locking or writing.
+	trailRec := httptest.NewRecorder()
+	trailReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/a/model_adapters"}{"adapter_path":"artifacts/b/model_adapters"}`))
+	pipeConc.HandleAdapter(trailRec, trailReq)
+	if trailRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
+	}
+
+	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir AND still cleans custom FeedbackDir when DataDir fails.
+	fbOnlyDir := t.TempDir()
+	fbOnlyFile := filepath.Join(fbOnlyDir, "sentinel-feedback.jsonl")
+	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+		t.Fatalf("write fbOnlyFile: %v", err)
+	}
+	if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 1 {
+		t.Fatalf("BurnLocalStateWithFeedbackDir('', fbOnlyDir) failed: rep=%+v err=%v", rep, err)
+	}
+
+	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+		t.Fatalf("rewrite fbOnlyFile: %v", err)
+	}
+	partialRep, partialErr := BurnLocalStateWithFeedbackDir(badParent, fbOnlyDir)
+	if partialErr == nil || partialRep.Status != "partial" || partialRep.FilesRemoved != 1 {
+		t.Fatalf("expected partial burn cleaning custom feedbackDir despite invalid DataDir, got rep=%+v err=%v", partialRep, partialErr)
+	}
+	if _, err := os.Stat(fbOnlyFile); !os.IsNotExist(err) {
+		t.Fatal("custom feedback file survived partial burn")
+	}
 }

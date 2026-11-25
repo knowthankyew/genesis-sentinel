@@ -589,4 +589,69 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dataDir, "active-adapter.json")); !os.IsNotExist(statErr) {
 		t.Fatal("Failed job with nonempty adapterPath wrote active-adapter.json")
 	}
+
+	// Reject --activate without --wait before submitting any job.
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--ftaas-http", ftaasSrv.URL,
+		"--dataset", seedPath,
+		"--activate",
+	}, &out, &errBuf); err == nil {
+		t.Fatal("expected --activate without --wait to be rejected")
+	}
+
+	// Reject --wait --activate when Succeeded job returns empty adapterPath.
+	emptyAdapterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"jobId":"job-empty-1","status":"Queued","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-empty-1":
+			_, _ = w.Write([]byte(`{"jobId":"job-empty-1","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":""}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer emptyAdapterSrv.Close()
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--ftaas-http", emptyAdapterSrv.URL,
+		"--dataset", seedPath,
+		"--wait", "--poll-interval", "5ms", "--activate",
+	}, &out, &errBuf); err == nil {
+		t.Fatal("expected --wait --activate with empty adapterPath to return an error")
+	}
+
+	// train activate with rejecting daemon (401) must leave previous active-adapter.json untouched.
+	prevManifest := `{"base_model":"HuggingFaceTB/SmolLM2-135M-Instruct","adapter_path":"artifacts/prev/model_adapters"}`
+	manifestPath := filepath.Join(dataDir, "active-adapter.json")
+	if err := os.WriteFile(manifestPath, []byte(prevManifest), 0600); err != nil {
+		t.Fatalf("seed previous active-adapter.json: %v", err)
+	}
+	rejectDaemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer rejectDaemon.Close()
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "activate",
+		"--data-dir", dataDir,
+		"--adapter-path", "artifacts/new/model_adapters",
+		"--sentinel-http", rejectDaemon.URL,
+	}, &out, &errBuf); err == nil {
+		t.Fatal("expected train activate against 401 daemon to fail")
+	}
+	rawAfter, _ := os.ReadFile(manifestPath)
+	if string(rawAfter) != prevManifest {
+		t.Fatalf("401 daemon activation mutated active-adapter.json: got %s", string(rawAfter))
+	}
 }

@@ -86,6 +86,12 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *activate && !*wait {
+		return fmt.Errorf("--activate requires --wait (pass both --wait --activate, or activate later via `sentinel train activate`)")
+	}
+	if *auditOnly && (*wait || *activate) {
+		return fmt.Errorf("--audit-only cannot be combined with --wait or --activate")
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -191,7 +197,10 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if finalStatus != "succeeded" && finalStatus != "completed" {
 		return fmt.Errorf("FTaaS job %s did not succeed (status=%q)", finalJob.JobID, finalJob.Status)
 	}
-	if *activate && strings.TrimSpace(finalJob.AdapterPath) != "" {
+	if *activate {
+		if strings.TrimSpace(finalJob.AdapterPath) == "" {
+			return fmt.Errorf("FTaaS job %s completed (%s) but returned an empty adapterPath; cannot activate", finalJob.JobID, finalJob.Status)
+		}
 		state := train.ActiveAdapter{
 			JobID:       finalJob.JobID,
 			BaseModel:   finalJob.BaseModel,
@@ -199,9 +208,8 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 			DatasetHash: finalJob.DatasetHash,
 			ActivatedAt: time.Now().UTC(),
 		}
-		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-			return fmt.Errorf("save active adapter: %w", err)
-		}
+		// Notify a running daemon BEFORE updating the local manifest so a 401/rejection
+		// never leaves active-adapter.json pointing to an unactivated adapter.
 		if strings.TrimSpace(*sentinelHTTP) != "" {
 			token := *authToken
 			if token == "" {
@@ -210,6 +218,9 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 			if err := train.NotifyDaemonAdapter(ctx, *sentinelHTTP, token, state, cfg.AllowRemoteEndpoints); err != nil {
 				return fmt.Errorf("notify running Sentinel daemon: %w", err)
 			}
+		}
+		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+			return fmt.Errorf("save active adapter: %w", err)
 		}
 		activatedState = &state
 	}
@@ -338,9 +349,6 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 		AdapterPath: strings.TrimSpace(*adapterPath),
 		ActivatedAt: time.Now().UTC(),
 	}
-	if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-		return err
-	}
 	if strings.TrimSpace(*sentinelHTTP) != "" {
 		token := *authToken
 		if token == "" {
@@ -349,6 +357,9 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 		if err := train.NotifyDaemonAdapter(context.Background(), *sentinelHTTP, token, state, remote); err != nil {
 			return err
 		}
+	}
+	if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+		return err
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")

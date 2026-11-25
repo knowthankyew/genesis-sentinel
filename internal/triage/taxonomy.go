@@ -350,15 +350,16 @@ func ParseCompletion(
 ) (model.TriageVerdict, bool) {
 	cleaned := sanitizeSingleLine(rawCompletion, 2048)
 
-	// Extract class strictly from the leading verdict tag position; never promote tags
-	// mentioned later inside explanation prose.
+	// Extract class strictly from the leading verdict tag position against the 8 canonical
+	// classes (aliases such as [NOISE] or custom tags fail closed to NEEDS-REVIEW in live triage).
 	label := ClassNeedsReview
 	matchedTag := false
 	rest := cleaned
 	if loc := leadingBracketTagRe.FindStringSubmatchIndex(cleaned); len(loc) >= 4 {
-		rawTag := cleaned[loc[2]:loc[3]]
-		if canon, ok := NormalizeClass(rawTag); ok {
-			label = canon
+		rawTag := strings.ToUpper(strings.TrimSpace(cleaned[loc[2]:loc[3]]))
+		rawTag = strings.ReplaceAll(rawTag, "_", "-")
+		if _, ok := canonicalTaxonomy[rawTag]; ok {
+			label = rawTag
 			matchedTag = true
 		}
 		rest = strings.TrimSpace(cleaned[loc[1]:])
@@ -367,41 +368,41 @@ func ParseCompletion(
 	severity := DefaultSeverityForClass(label)
 	mitre := DefaultMitreForClass(label)
 	confidence := 0.5
+	metaCursor := rest
 	if matchedTag {
 		confidence = 0.8
-	}
-
-	// Consume optional structured key=value metadata strictly from the prefix before explanation.
-	metaCursor := rest
-	for {
-		m := leadingMetaFieldRe.FindStringSubmatchIndex(metaCursor)
-		if len(m) < 6 {
-			break
-		}
-		key := strings.ToLower(metaCursor[m[2]:m[3]])
-		val := strings.TrimSpace(metaCursor[m[4]:m[5]])
-		switch key {
-		case "severity":
-			upper := strings.ToUpper(val)
-			switch upper {
-			case "LOW", "MEDIUM", "HIGH", "CRITICAL":
-				severity = upper
+		// Consume optional structured key=value metadata strictly after a valid canonical leading tag
+		// and strictly before the explanation begins.
+		for {
+			m := leadingMetaFieldRe.FindStringSubmatchIndex(metaCursor)
+			if len(m) < 6 {
+				break
 			}
-		case "mitre":
-			upper := strings.ToUpper(val)
-			if upper == "NONE" {
-				mitre = ""
-			} else if mitreTacticRe.MatchString(upper) {
-				mitre = upper
-			}
-		case "confidence":
-			if parsed, err := strconv.ParseFloat(val, 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
-				if parsed >= 0 && parsed <= 1 {
-					confidence = math.Round(parsed*1000) / 1000
+			key := strings.ToLower(metaCursor[m[2]:m[3]])
+			val := strings.TrimSpace(metaCursor[m[4]:m[5]])
+			switch key {
+			case "severity":
+				upper := strings.ToUpper(val)
+				switch upper {
+				case "LOW", "MEDIUM", "HIGH", "CRITICAL":
+					severity = upper
+				}
+			case "mitre":
+				upper := strings.ToUpper(val)
+				if upper == "NONE" {
+					mitre = ""
+				} else if mitreTacticRe.MatchString(upper) {
+					mitre = upper
+				}
+			case "confidence":
+				if parsed, err := strconv.ParseFloat(val, 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+					if parsed >= 0 && parsed <= 1 {
+						confidence = math.Round(parsed*1000) / 1000
+					}
 				}
 			}
+			metaCursor = strings.TrimSpace(metaCursor[m[1]:])
 		}
-		metaCursor = strings.TrimSpace(metaCursor[m[1]:])
 	}
 
 	explanation := ""

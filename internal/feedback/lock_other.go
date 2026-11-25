@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !(linux || darwin || freebsd || netbsd || openbsd || dragonfly)
 
 package feedback
 
@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -14,18 +16,20 @@ var (
 	pathLocks   = make(map[string]*sync.Mutex)
 )
 
-func getPathMutex(cleanPath string) *sync.Mutex {
+func getPathMutex(cleanKey string) *sync.Mutex {
 	pathLocksMu.Lock()
 	defer pathLocksMu.Unlock()
-	m, ok := pathLocks[cleanPath]
+	m, ok := pathLocks[cleanKey]
 	if !ok {
 		m = &sync.Mutex{}
-		pathLocks[cleanPath] = m
+		pathLocks[cleanKey] = m
 	}
 	return m
 }
 
-// acquireFileLock serializes access to targetPath across all in-process instances.
+// acquireFileLock serializes access across all in-process Store/Journal instances targeting
+// the same parent directory (normalized case-insensitively on Windows so equivalent filenames
+// such as sentinel-feedback-Team.jsonl and sentinel-feedback-team.jsonl share one mutex).
 func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
@@ -38,9 +42,13 @@ func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 		}
 	}
 	if evalDir, err := filepath.EvalSymlinks(dir); err == nil {
-		absPath = filepath.Join(evalDir, filepath.Base(absPath))
+		dir = evalDir
 	}
-	pm := getPathMutex(absPath)
+	lockKey := filepath.Clean(dir)
+	if runtime.GOOS == "windows" {
+		lockKey = strings.ToLower(lockKey)
+	}
+	pm := getPathMutex(lockKey)
 	pm.Lock()
 	return func() { pm.Unlock() }, nil
 }

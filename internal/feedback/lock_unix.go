@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
 
 package feedback
 
@@ -28,8 +28,9 @@ func getPathMutex(cleanPath string) *sync.Mutex {
 }
 
 // acquireFileLock serializes access to targetPath across both in-process Store/Journal
-// instances and separate OS processes via an in-process per-path mutex combined with an
-// advisory flock on the parent directory descriptor (leaving zero stray lock files on disk).
+// instances and separate OS processes via an in-process per-directory mutex combined with an
+// advisory flock on the parent directory descriptor (leaving zero stray lock files on disk;
+// BurnLocalState only unlinks regular files and never removes or recreates directories).
 func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
@@ -42,11 +43,10 @@ func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 		}
 	}
 	if evalDir, err := filepath.EvalSymlinks(dir); err == nil {
-		absPath = filepath.Join(evalDir, filepath.Base(absPath))
 		dir = evalDir
 	}
 
-	pm := getPathMutex(absPath)
+	pm := getPathMutex(dir)
 	pm.Lock()
 
 	dirFile, err := os.Open(dir)

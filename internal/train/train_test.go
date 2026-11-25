@@ -1,8 +1,10 @@
 package train
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,14 +26,21 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatalf("WriteFTaaSDataset: %v", err)
 	}
 
+	dsBytes, err := os.ReadFile(dsPath)
+	if err != nil {
+		t.Fatalf("read dsPath: %v", err)
+	}
+
 	type submitCapture struct {
 		baseModel string
 		jobName   string
 		preflight string
+		fileBytes []byte
 	}
 	type auditCapture struct {
-		ablation string
-		anomaly  string
+		ablation  string
+		anomaly   string
+		fileBytes []byte
 	}
 	submitCh := make(chan submitCapture, 1)
 	auditCh := make(chan auditCapture, 1)
@@ -44,9 +53,17 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			f, _, err := r.FormFile("file")
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			gotFile, _ := io.ReadAll(f)
+			_ = f.Close()
 			auditCh <- auditCapture{
-				ablation: r.FormValue("ablationThreshold"),
-				anomaly:  r.FormValue("anomalyThreshold"),
+				ablation:  r.FormValue("ablationThreshold"),
+				anomaly:   r.FormValue("anomalyThreshold"),
+				fileBytes: gotFile,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"isValid":true,"cleanedRecordCount":14,"summary":{"original_count":16,"cleaned_count":14,"ablated_count":2,"anomalous_count":0}}`))
@@ -55,10 +72,17 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			f, _, err := r.FormFile("file")
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			gotFile, _ := io.ReadAll(f)
+			_ = f.Close()
 			bm := r.FormValue("baseModel")
 			jn := r.FormValue("jobName")
 			pf := r.FormValue("enableSurprisalPreflight")
-			submitCh <- submitCapture{baseModel: bm, jobName: jn, preflight: pf}
+			submitCh <- submitCapture{baseModel: bm, jobName: jn, preflight: pf, fileBytes: gotFile}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"jobId":"job_abc123","jobName":"` + jn + `","status":"Queued","baseModel":"` + bm + `","datasetPath":"datasets/job_abc123.jsonl","datasetHash":"deadbeef","surprisalPreflightStatus":"Completed"}`))
@@ -73,6 +97,9 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job_failed":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"jobId":"job_failed","status":"Failed","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job_failed/model_adapters","errorMessage":"worker OOM"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job_mismatch":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jobId":"job_other","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job_other/model_adapters"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`[{"jobId":"job_abc123","jobName":"sentinel-test","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct"}]`))
@@ -93,8 +120,8 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatalf("AuditDataset unexpected: %+v err=%v", auditRes, err)
 	}
 	gotAudit := <-auditCh
-	if gotAudit.ablation != "0.00001" {
-		t.Fatalf("expected full precision ablationThreshold 0.00001, got %q", gotAudit.ablation)
+	if gotAudit.ablation != "0.00001" || !bytes.Equal(gotAudit.fileBytes, dsBytes) {
+		t.Fatalf("AuditDataset mismatch: ablation=%q fileLen=%d wantLen=%d", gotAudit.ablation, len(gotAudit.fileBytes), len(dsBytes))
 	}
 
 	subRes, err := client.SubmitJob(context.Background(), SubmitRequest{
@@ -109,8 +136,13 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatalf("SubmitJob unexpected error: %v", err)
 	}
 	gotSub := <-submitCh
-	if subRes.JobID != "job_abc123" || gotSub.preflight != "true" || gotSub.baseModel != model.ModelSmolLM2135MInstruct || gotSub.jobName != "sentinel-test" {
-		t.Fatalf("SubmitJob unexpected: res=%+v captured=%+v", subRes, gotSub)
+	if subRes.JobID != "job_abc123" || gotSub.preflight != "true" || gotSub.baseModel != model.ModelSmolLM2135MInstruct || gotSub.jobName != "sentinel-test" || !bytes.Equal(gotSub.fileBytes, dsBytes) {
+		t.Fatalf("SubmitJob unexpected: res=%+v fileMatch=%v", subRes, bytes.Equal(gotSub.fileBytes, dsBytes))
+	}
+
+	// Mismatched jobId from GET /api/v1/jobs/{id} MUST fail closed.
+	if _, err := client.GetJob(context.Background(), "job_mismatch"); err == nil {
+		t.Fatal("expected GetJob to reject mismatched jobId response")
 	}
 
 	var updates int
@@ -144,6 +176,15 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	loaded, exists, err := LoadActiveAdapter(tmp)
 	if err != nil || !exists || loaded.AdapterPath != state.AdapterPath {
 		t.Fatalf("LoadActiveAdapter: %+v exists=%v err=%v", loaded, exists, err)
+	}
+
+	// Reject an existing manifest with an empty adapter_path while preserving exists=true.
+	emptyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(emptyDir, ActiveAdapterFilename), []byte(`{"base_model":"HuggingFaceTB/SmolLM2-135M-Instruct","adapter_path":""}`), 0600); err != nil {
+		t.Fatalf("write empty adapter manifest: %v", err)
+	}
+	if _, exists, err := LoadActiveAdapter(emptyDir); !exists || err == nil {
+		t.Fatalf("expected LoadActiveAdapter to reject empty adapter_path with exists=true, got exists=%v err=%v", exists, err)
 	}
 }
 
@@ -217,5 +258,14 @@ func TestNotifyDaemonAdapterRedactsEchoedCredentialsInErrorBody(t *testing.T) {
 	}
 	if err := NotifyDaemonAdapter(context.Background(), "http://u:secretpass@127.0.0.1:notaport", "", ActiveAdapter{}, false); err == nil || strings.Contains(err.Error(), "secretpass") {
 		t.Fatalf("NotifyDaemonAdapter leaked URL credentials on parse failure: %v", err)
+	}
+	// Wrapped transport *url.Error must strip URL username as well as password.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := NotifyDaemonAdapter(cancelCtx, "http://secretuser:secretpass@127.0.0.1:1", "", ActiveAdapter{
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/job1/model_adapters",
+	}, false); err == nil || strings.Contains(err.Error(), "secretuser") || strings.Contains(err.Error(), "secretpass") || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected sanitized url.Error preserving context.Canceled without username/password, got %v", err)
 	}
 }

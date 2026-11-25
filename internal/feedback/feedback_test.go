@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -18,8 +19,9 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	// Luhn-valid Visa (4-4-4-4) + Amex (4-6-5) + SSA-valid SSN + JWT + Bearer + Basic
 	// + GitHub token + email + unquoted & JSON-quoted credentials + multi-line PEM with invalid UTF-8 + ChatML.
 	raw := "user=alice@example.com ssn=123-45-6789 card=4111-1111-1111-1111 amex=3782-822463-10005 " +
-		"Authorization: Bearer abcdef1234567890 Authorization: Basic dXNlcjpwYXNz " +
-		`{"authToken": "opaque_json_secret_99", "password": "jsonpwvalue"} ` +
+		`Authorization: Bearer abcdef1234567890 Authorization: Basic dXNlcjpwYXNz {"Authorization": "Basic YTpi"} ` +
+		`{"authToken": "opaque_json_secret_99", "password": "before\"after_escaped_quote"} ` +
+		`DOCKER_AUTH_CONFIG={"auths":{"reg.local":{"auth":"cmVnOnNlY3JldA=="}}} ` +
 		"token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123def456 " +
 		"ghp_1234567890abcdefghij1234567890 password=supersecret <|im_end|>\n" +
 		strings.Repeat("\xff", 40) + "\r\n" +
@@ -29,10 +31,15 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		t.Fatalf("expected ScanForPII to detect sensitive data, got found=%v cat=%q", found, cat)
 	}
 
-	// Verify ScanForPII independently catches opaque Bearer, Basic, and 4-6-5 Amex cards.
+	// Verify ScanForPII independently catches Bearer, Basic, quoted Authorization, DOCKER_AUTH_CONFIG,
+	// credential assignments, emails, and 4-6-5 Amex cards.
 	for _, sample := range []string{
 		"Authorization: Bearer opaqueToken123456",
 		"Authorization: Basic dXNlcjpwYXNz",
+		`{"Authorization": "Basic YTpi"}`,
+		`DOCKER_AUTH_CONFIG={"auths":{"reg.local":{"auth":"cmVnOnNlY3JldA=="}}}`,
+		`password=myplaintextpw`,
+		`contact alice@example.com`,
 		"card=3782-822463-10005",
 	} {
 		if _, found := ScanForPII(sample); !found {
@@ -41,7 +48,7 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	}
 
 	scrubbed, findings := RedactText(raw)
-	if len(findings) < 7 {
+	if len(findings) < 8 {
 		t.Fatalf("expected multiple redacted categories, got %v", findings)
 	}
 	for _, forbidden := range []string{
@@ -51,8 +58,11 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		"3782-822463-10005",
 		"abcdef1234567890",
 		"dXNlcjpwYXNz",
+		"YTpi",
 		"opaque_json_secret_99",
-		"jsonpwvalue",
+		"before",
+		"after_escaped_quote",
+		"cmVnOnNlY3JldA==",
 		"supersecret",
 		"ghp_1234567890",
 		"MIIBOgIBAAJBALeakedKeyMaterialLine1",
@@ -106,12 +116,25 @@ func TestGenerateSeedDatasetBalancedDisjointAndPIIFree(t *testing.T) {
 				t.Fatalf("expected %d seed records for class %s, got %d", tc.trainN, cls, counts[cls])
 			}
 		}
+		valCounts := make(map[string]int)
 		for i, r := range val {
+			if cat, found := ScanForPII(r.Prompt); found {
+				t.Fatalf("seed val record %d prompt triggered PII scan: %s", i, cat)
+			}
+			if cat, found := ScanForPII(r.Completion); found {
+				t.Fatalf("seed val record %d completion triggered PII scan: %s", i, cat)
+			}
+			valCounts[r.Label]++
 			if _, dup := trainTemplates[extractPromptTemplate(r.Prompt)]; dup {
 				t.Fatalf("split (%d,%d) leaked training scenario template into validation record %d: %q", tc.trainN, tc.valN, i, extractPromptTemplate(r.Prompt))
 			}
 			if _, dup := trainPairs[r.Prompt+"\x00"+r.Completion]; dup {
 				t.Fatalf("split (%d,%d) leaked exact prompt/completion into validation record %d", tc.trainN, tc.valN, i)
+			}
+		}
+		for _, cls := range triage.AllClasses() {
+			if valCounts[cls] != tc.valN {
+				t.Fatalf("expected %d val records for class %s, got %d", tc.valN, cls, valCounts[cls])
 			}
 		}
 	}
@@ -204,10 +227,47 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 		t.Fatalf("expected 6000-character (12000-byte) prompt below 10000-char limit to pass, got %v", err)
 	}
 
-	// Reject exporting directly over the curated source queue path.
+	// Verify ValidateJSONLFile rejects extra JSON fields, duplicate keys, null prompt, emails, and credential assignments.
+	for name, content := range map[string]string{
+		"extra-field.jsonl": `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"\u0031\u0032\u0033-45-6789"}` + "\n",
+		"dup-key.jsonl":     `{"prompt":"user 123-45-6789","prompt":"clean prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
+		"null-prompt.jsonl": `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
+		"email-pii.jsonl":   `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",
+		"cred-kv.jsonl":     `{"prompt":"login password=unredactedpw failed","completion":"[AUTH-BRUTEFORCE]"}` + "\n",
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if _, err := ValidateJSONLFile(p, true); err == nil {
+			t.Fatalf("expected ValidateJSONLFile to reject %s", name)
+		}
+	}
+
+	// Reject arbitrary PII/email in FeedbackRecord.Label during PrepareRecord.
+	if _, _, err := PrepareRecord(model.FeedbackRecord{
+		Prompt:     "normal log event text",
+		Completion: "[BENIGN-NOISE]",
+		Label:      "alice@example.com",
+	}, true); err == nil {
+		t.Fatal("expected PrepareRecord to reject invalid email label")
+	}
+
+	// Reject exporting directly over the curated source queue OR another curated queue (even seed-only).
 	srcPath, _ := store.PathFor(DefaultFeedbackFilename)
 	if _, err := store.ExportFTaaS(DefaultFeedbackFilename, srcPath, 0, 1); err == nil {
 		t.Fatal("expected ExportFTaaS to reject overwriting the curated source queue")
+	}
+	if _, err := store.ExportFTaaS("", srcPath, 1, 1); err == nil {
+		t.Fatal("expected seed-only ExportFTaaS to reject overwriting primary curated queue")
+	}
+	otherQueueName, _ := NamedFilename("team-other")
+	if _, err := store.Append(otherQueueName, rec); err != nil {
+		t.Fatalf("Append team-other: %v", err)
+	}
+	otherQueuePath, _ := store.PathFor(otherQueueName)
+	if _, err := store.ExportFTaaS(DefaultFeedbackFilename, otherQueuePath, 0, 1); err == nil {
+		t.Fatal("expected ExportFTaaS to reject overwriting another existing curated queue")
 	}
 
 	// Reject oversized seed count before generating seed data, while keeping exact-fit valid.
@@ -269,7 +329,7 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		if err := j.Record(emit.Alert{
 			AlertID:           fmt.Sprintf("sentinel-100-%d", i),
-			SourceService:     "api",
+			SourceService:     "svc-owner@example.com",
 			Severity:          "HIGH",
 			Message:           "user=alice@example.com ssn=123-45-6789 Authorization: Bearer secretToken12345",
 			SanitizedSample:   "Authorization: Basic dXNlcjpwYXNz",
@@ -277,6 +337,10 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
 		}
+	}
+	// Reject alert with empty AlertID before modifying journal.
+	if err := j.Record(emit.Alert{AlertID: "", Severity: "HIGH", Message: "missing id"}); err == nil {
+		t.Fatal("expected AlertJournal.Record to reject empty AlertID")
 	}
 
 	if _, found, err := j.FindByID("sentinel-100-1"); err != nil || found {
@@ -286,12 +350,12 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	if err != nil || !found || got.AlertID != "sentinel-100-5" {
 		t.Fatalf("expected newest alert sentinel-100-5, got=%+v found=%v err=%v", got, found, err)
 	}
-	// Verify PII/secrets were scrubbed before persistence in alerts.jsonl.
+	// Verify PII/secrets (including SourceService email) were scrubbed before persistence in alerts.jsonl.
 	rawJournal, err := os.ReadFile(j.Path())
 	if err != nil {
 		t.Fatalf("read alerts.jsonl: %v", err)
 	}
-	for _, secret := range []string{"alice@example.com", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
+	for _, secret := range []string{"svc-owner@example.com", "alice@example.com", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
 		if strings.Contains(string(rawJournal), secret) {
 			t.Fatalf("secret %q leaked into alerts.jsonl: %s", secret, string(rawJournal))
 		}
@@ -300,6 +364,16 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	recent, err := j.Recent(2)
 	if err != nil || len(recent) != 2 || recent[0].AlertID != "sentinel-100-5" {
 		t.Fatalf("unexpected Recent(2): %+v err=%v", recent, err)
+	}
+
+	// Verify malformed existing journal row fails closed rather than silently rewriting over history.
+	corruptDir := t.TempDir()
+	jCorrupt := NewAlertJournal(corruptDir)
+	if err := os.WriteFile(jCorrupt.Path(), []byte(`{"alert_id":"ok-1"}`+"\n{not-valid-json\n"), 0600); err != nil {
+		t.Fatalf("write corrupt alerts.jsonl: %v", err)
+	}
+	if err := jCorrupt.Record(emit.Alert{AlertID: "ok-2", Severity: "HIGH"}); err == nil {
+		t.Fatal("expected Record to refuse overwriting a journal containing a malformed row")
 	}
 
 	// Verify oversized record is rejected WITHOUT replacing existing journal history.
@@ -316,17 +390,17 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 		t.Fatalf("existing journal lost after oversized Record rejection: found=%v err=%v", found, err)
 	}
 
-	// Verify read error does NOT overwrite/wipe the existing journal.
-	unreadableDir := t.TempDir()
-	jErr := NewAlertJournal(unreadableDir)
-	if err := jErr.Record(emit.Alert{AlertID: "sentinel-keep", Severity: "HIGH"}); err != nil {
-		t.Fatalf("seed journal: %v", err)
-	}
-	if err := os.Chmod(jErr.Path(), 0000); err != nil {
-		t.Fatalf("chmod 0000: %v", err)
-	}
-	defer func() { _ = os.Chmod(jErr.Path(), 0600) }()
-	if os.Geteuid() != 0 {
+	// Verify read error does NOT overwrite/wipe the existing journal (Unix chmod semantics).
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+		unreadableDir := t.TempDir()
+		jErr := NewAlertJournal(unreadableDir)
+		if err := jErr.Record(emit.Alert{AlertID: "sentinel-keep", Severity: "HIGH"}); err != nil {
+			t.Fatalf("seed journal: %v", err)
+		}
+		if err := os.Chmod(jErr.Path(), 0000); err != nil {
+			t.Fatalf("chmod 0000: %v", err)
+		}
+		defer func() { _ = os.Chmod(jErr.Path(), 0600) }()
 		if err := jErr.Record(emit.Alert{AlertID: "sentinel-new", Severity: "HIGH"}); err == nil {
 			t.Fatal("expected read permission error from Record without wiping journal")
 		}

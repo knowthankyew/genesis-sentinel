@@ -14,17 +14,20 @@ var (
 	// JWT tokens (3 base64url segments beginning with eyJ).
 	jwtRe = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
 
-	// Authorization Bearer and Basic credentials.
-	authHeaderCredRe = regexp.MustCompile(`(?i)\b((?:Proxy-)?Authorization\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
+	// Authorization Bearer and Basic credentials (both plain headers and JSON-quoted header keys).
+	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
 	bearerRe         = regexp.MustCompile(`(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
 	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{8,}={0,2})`)
+
+	// Credential-bearing *_AUTH_CONFIG keys (e.g., DOCKER_AUTH_CONFIG JSON objects or strings).
+	authConfigKeyRe = regexp.MustCompile(`(?i)(["']?)\b([A-Z0-9_-]*auth[_-]?config)(["']?\s*[=:]\s*)`)
 
 	// Common cloud, VCS, and AI API key prefixes.
 	apiKeyPrefixRe = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 
 	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
-	// never matching already-redacted placeholders).
-	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\]]+)`)
+	// escape-aware for quoted strings containing \" or \', never matching redacted placeholders).
+	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;&}\]]+)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -73,8 +76,12 @@ func RedactText(raw string) (string, []string) {
 		addFinding("jwt")
 	}
 	if authHeaderCredRe.MatchString(s) {
-		s = authHeaderCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
+		s = authHeaderCredRe.ReplaceAllString(s, "${1}${2}${3}[REDACTED_TOKEN]")
 		addFinding("auth_credential")
+	}
+	if next, changed := redactAuthConfigValues(s); changed {
+		s = next
+		addFinding("auth_config")
 	}
 	if bearerRe.MatchString(s) {
 		s = bearerRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
@@ -99,7 +106,7 @@ func RedactText(raw string) (string, []string) {
 		}
 		rawVal := sub[4]
 		val := strings.Trim(rawVal, `"'`)
-		if val == "" || strings.HasPrefix(val, "[REDACTED") || val == "<STR>" || val == "<HEX>" || val == "<NUM>" {
+		if isRedactedPlaceholder(val) {
 			return match
 		}
 		addFinding("credential_value")
@@ -145,8 +152,8 @@ func RedactText(raw string) (string, []string) {
 
 // ScanForPII performs a fail-closed pre-export compliance scan mirroring FTaaS's
 // DatasetService.ScanForPii (SSA-valid SSNs and Luhn-valid payment cards) plus high-risk
-// unredacted secret patterns (PEM private keys, JWTs, Bearer/Basic authorization credentials,
-// and cloud/VCS API key prefixes).
+// unredacted secret/PII patterns (PEM private keys, JWTs, Bearer/Basic authorization
+// credentials, *_AUTH_CONFIG secrets, credential KV assignments, emails, and cloud/VCS API keys).
 func ScanForPII(text string) (string, bool) {
 	if strings.TrimSpace(text) == "" {
 		return "", false
@@ -160,6 +167,9 @@ func ScanForPII(text string) (string, bool) {
 	if authHeaderCredRe.MatchString(text) {
 		return "Authorization Credential", true
 	}
+	if hasUnredactedAuthConfig(text) {
+		return "Auth Configuration Secret", true
+	}
 	if bearerRe.MatchString(text) {
 		return "Bearer Token", true
 	}
@@ -170,6 +180,12 @@ func ScanForPII(text string) (string, bool) {
 	}
 	if apiKeyPrefixRe.MatchString(text) {
 		return "API Access Key", true
+	}
+	if hasUnredactedCredKV(text) {
+		return "Credential Assignment", true
+	}
+	if emailRe.MatchString(text) {
+		return "Email Address", true
 	}
 	for _, sub := range ssnContextualCandidateRe.FindAllStringSubmatch(text, -1) {
 		if len(sub) >= 8 && isValidSSAParts(sub[3], sub[5], sub[7]) {
@@ -188,6 +204,158 @@ func ScanForPII(text string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func isRedactedPlaceholder(val string) bool {
+	return val == "" || strings.HasPrefix(val, "[REDACTED") || val == "<STR>" || val == "<HEX>" || val == "<NUM>"
+}
+
+func hasUnredactedCredKV(text string) bool {
+	for _, sub := range credKVRe.FindAllStringSubmatch(text, -1) {
+		if len(sub) < 5 {
+			continue
+		}
+		val := strings.Trim(sub[4], `"'`)
+		if !isRedactedPlaceholder(val) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactAuthConfigValues replaces credential-bearing *_AUTH_CONFIG values (such as
+// DOCKER_AUTH_CONFIG={...} or JSON-quoted values) cleanly with [REDACTED_AUTH_CONFIG].
+func redactAuthConfigValues(s string) (string, bool) {
+	var b strings.Builder
+	pos := 0
+	changed := false
+	for pos < len(s) {
+		loc := authConfigKeyRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			b.WriteString(s[pos:])
+			break
+		}
+		valStart := pos + loc[1]
+		b.WriteString(s[pos:valStart])
+		valEnd, replacement, redacted := scanAuthConfigValue(s, valStart)
+		if redacted {
+			b.WriteString(replacement)
+			changed = true
+		} else {
+			b.WriteString(s[valStart:valEnd])
+		}
+		pos = valEnd
+	}
+	if !changed {
+		return s, false
+	}
+	return b.String(), true
+}
+
+func hasUnredactedAuthConfig(s string) bool {
+	pos := 0
+	for pos < len(s) {
+		loc := authConfigKeyRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			return false
+		}
+		valStart := pos + loc[1]
+		valEnd, _, redacted := scanAuthConfigValue(s, valStart)
+		if redacted {
+			return true
+		}
+		if valEnd <= pos {
+			pos = valStart + 1
+		} else {
+			pos = valEnd
+		}
+	}
+	return false
+}
+
+// scanAuthConfigValue scans a JSON object ({...}), escape-aware quoted string, or unquoted
+// value starting at s[valStart:] and reports its end index and redacted replacement.
+func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
+	if valStart >= len(s) {
+		return valStart, "", false
+	}
+	switch s[valStart] {
+	case '{':
+		depth := 0
+		inQuote := byte(0)
+		escaped := false
+		i := valStart
+		for i < len(s) {
+			ch := s[i]
+			if ch == '\r' || ch == '\n' {
+				break
+			}
+			if inQuote != 0 {
+				if escaped {
+					escaped = false
+				} else if ch == '\\' {
+					escaped = true
+				} else if ch == inQuote {
+					inQuote = 0
+				}
+			} else {
+				switch ch {
+				case '"', '\'':
+					inQuote = ch
+				case '{':
+					depth++
+				case '}':
+					depth--
+					if depth == 0 {
+						return i + 1, "[REDACTED_AUTH_CONFIG]", true
+					}
+				}
+			}
+			i++
+		}
+		return i, "[REDACTED_AUTH_CONFIG]", true
+	case '"', '\'':
+		q := s[valStart]
+		escaped := false
+		i := valStart + 1
+		for i < len(s) {
+			ch := s[i]
+			if ch == '\r' || ch == '\n' {
+				break
+			}
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == q {
+				inner := s[valStart+1 : i]
+				if isRedactedPlaceholder(inner) {
+					return i + 1, s[valStart : i+1], false
+				}
+				return i + 1, string(q) + "[REDACTED_AUTH_CONFIG]" + string(q), true
+			}
+			i++
+		}
+		inner := s[valStart+1 : i]
+		if isRedactedPlaceholder(inner) {
+			return i, s[valStart:i], false
+		}
+		return i, string(q) + "[REDACTED_AUTH_CONFIG]" + string(q), true
+	default:
+		i := valStart
+		for i < len(s) {
+			ch := s[i]
+			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == ';' || ch == '&' || ch == ',' || ch == '}' || ch == ']' {
+				break
+			}
+			i++
+		}
+		rawVal := s[valStart:i]
+		if isRedactedPlaceholder(rawVal) {
+			return i, rawVal, false
+		}
+		return i, "[REDACTED_AUTH_CONFIG]", true
+	}
 }
 
 // looksLikeEncodedBasicCred distinguishes standalone Base64 Basic credentials (mixed case,

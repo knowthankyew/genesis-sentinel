@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -331,4 +332,30 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	}
 
 	return b.String(), signals
+}
+
+// SanitizeURLError strips userinfo, query parameters, and fragments from wrapped *url.Error
+// transport errors while preserving the underlying error for errors.Is / errors.As checks
+// (such as context.Canceled and context.DeadlineExceeded).
+func SanitizeURLError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) || ue == nil {
+		return err
+	}
+	cleanURL := "<redacted-url>"
+	if u, parseErr := url.Parse(ue.URL); parseErr == nil && u.Host != "" {
+		u.User = nil
+		u.RawQuery = ""
+		u.ForceQuery = false
+		u.Fragment = ""
+		cleanURL = u.String()
+	}
+	return &url.Error{
+		Op:  ue.Op,
+		URL: cleanURL,
+		Err: ue.Err,
+	}
 }

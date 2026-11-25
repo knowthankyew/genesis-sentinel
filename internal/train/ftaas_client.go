@@ -299,10 +299,10 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 
 	var out SubmitResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return SubmitResponse{}, fmt.Errorf("decode FTaaS submit response: %w", err)
+		return SubmitResponse{}, fmt.Errorf("decode FTaaS submit response for jobName=%q (FTaaS accepted HTTP %d; run `sentinel train list` to locate the queued job before retrying): %w", jobName, statusCode, err)
 	}
 	if !validJobIDRe.MatchString(out.JobID) {
-		return SubmitResponse{}, fmt.Errorf("FTaaS returned invalid jobId %q", out.JobID)
+		return SubmitResponse{}, fmt.Errorf("FTaaS returned invalid jobId %q for jobName=%q (FTaaS accepted HTTP %d; run `sentinel train list` to locate the queued job before retrying)", out.JobID, jobName, statusCode)
 	}
 	return out, nil
 }
@@ -332,6 +332,9 @@ func (c *FTaaSClient) GetJob(ctx context.Context, jobID string) (JobDetail, erro
 	var detail JobDetail
 	if err := json.Unmarshal(respBody, &detail); err != nil {
 		return JobDetail{}, fmt.Errorf("decode FTaaS job detail: %w", err)
+	}
+	if strings.TrimSpace(detail.JobID) == "" || strings.TrimSpace(detail.JobID) != jobID {
+		return JobDetail{}, fmt.Errorf("FTaaS job detail mismatch: requested jobId %q, received %q", jobID, detail.JobID)
 	}
 	return detail, nil
 }
@@ -420,7 +423,7 @@ func (c *FTaaSClient) applyAuth(req *http.Request) {
 func (c *FTaaSClient) doBounded(req *http.Request) ([]byte, int, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, security.SanitizeURLError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -611,6 +612,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		cleanLevel := bucket.displayLevel
 		cleanTemplate, _ := security.SanitizeUntrustedLogText(tmplStr, p.cfg.MaxPromptByte)
 		if p.cfg.RequireRedaction {
+			cleanService, _ = feedback.RedactText(cleanService)
+			cleanLevel, _ = feedback.RedactText(cleanLevel)
 			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
 			bestSample, _ = feedback.RedactText(bestSample)
 		}
@@ -726,6 +729,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		cleanTemplate, _ := security.SanitizeUntrustedLogText(w.Template, p.cfg.MaxPromptByte)
 		cleanSample, msgSigs := security.SanitizeUntrustedLogText(w.SampleLine, p.cfg.MaxPromptByte)
 		if p.cfg.RequireRedaction {
+			cleanService, _ = feedback.RedactText(cleanService)
+			cleanLevel, _ = feedback.RedactText(cleanLevel)
 			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
 			cleanSample, _ = feedback.RedactText(cleanSample)
 		}
@@ -897,7 +902,7 @@ func (p *Pipeline) Stats() Stats {
 		OverflowThresholdSkipped: p.overflowThresholdSkipped.Load(),
 		SinkErrors:               p.sinkErrors.Load(),
 		JournalErrors:            p.journalErrors.Load(),
-		TriageMode:               p.cfg.TriageMode,
+		TriageMode:               "off",
 		ActiveSource:             p.activeSource,
 		DataDir:                  p.cfg.DataDir,
 		GenesisDataDir:           p.cfg.GenesisDataDir,
@@ -991,6 +996,12 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload"})
+		return
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload: unexpected trailing data"})
 		return
 	}
 	baseModel := strings.TrimSpace(req.BaseModel)
@@ -1133,87 +1144,82 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 		info, err := os.Stat(dataDir)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				rep.Status = "failed"
-				return rep, fmt.Errorf("stat data dir %q: %w", dataDir, err)
+				errs = append(errs, fmt.Errorf("stat data dir %q: %w", dataDir, err))
 			}
+		} else if !info.IsDir() {
+			errs = append(errs, fmt.Errorf("data dir %q is not a directory", dataDir))
 		} else {
-			if !info.IsDir() {
-				rep.Status = "failed"
-				return rep, fmt.Errorf("data dir %q is not a directory", dataDir)
-			}
-
-			root, err := os.OpenRoot(dataDir)
-			if err != nil {
-				rep.Status = "failed"
-				return rep, fmt.Errorf("open root %q: %w", dataDir, err)
-			}
-			defer func() { _ = root.Close() }()
-
-			// 1. Known top-level Sentinel state files and atomic temp files.
-			topDir, err := root.Open(".")
-			if err != nil {
-				rep.Status = "failed"
-				return rep, fmt.Errorf("open root dir %q: %w", dataDir, err)
-			}
-			entries, err := topDir.ReadDir(-1)
-			_ = topDir.Close()
-			if err != nil {
-				rep.Status = "failed"
-				return rep, fmt.Errorf("read data dir %q: %w", dataDir, err)
-			}
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				if isOwnedTopLevelFile(entry.Name()) {
-					removeOwnedInRoot(root, entry.Name())
-				}
-			}
-
-			// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
-			fbInfo, statErr := root.Lstat("feedback")
-			if statErr == nil {
-				if fbInfo.Mode()&os.ModeSymlink != 0 {
-					errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
-				} else if fbInfo.IsDir() {
-					defaultFeedbackStat = fbInfo
-					fbRoot, openRootErr := root.OpenRoot("feedback")
-					if openRootErr != nil {
-						errs = append(errs, fmt.Errorf("open feedback root: %w", openRootErr))
+			root, openRootErr := os.OpenRoot(dataDir)
+			if openRootErr != nil {
+				errs = append(errs, fmt.Errorf("open root %q: %w", dataDir, openRootErr))
+			} else {
+				// 1. Known top-level Sentinel state files and atomic temp files.
+				topDir, topOpenErr := root.Open(".")
+				if topOpenErr != nil {
+					errs = append(errs, fmt.Errorf("open root dir %q: %w", dataDir, topOpenErr))
+				} else {
+					entries, readErr := topDir.ReadDir(-1)
+					_ = topDir.Close()
+					if readErr != nil {
+						errs = append(errs, fmt.Errorf("read data dir %q: %w", dataDir, readErr))
 					} else {
-						fbStat, fbStatErr := fbRoot.Stat(".")
-						if fbStatErr != nil {
-							errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
-							_ = fbRoot.Close()
-						} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
-							errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
-							_ = fbRoot.Close()
-						} else {
-							fbDir, openErr := fbRoot.Open(".")
-							if openErr != nil {
-								errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
-							} else {
-								fbEntries, readErr := fbDir.ReadDir(-1)
-								_ = fbDir.Close()
-								if readErr != nil {
-									errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
-								} else {
-									for _, e := range fbEntries {
-										if e.IsDir() {
-											continue
-										}
-										if isOwnedFeedbackFile(e.Name()) {
-											removeOwnedInRoot(fbRoot, e.Name())
-										}
-									}
-								}
+						for _, entry := range entries {
+							if entry.IsDir() {
+								continue
 							}
-							_ = fbRoot.Close()
+							if isOwnedTopLevelFile(entry.Name()) {
+								removeOwnedInRoot(root, entry.Name())
+							}
 						}
 					}
 				}
-			} else if !os.IsNotExist(statErr) {
-				errs = append(errs, fmt.Errorf("lstat feedback dir: %w", statErr))
+
+				// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
+				fbInfo, statErr := root.Lstat("feedback")
+				if statErr == nil {
+					if fbInfo.Mode()&os.ModeSymlink != 0 {
+						errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
+					} else if fbInfo.IsDir() {
+						defaultFeedbackStat = fbInfo
+						fbRoot, fbOpenRootErr := root.OpenRoot("feedback")
+						if fbOpenRootErr != nil {
+							errs = append(errs, fmt.Errorf("open feedback root: %w", fbOpenRootErr))
+						} else {
+							fbStat, fbStatErr := fbRoot.Stat(".")
+							if fbStatErr != nil {
+								errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
+								_ = fbRoot.Close()
+							} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
+								errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
+								_ = fbRoot.Close()
+							} else {
+								fbDir, openErr := fbRoot.Open(".")
+								if openErr != nil {
+									errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+								} else {
+									fbEntries, readErr := fbDir.ReadDir(-1)
+									_ = fbDir.Close()
+									if readErr != nil {
+										errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+									} else {
+										for _, e := range fbEntries {
+											if e.IsDir() {
+												continue
+											}
+											if isOwnedFeedbackFile(e.Name()) {
+												removeOwnedInRoot(fbRoot, e.Name())
+											}
+										}
+									}
+								}
+								_ = fbRoot.Close()
+							}
+						}
+					}
+				} else if !os.IsNotExist(statErr) {
+					errs = append(errs, fmt.Errorf("lstat feedback dir: %w", statErr))
+				}
+				_ = root.Close()
 			}
 		}
 	}
@@ -1271,7 +1277,11 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 	}
 
 	if len(errs) > 0 {
-		rep.Status = "partial"
+		if rep.FilesRemoved > 0 {
+			rep.Status = "partial"
+		} else {
+			rep.Status = "failed"
+		}
 		return rep, errors.Join(errs...)
 	}
 	return rep, nil

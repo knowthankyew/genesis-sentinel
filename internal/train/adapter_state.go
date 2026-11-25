@@ -118,6 +118,9 @@ func LoadActiveAdapter(dataDir string) (ActiveAdapter, bool, error) {
 	if err != nil {
 		return ActiveAdapter{}, true, fmt.Errorf("invalid active adapter path in %q: %w", path, err)
 	}
+	if cleanAdapter == "" {
+		return ActiveAdapter{}, true, fmt.Errorf("invalid active adapter in %q: adapter_path is required", path)
+	}
 	state.AdapterPath = cleanAdapter
 	return state, true, nil
 }
@@ -173,7 +176,7 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	client := security.NewLoopbackHTTPClient(5*time.Second, allowRemote, true)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s/adapter: %w", redactedTarget, err)
+		return fmt.Errorf("POST %s/adapter: %w", redactedTarget, security.SanitizeURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 

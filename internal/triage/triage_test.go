@@ -89,13 +89,22 @@ func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
 		t.Fatalf("expected unstructured completion to default fail-closed to NEEDS-REVIEW, got %+v", vBad)
 	}
 
-	// 3. Unknown leading tag with [BENIGN-NOISE] mentioned in explanation MUST stay NEEDS-REVIEW!
+	// 3. Unknown leading tag with [BENIGN-NOISE] in explanation AND severity=LOW/confidence=0.99 MUST stay NEEDS-REVIEW with review defaults!
 	vExpTag, _ := ParseCompletion(
-		"[UNKNOWN-CLASS] severity=LOW explanation=Not actually [BENIGN-NOISE] in logs.",
+		"[UNKNOWN-CLASS] severity=LOW mitre=TA0006 confidence=0.99 explanation=Not actually [BENIGN-NOISE] in logs.",
 		model.ModelSmolLM2135MInstruct, "", "t-exptag", false, nil,
 	)
-	if vExpTag.Label != ClassNeedsReview {
-		t.Fatalf("expected unknown leading tag not to adopt [BENIGN-NOISE] from explanation, got %+v", vExpTag)
+	if vExpTag.Label != ClassNeedsReview || vExpTag.Severity != "MEDIUM" || vExpTag.MitreTactic != "" || vExpTag.Confidence != 0.5 {
+		t.Fatalf("expected unknown leading tag to preserve NEEDS-REVIEW defaults (MEDIUM, no MITRE, 0.5), got %+v", vExpTag)
+	}
+
+	// 3b. Non-canonical alias tag [NOISE] in live model output MUST fail closed to NEEDS-REVIEW.
+	vAlias, _ := ParseCompletion(
+		"[NOISE] severity=LOW mitre=NONE explanation=Routine ping.",
+		model.ModelSmolLM2135MInstruct, "", "t-alias", false, nil,
+	)
+	if vAlias.Label != ClassNeedsReview || vAlias.Severity != "MEDIUM" {
+		t.Fatalf("expected noncanonical alias [NOISE] to fail closed to NEEDS-REVIEW, got %+v", vAlias)
 	}
 
 	// 4. Metadata-like tokens inside explanation MUST NOT override confidence, severity, or mitre.
@@ -140,7 +149,7 @@ func TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials(t
 	if _, err := NewClient(ClientOptions{MaxPromptBytes: 64}); err == nil {
 		t.Fatal("expected sub-framing MaxPromptBytes to be rejected upfront")
 	}
-	for _, badPath := range []string{"../secret", "/etc/passwd", "artifacts/../../etc", `artifacts\job1`, "artifacts/job\t1/model_adapters"} {
+	for _, badPath := range []string{"../secret", "/etc/passwd", "artifacts/../../etc", `artifacts\job1`, "artifacts/job\t1/model_adapters", "./C:/evil/adapter"} {
 		if _, err := NewClient(ClientOptions{AdapterPath: badPath}); err == nil {
 			t.Fatalf("expected adapter path %q to be rejected", badPath)
 		}
@@ -328,5 +337,52 @@ func TestClientStaleCircuitGenerationDoesNotReopenRecoveredBreaker(t *testing.T)
 	}
 	if reqNum.Load() != 4 {
 		t.Fatalf("expected 4 HTTP calls, got %d", reqNum.Load())
+	}
+}
+
+func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) {
+	// 1. Explicitly empty "adapterPath": "" when an adapter was requested MUST fail closed.
+	mismatchSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
+	}))
+	defer mismatchSrv.Close()
+
+	cMismatch, err := NewClient(ClientOptions{
+		BaseURL:     mismatchSrv.URL,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/job-1/model_adapters",
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := cMismatch.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "x"}); err == nil {
+		t.Fatal("expected explicit empty adapterPath response to fail closed when adapter was requested")
+	}
+
+	// 2. Dispatched request exhausting caller deadline (e.g. TriageTimeoutSec=5) MUST trip circuit breaker.
+	releaseHang := make(chan struct{})
+	hangSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-releaseHang:
+		case <-r.Context().Done():
+		}
+	}))
+	defer func() {
+		close(releaseHang)
+		hangSrv.Close()
+	}()
+
+	cHang, err := NewClient(ClientOptions{BaseURL: hangSrv.URL, Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient hang: %v", err)
+	}
+	deadlineCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, _, err := cHang.TriageWindow(deadlineCtx, PromptInput{Service: "api", SampleLine: "hang"}); err == nil {
+		t.Fatal("expected deadline error on hung server")
+	}
+	if !cHang.Stats().CircuitOpen {
+		t.Fatal("expected circuit breaker to trip when dispatched request exhausts flush deadline")
 	}
 }

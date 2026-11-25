@@ -74,8 +74,8 @@ type generateRequest struct {
 }
 
 type generateResponse struct {
-	BaseModel   string  `json:"baseModel"`
-	AdapterPath string  `json:"adapterPath"`
+	BaseModel   *string `json:"baseModel"`
+	AdapterPath *string `json:"adapterPath"`
 	Completion  string  `json:"completion"`
 	LatencyMs   float64 `json:"latencyMs"`
 }
@@ -129,7 +129,7 @@ func ValidateAdapterPath(rel string) (string, error) {
 		}
 	}
 	cleaned := path.Clean(trimmed)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") {
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || (len(cleaned) >= 2 && cleaned[1] == ':') {
 		return "", fmt.Errorf("invalid adapter path %q: escapes artifacts directory", rel)
 	}
 	return cleaned, nil
@@ -336,7 +336,7 @@ func (c *Client) Health(ctx context.Context) (HealthStatus, error) {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return HealthStatus{}, fmt.Errorf("inference health check at %s: %w", c.redactedURL, err)
+		return HealthStatus{}, fmt.Errorf("inference health check at %s: %w", c.redactedURL, security.SanitizeURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -409,17 +409,20 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		callerCanceled := ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
-		c.recordFailure(circuitGen, !callerCanceled)
-		return model.TriageVerdict{}, false, fmt.Errorf("post %s/api/v1/inference/generate: %w", c.redactedURL, err)
+		// Distinguish explicit caller cancellation (shutdown/abort -> keep breaker closed) from
+		// dispatched request timeouts or transport failures (including exhausting a flush budget
+		// while the server hangs -> trip breaker so subsequent flushes do not stall repeatedly).
+		explicitCancel := errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled)
+		c.recordFailure(circuitGen, !explicitCancel)
+		return model.TriageVerdict{}, false, fmt.Errorf("post %s/api/v1/inference/generate: %w", c.redactedURL, security.SanitizeURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxInferenceResponseBytes+1))
 	if err != nil {
-		callerCanceled := ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
-		c.recordFailure(circuitGen, !callerCanceled)
-		return model.TriageVerdict{}, false, fmt.Errorf("read inference response: %w", err)
+		explicitCancel := errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled)
+		c.recordFailure(circuitGen, !explicitCancel)
+		return model.TriageVerdict{}, false, fmt.Errorf("read inference response: %w", security.SanitizeURLError(err))
 	}
 	if len(respBody) > maxInferenceResponseBytes {
 		c.recordFailure(circuitGen, true)
@@ -442,14 +445,19 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 		c.recordFailure(circuitGen, false)
 		return model.TriageVerdict{}, false, fmt.Errorf("inference returned empty completion")
 	}
-	// Fail closed if the server explicitly reports a different runtime model or adapter than requested.
-	if respModel := strings.TrimSpace(genResp.BaseModel); respModel != "" && respModel != baseModel {
-		c.recordFailure(circuitGen, true)
-		return model.TriageVerdict{}, false, fmt.Errorf("inference baseModel mismatch: requested %q, server used %q", baseModel, respModel)
+	// Fail closed if the server explicitly reports a different (or explicitly empty) runtime
+	// model or adapter than requested, while keeping omitted optional response fields compatible.
+	if genResp.BaseModel != nil {
+		if respModel := strings.TrimSpace(*genResp.BaseModel); respModel != baseModel {
+			c.recordFailure(circuitGen, true)
+			return model.TriageVerdict{}, false, fmt.Errorf("inference baseModel mismatch: requested %q, server used %q", baseModel, respModel)
+		}
 	}
-	if respAdapter := strings.TrimSpace(genResp.AdapterPath); respAdapter != "" && respAdapter != adapterPath {
-		c.recordFailure(circuitGen, true)
-		return model.TriageVerdict{}, false, fmt.Errorf("inference adapterPath mismatch: requested %q, server used %q", adapterPath, respAdapter)
+	if genResp.AdapterPath != nil {
+		if respAdapter := strings.TrimSpace(*genResp.AdapterPath); respAdapter != adapterPath {
+			c.recordFailure(circuitGen, true)
+			return model.TriageVerdict{}, false, fmt.Errorf("inference adapterPath mismatch: requested %q, server used %q", adapterPath, respAdapter)
+		}
 	}
 
 	verdict, overridden := ParseCompletion(
