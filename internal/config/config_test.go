@@ -88,10 +88,29 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 	if cfg.AdapterPath != "artifacts/job-1/model_adapters" {
 		t.Fatalf("expected Validate() to normalize AdapterPath, got %q", cfg.AdapterPath)
 	}
+	// With triage_mode=off, small positive max_prompt_bytes (e.g. 256) remains valid while <=0 fails.
 	cfg = DefaultConfig()
+	cfg.TriageMode = "off"
+	cfg.MaxPromptByte = 256
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected max_prompt_bytes=256 to validate when triage_mode=off, got %v", err)
+	}
+	cfg.MaxPromptByte = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected non-positive max_prompt_bytes to fail validation")
+	}
+	// With triage_mode=http, require both framing-sized max_prompt_bytes AND non-empty inference_http.
+	cfg = DefaultConfig()
+	cfg.TriageMode = "http"
 	cfg.MaxPromptByte = 64
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected sub-framing max_prompt_bytes to fail validation")
+		t.Fatal("expected sub-framing max_prompt_bytes to fail validation when triage_mode=http")
+	}
+	cfg = DefaultConfig()
+	cfg.TriageMode = "http"
+	cfg.InferenceAddr = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected empty inference_http to fail validation when triage_mode=http")
 	}
 	cfg = DefaultConfig()
 	cfg.TriageMaxTokens = 999
@@ -117,12 +136,14 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {
 	tmp := t.TempDir()
 	cfgPath := filepath.Join(tmp, "sentinel.json")
-	raw := `{"base_model":"HuggingFaceTB/SmolLM2-135M-Instruct","surprisal_threshold_nats":4.25,"window":"15s"}`
+	raw := `{"base_model":"HuggingFaceTB/SmolLM2-135M-Instruct","surprisal_threshold_nats":4.25,"window":"15s","triage_timeout_sec":60,"triage_max_tokens":96}`
 	if err := os.WriteFile(cfgPath, []byte(raw), 0600); err != nil {
 		t.Fatalf("failed writing temp config: %v", err)
 	}
 
 	t.Setenv("SENTINEL_SURPRISAL_THRESHOLD", "6.5")
+	t.Setenv("SENTINEL_TRIAGE_TIMEOUT_SEC", "0")
+	t.Setenv("SENTINEL_TRIAGE_MAX_TOKENS", "0")
 	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
@@ -138,5 +159,8 @@ func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {
 	}
 	if cfg.WindowDuration.Seconds() != 15 {
 		t.Fatalf("expected 15s window duration, got %v", cfg.WindowDuration)
+	}
+	if cfg.TriageTimeoutSec != 60 || cfg.TriageMaxTokens != 96 {
+		t.Fatalf("expected nonpositive env overrides to preserve file values (60, 96), got (%d, %d)", cfg.TriageTimeoutSec, cfg.TriageMaxTokens)
 	}
 }

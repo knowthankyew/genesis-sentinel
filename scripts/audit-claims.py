@@ -300,10 +300,32 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
         errors.append("go.sum is non-empty (violates stdlib-only invariant)")
 
     # 2. Security, Model Governance (BitNet excluded), Config Redaction, Tier 2/Feedback & Burn Invariant Go Tests
-    run_check(
+    expected_invariant_tests = [
+        "TestIsLoopbackEndpoint",
+        "TestIsBindingAllInterfaces",
+        "TestAuthMiddleware",
+        "TestSanitizeUntrustedLogText",
+        "TestNewLoopbackHTTPClientRedirectPolicies",
+        "TestValidateBaseModel",
+        "TestDefaultConfigValidates",
+        "TestConfigRejectsBitNetAndNonLoopback",
+        "TestExecuteConfigRedactsTokens",
+        "TestExecuteDataSubcommands",
+        "TestBurnLocalStateRejectsFeedbackSymlinkEscape",
+        "TestPipelineCountsOnlySuccessfulSinkEmissions",
+        "TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate",
+        "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials",
+        "TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline",
+        "TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset",
+        "TestParseCompletionFailClosedAndInjectionOverride",
+        "TestRedactTextAndScanForPII",
+        "TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload",
+    ]
+    ok_inv, inv_out = run_check(
         [
             "go",
             "test",
+            "-json",
             "./internal/security",
             "./internal/model",
             "./internal/config",
@@ -313,21 +335,28 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/feedback",
             "./internal/train",
             "-run",
-            (
-                "^(TestIsLoopbackEndpoint|TestIsBindingAllInterfaces|TestAuthMiddleware|"
-                "TestSanitizeUntrustedLogText|TestNewLoopbackHTTPClientRedirectPolicies|"
-                "TestValidateBaseModel|TestDefaultConfigValidates|TestConfigRejectsBitNetAndNonLoopback|"
-                "TestExecuteConfigRedactsTokens|TestExecuteDataSubcommands|"
-                "TestBurnLocalStateRejectsFeedbackSymlinkEscape|TestPipelineCountsOnlySuccessfulSinkEmissions|"
-                "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials|"
-                "TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline|"
-                "TestParseCompletionFailClosedAndInjectionOverride|"
-                "TestRedactTextAndScanForPII|TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload)$"
-            ),
+            "^(" + "|".join(expected_invariant_tests) + ")$",
         ],
         "Go Security, Model Governance, Redaction & Burn Invariant Tests",
         errors,
     )
+    if ok_inv:
+        passed_tests: set[str] = set()
+        for line in inv_out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("Action") == "pass" and isinstance(ev.get("Test"), str):
+                passed_tests.add(ev["Test"])
+        missing_tests = [t for t in expected_invariant_tests if t not in passed_tests]
+        if missing_tests:
+            errors.append(
+                f"Invariant Go test audit missed expected tests (renamed or skipped?): {', '.join(missing_tests)}"
+            )
 
 
 def run_check(cmd: list[str], label: str, errors: list[str]) -> tuple[bool, str]:

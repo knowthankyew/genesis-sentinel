@@ -3,12 +3,9 @@
 package feedback
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,11 +17,14 @@ var (
 	pathLocks   = make(map[string]*sync.Mutex)
 
 	kernel32DLL      = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutexW = kernel32DLL.NewProc("CreateMutexW")
-	procReleaseMutex = kernel32DLL.NewProc("ReleaseMutex")
+	procLockFileEx   = kernel32DLL.NewProc("LockFileEx")
+	procUnlockFileEx = kernel32DLL.NewProc("UnlockFileEx")
 )
 
-const waitAbandoned = 0x00000080
+const (
+	lockfileExclusiveLock = 0x00000002
+	windowsLockFilename   = ".sentinel.lock"
+)
 
 func getPathMutex(cleanKey string) *sync.Mutex {
 	pathLocksMu.Lock()
@@ -39,15 +39,16 @@ func getPathMutex(cleanKey string) *sync.Mutex {
 
 // AcquireDirLock acquires the same cross-process and in-process directory lock used by
 // Store and AlertJournal so destructive operations such as BurnLocalState serialize cleanly
-// against concurrent appends and journal commits on Windows.
+// against concurrent appends and journal commits across all Windows sessions.
 func AcquireDirLock(dir string) (func(), error) {
 	return acquireFileLock(filepath.Join(dir, ".sentinel-dir-lock-anchor"), false)
 }
 
 // acquireFileLock serializes access to targetPath across both in-process goroutines and
-// separate Windows processes via an in-process per-directory mutex combined with a named
-// Win32 Local\ kernel mutex hashed from the canonical lowercase directory path (leaving
-// zero stray lock files on disk and remaining safe across BurnLocalState unlinks).
+// separate Windows processes (including across distinct Windows sessions such as background
+// services and interactive CLI invocations) via an in-process per-directory mutex combined
+// with an exclusive Win32 LockFileEx filesystem lock on a 0-byte .sentinel.lock anchor file
+// opened without FILE_SHARE_DELETE so BurnLocalState cannot unlink it while held.
 func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
@@ -67,41 +68,69 @@ func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 	pm := getPathMutex(lockKey)
 	pm.Lock()
 
-	sum := sha256.Sum256([]byte(lockKey))
-	mutexName := "Local\\GenesisSentinel-Dir-" + hex.EncodeToString(sum[:16])
-	namePtr, err := syscall.UTF16PtrFromString(mutexName)
+	if !createDir {
+		info, statErr := os.Stat(dir)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return func() { pm.Unlock() }, nil
+			}
+			pm.Unlock()
+			return nil, fmt.Errorf("stat lock directory %q: %w", dir, statErr)
+		}
+		if !info.IsDir() {
+			pm.Unlock()
+			return nil, fmt.Errorf("lock path %q is not a directory", dir)
+		}
+	}
+
+	lockPath := filepath.Join(dir, windowsLockFilename)
+	pathPtr, err := syscall.UTF16PtrFromString(lockPath)
 	if err != nil {
 		pm.Unlock()
-		return nil, fmt.Errorf("encode windows mutex name: %w", err)
+		return nil, fmt.Errorf("encode windows lock path: %w", err)
 	}
 
-	// Pin this goroutine to its OS thread before acquiring the Win32 kernel mutex because
-	// Windows mutex ownership is thread-bound and ReleaseMutex must run on the acquiring thread.
-	runtime.LockOSThread()
+	// Open with FILE_SHARE_READ | FILE_SHARE_WRITE (intentionally omitting FILE_SHARE_DELETE)
+	// so concurrent processes can open the same lock file while deletion is prevented during lock hold.
+	handle, err := syscall.CreateFile(
+		pathPtr,
+		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.OPEN_ALWAYS,
+		syscall.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		pm.Unlock()
+		return nil, fmt.Errorf("open windows lock file %q: %w", lockPath, err)
+	}
 
-	r1, _, callErr := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(namePtr)))
+	var overlapped syscall.Overlapped
+	r1, _, callErr := procLockFileEx.Call(
+		uintptr(handle),
+		uintptr(lockfileExclusiveLock),
+		0,
+		1,
+		0,
+		uintptr(unsafe.Pointer(&overlapped)),
+	)
 	if r1 == 0 {
-		runtime.UnlockOSThread()
-		pm.Unlock()
-		return nil, fmt.Errorf("create windows directory mutex: %w", callErr)
-	}
-	handle := syscall.Handle(r1)
-
-	waitRes, waitErr := syscall.WaitForSingleObject(handle, syscall.INFINITE)
-	if waitRes != syscall.WAIT_OBJECT_0 && waitRes != waitAbandoned {
 		_ = syscall.CloseHandle(handle)
-		runtime.UnlockOSThread()
 		pm.Unlock()
-		if waitErr != nil {
-			return nil, fmt.Errorf("wait on windows directory mutex: %w", waitErr)
-		}
-		return nil, fmt.Errorf("wait on windows directory mutex returned status 0x%x", waitRes)
+		return nil, fmt.Errorf("LockFileEx %q: %w", lockPath, callErr)
 	}
 
 	return func() {
-		_, _, _ = procReleaseMutex.Call(uintptr(handle))
+		var unlockOv syscall.Overlapped
+		_, _, _ = procUnlockFileEx.Call(
+			uintptr(handle),
+			0,
+			1,
+			0,
+			uintptr(unsafe.Pointer(&unlockOv)),
+		)
 		_ = syscall.CloseHandle(handle)
-		runtime.UnlockOSThread()
 		pm.Unlock()
 	}, nil
 }

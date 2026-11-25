@@ -308,4 +308,8 @@ func TestSanitizeURLErrorStripsCauseQuerySecrets(t *testing.T) {
 	if strings.Contains(sanLoc.Error(), "fragsecret2") || !errors.Is(sanLoc, context.DeadlineExceeded) {
 		t.Fatalf("SanitizeURLError failed malformed Location handling: %v", sanLoc)
 	}
+	var locURLErr *url.Error
+	if !errors.As(sanLoc, &locURLErr) || !locURLErr.Timeout() {
+		t.Fatalf("SanitizeURLError did not preserve Timeout() classification on *url.Error: %v", sanLoc)
+	}
 }

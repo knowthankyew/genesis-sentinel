@@ -3,6 +3,7 @@ package feedback
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"regexp"
 	"strings"
 	"unicode"
@@ -12,11 +13,16 @@ import (
 )
 
 var (
-	// PEM private key blocks (single-line or multi-line).
-	pemPrivateKeyRe = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	// PEM private key blocks (complete single/multi-line blocks and truncated unterminated blocks).
+	pemPrivateKeyRe             = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	pemPrivateKeyUnterminatedRe = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*`)
 
-	// JWT tokens (3 base64url segments beginning with eyJ).
-	jwtRe = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+	// JWT candidates (3 base64url segments beginning with eyJ; validated structurally in Go
+	// so compact tokens with short claims objects such as e30 ("{}") are caught without false positives).
+	jwtCandidateRe = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{8,}\b`)
+
+	// Connection/HTTP URL scheme prefixes for scrubbing embedded user:pass@host credentials.
+	urlSchemeRe = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,15}://`)
 
 	// Authorization Bearer and Basic credentials (both plain headers and JSON-quoted header keys).
 	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
@@ -30,8 +36,8 @@ var (
 	apiKeyPrefixRe = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 
 	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
-	// escape-aware for quoted strings, and bracket-aware for exact [REDACTED_*] placeholders).
-	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
+	// escape-aware for complete and unterminated quoted strings, and bracket-aware for exact [REDACTED_*] placeholders).
+	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|"(?:\\.|[^"\\\r\n])*|'(?:\\.|[^'\\\r\n])*|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -75,9 +81,20 @@ func RedactText(raw string) (string, []string) {
 		s = pemPrivateKeyRe.ReplaceAllString(s, "[REDACTED_PRIVATE_KEY]")
 		addFinding("private_key")
 	}
-	if jwtRe.MatchString(s) {
-		s = jwtRe.ReplaceAllString(s, "[REDACTED_JWT]")
+	if pemPrivateKeyUnterminatedRe.MatchString(s) {
+		s = pemPrivateKeyUnterminatedRe.ReplaceAllString(s, "[REDACTED_PRIVATE_KEY]")
+		addFinding("private_key")
+	}
+	s = jwtCandidateRe.ReplaceAllStringFunc(s, func(match string) string {
+		if !looksLikeCompactJWT(match) {
+			return match
+		}
 		addFinding("jwt")
+		return "[REDACTED_JWT]"
+	})
+	if next, changed := redactURLCredentials(s); changed {
+		s = next
+		addFinding("url_credential")
 	}
 	if authHeaderCredRe.MatchString(s) {
 		s = authHeaderCredRe.ReplaceAllString(s, "${1}${2}${3}[REDACTED_TOKEN]")
@@ -114,10 +131,10 @@ func RedactText(raw string) (string, []string) {
 			return match
 		}
 		addFinding("credential_value")
-		if len(rawVal) >= 2 && rawVal[0] == '"' && rawVal[len(rawVal)-1] == '"' {
+		if len(rawVal) >= 1 && rawVal[0] == '"' {
 			return sub[1] + sub[2] + sub[3] + `"[REDACTED_SECRET]"`
 		}
-		if len(rawVal) >= 2 && rawVal[0] == '\'' && rawVal[len(rawVal)-1] == '\'' {
+		if len(rawVal) >= 1 && rawVal[0] == '\'' {
 			return sub[1] + sub[2] + sub[3] + `'[REDACTED_SECRET]'`
 		}
 		return sub[1] + sub[2] + sub[3] + "[REDACTED_SECRET]"
@@ -142,30 +159,33 @@ func RedactText(raw string) (string, []string) {
 		addFinding("ssn")
 		return "[REDACTED_SSN]"
 	})
-	s = cardCandidateRe.ReplaceAllStringFunc(s, func(match string) string {
-		if prefixEnd, ok := findCardLuhnMatch(match); ok {
-			addFinding("payment_card")
-			return "[REDACTED_CARD]" + match[prefixEnd:]
-		}
-		return match
-	})
+	if next, changed := redactCards(s); changed {
+		s = next
+		addFinding("payment_card")
+	}
 
 	return s, findings
 }
 
 // ScanForPII performs a fail-closed pre-export compliance scan mirroring FTaaS's
 // DatasetService.ScanForPii (SSA-valid SSNs and Luhn-valid payment cards) plus high-risk
-// unredacted secret/PII patterns (PEM private keys, JWTs, Bearer/Basic authorization
-// credentials, *_AUTH_CONFIG secrets, credential KV assignments, emails, and cloud/VCS API keys).
+// unredacted secret/PII patterns (PEM private keys, JWTs, connection URL credentials,
+// Bearer/Basic authorization credentials, *_AUTH_CONFIG secrets, credential KV assignments,
+// emails, and cloud/VCS API keys).
 func ScanForPII(text string) (string, bool) {
 	if strings.TrimSpace(text) == "" {
 		return "", false
 	}
-	if pemPrivateKeyRe.MatchString(text) {
+	if pemPrivateKeyRe.MatchString(text) || pemPrivateKeyUnterminatedRe.MatchString(text) {
 		return "PEM Private Key", true
 	}
-	if jwtRe.MatchString(text) {
-		return "JWT Bearer Token", true
+	for _, tok := range jwtCandidateRe.FindAllString(text, -1) {
+		if looksLikeCompactJWT(tok) {
+			return "JWT Bearer Token", true
+		}
+	}
+	if hasURLCredentials(text) {
+		return "URL Credential", true
 	}
 	if authHeaderCredRe.MatchString(text) {
 		return "Authorization Credential", true
@@ -200,12 +220,141 @@ func ScanForPII(text string) (string, bool) {
 			return "Social Security Number (SSN)", true
 		}
 	}
-	for _, match := range cardCandidateRe.FindAllString(text, -1) {
-		if _, ok := findCardLuhnMatch(match); ok {
-			return "Credit/Debit Card Number", true
-		}
+	if hasLuhnCard(text) {
+		return "Credit/Debit Card Number", true
 	}
 	return "", false
+}
+
+// looksLikeCompactJWT validates that a 3-segment base64url JWT candidate decodes to JSON
+// objects for both its header and claims segments (catching empty/short claims like "e30").
+func looksLikeCompactJWT(tok string) bool {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		decoded, err := base64.RawURLEncoding.DecodeString(parts[i])
+		if err != nil {
+			return false
+		}
+		trimmed := bytes.TrimSpace(decoded)
+		if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+			return false
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// redactURLCredentials scrubs scheme://user:pass@host credentials (including passwords that
+// contain '@' by scanning to the last '@' inside the authority segment).
+func redactURLCredentials(s string) (string, bool) {
+	var b strings.Builder
+	pos := 0
+	changed := false
+	for pos < len(s) {
+		loc := urlSchemeRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			b.WriteString(s[pos:])
+			break
+		}
+		authStart := pos + loc[1]
+		authEnd := authStart
+		for authEnd < len(s) {
+			ch := s[authEnd]
+			if ch <= ' ' || ch == '/' || ch == '?' || ch == '#' || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == ',' || ch == ';' || ch == ')' || ch == ']' || ch == '}' {
+				break
+			}
+			authEnd++
+		}
+		authority := s[authStart:authEnd]
+		if atIdx := strings.LastIndexByte(authority, '@'); atIdx > 0 && atIdx < len(authority)-1 {
+			userinfo := authority[:atIdx]
+			if strings.ContainsRune(userinfo, ':') && !isRedactedPlaceholder(userinfo) {
+				b.WriteString(s[pos:authStart])
+				b.WriteString("[REDACTED_SECRET]@")
+				b.WriteString(authority[atIdx+1:])
+				pos = authEnd
+				changed = true
+				continue
+			}
+		}
+		b.WriteString(s[pos:authEnd])
+		pos = authEnd
+	}
+	if !changed {
+		return s, false
+	}
+	return b.String(), true
+}
+
+func hasURLCredentials(s string) bool {
+	_, changed := redactURLCredentials(s)
+	return changed
+}
+
+// redactCards performs a sliding-window Luhn card scan so a valid card following a non-card
+// digit group (e.g. "batch 1234 4111 1111 1111 1111") is caught by advancing past only the
+// first digit group when a candidate fails Luhn, while preserving trailing counts after valid cards.
+func redactCards(s string) (string, bool) {
+	var b strings.Builder
+	pos := 0
+	changed := false
+	for pos < len(s) {
+		loc := cardCandidateRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			b.WriteString(s[pos:])
+			break
+		}
+		start := pos + loc[0]
+		end := pos + loc[1]
+		match := s[start:end]
+		if prefixEnd, ok := findCardLuhnMatch(match); ok {
+			b.WriteString(s[pos:start])
+			b.WriteString("[REDACTED_CARD]")
+			pos = start + prefixEnd
+			changed = true
+			continue
+		}
+		if sep := strings.IndexAny(match, " -"); sep > 0 {
+			nextPos := start + sep + 1
+			b.WriteString(s[pos:nextPos])
+			pos = nextPos
+		} else {
+			b.WriteString(s[pos:end])
+			pos = end
+		}
+	}
+	if !changed {
+		return s, false
+	}
+	return b.String(), true
+}
+
+func hasLuhnCard(s string) bool {
+	pos := 0
+	for pos < len(s) {
+		loc := cardCandidateRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			return false
+		}
+		start := pos + loc[0]
+		end := pos + loc[1]
+		match := s[start:end]
+		if _, ok := findCardLuhnMatch(match); ok {
+			return true
+		}
+		if sep := strings.IndexAny(match, " -"); sep > 0 {
+			pos = start + sep + 1
+		} else {
+			pos = end
+		}
+	}
+	return false
 }
 
 // findCardLuhnMatch checks whether match is a Luhn-valid 13-19 digit payment card; if an
@@ -381,8 +530,16 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 	default:
 		i := valStart
 		if strings.HasPrefix(s[valStart:], "[REDACTED") {
-			if closeRel := strings.IndexByte(s[valStart:], ']'); closeRel >= 0 {
-				i = valStart + closeRel + 1
+			limit := min(len(s), valStart+32)
+			for j := valStart + len("[REDACTED"); j < limit; j++ {
+				ch := s[j]
+				if ch == ']' {
+					i = j + 1
+					break
+				}
+				if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == ';' || ch == '&' || ch == ',' || ch == '}' {
+					break
+				}
 			}
 		}
 		for i < len(s) {

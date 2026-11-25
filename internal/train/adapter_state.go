@@ -182,10 +182,17 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	redactedU.User = nil
 	redactedTarget := strings.TrimRight(redactedU.String(), "/")
 
-	body, err := json.Marshal(map[string]string{
+	payload := map[string]string{
 		"base_model":   state.BaseModel,
 		"adapter_path": state.AdapterPath,
-	})
+	}
+	if strings.TrimSpace(state.JobID) != "" {
+		payload["job_id"] = strings.TrimSpace(state.JobID)
+	}
+	if strings.TrimSpace(state.DatasetHash) != "" {
+		payload["dataset_hash"] = strings.TrimSpace(state.DatasetHash)
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}

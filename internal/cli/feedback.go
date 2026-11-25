@@ -17,9 +17,12 @@ import (
 func runFeedback(args []string, stdout, stderr io.Writer) error {
 	action := "add"
 	subArgs := args
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		action = strings.ToLower(strings.TrimSpace(args[0]))
-		subArgs = args[1:]
+	if len(args) > 0 {
+		first := strings.ToLower(strings.TrimSpace(args[0]))
+		if first == "-h" || first == "--help" || !strings.HasPrefix(args[0], "-") {
+			action = first
+			subArgs = args[1:]
+		}
 	}
 
 	switch action {
@@ -88,6 +91,9 @@ func runFeedbackAdd(args []string, stdout, stderr io.Writer) error {
 	asJSON := fs.Bool("json", false, "Emit JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --alert-id, --label, --sample)", fs.Arg(0))
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -188,6 +194,9 @@ func runFeedbackSeed(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --alert-id, --label, --sample)", fs.Arg(0))
+	}
 	if *perClass <= 0 {
 		return fmt.Errorf("--per-class must be positive, got %d", *perClass)
 	}
@@ -284,6 +293,9 @@ func runFeedbackExport(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --alert-id, --label, --sample)", fs.Arg(0))
+	}
 	if *includeSeed < 0 {
 		return fmt.Errorf("--include-seed must be >= 0, got %d", *includeSeed)
 	}
@@ -329,6 +341,9 @@ func runFeedbackStats(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --alert-id, --label, --sample)", fs.Arg(0))
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -359,6 +374,9 @@ func runFeedbackAlerts(args []string, stdout, stderr io.Writer) error {
 	asJSON := fs.Bool("json", false, "Emit JSON array")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --alert-id, --label, --sample)", fs.Arg(0))
 	}
 
 	cfg, err := config.LoadConfig(*configPath)

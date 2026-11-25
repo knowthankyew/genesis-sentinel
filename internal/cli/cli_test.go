@@ -456,8 +456,12 @@ func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
 	}, &out, &errBuf); err != nil {
 		t.Fatalf("train submit --wait --activate failed: %v (stderr=%s)", err, errBuf.String())
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, "active-adapter.json")); err != nil {
-		t.Fatalf("expected active-adapter.json after --activate: %v", err)
+	activeManifest, exists, err := train.LoadActiveAdapter(dataDir)
+	if err != nil || !exists {
+		t.Fatalf("expected active-adapter.json after --activate: exists=%v err=%v", exists, err)
+	}
+	if activeManifest.JobID != "job-smol-01" || activeManifest.BaseModel != model.ModelSmolLM2135MInstruct || activeManifest.AdapterPath != "artifacts/job-smol-01/model_adapters" {
+		t.Fatalf("unexpected persisted active-adapter.json contents: %+v", activeManifest)
 	}
 
 	// 4. Mock local Inference server + run `sentinel scan --triage-mode http`, verifying adapter & model forwarding.
@@ -580,13 +584,16 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 	}
 	seedPath := filepath.Join(dataDir, "feedback", "sentinel-feedback-s.jsonl")
 
+	var submitHits, pollHits atomic.Int32
 	ftaasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs":
+			submitHits.Add(1)
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"jobId":"job-fail-1","jobName":"fail-test","status":"Queued","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-fail-1":
+			pollHits.Add(1)
 			_, _ = w.Write([]byte(`{"jobId":"job-fail-1","status":"Failed","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":"artifacts/job-fail-1/model_adapters","errorMessage":"oom"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -605,8 +612,8 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 		"--poll-interval", "5ms",
 		"--activate",
 	}, &out, &errBuf)
-	if err == nil {
-		t.Fatal("expected train submit --wait --activate to return error for Failed job")
+	if err == nil || !strings.Contains(err.Error(), "oom") || submitHits.Load() != 1 || pollHits.Load() != 1 {
+		t.Fatalf("expected Failed job poll error mentioning oom (submits=%d polls=%d), got %v", submitHits.Load(), pollHits.Load(), err)
 	}
 	if _, statErr := os.Stat(filepath.Join(dataDir, "active-adapter.json")); !os.IsNotExist(statErr) {
 		t.Fatal("Failed job with nonempty adapterPath wrote active-adapter.json")
@@ -621,11 +628,42 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 		"--ftaas-http", ftaasSrv.URL,
 		"--dataset", seedPath,
 		"--activate",
-	}, &out, &errBuf); err == nil {
-		t.Fatal("expected --activate without --wait to be rejected")
+	}, &out, &errBuf); err == nil || !strings.Contains(err.Error(), "--wait") {
+		t.Fatalf("expected --activate without --wait error, got %v", err)
+	}
+	if submitHits.Load() != 1 {
+		t.Fatalf("--activate without --wait still queued a training job (submitHits=%d)", submitHits.Load())
+	}
+
+	// Reject trailing positional arguments before queuing any training job.
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		seedPath,
+		"--data-dir", dataDir,
+		"--ftaas-http", ftaasSrv.URL,
+	}, &out, &errBuf); err == nil || !strings.Contains(err.Error(), "--dataset") || submitHits.Load() != 1 {
+		t.Fatalf("expected trailing positional argument rejection before submission (submitHits=%d), got %v", submitHits.Load(), err)
+	}
+
+	// Route `train --help` and `feedback --help` to their subcommand overviews cleanly.
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"train", "--help"}, "activate"},
+		{[]string{"feedback", "--help"}, "alerts"},
+	} {
+		out.Reset()
+		errBuf.Reset()
+		if err := ExecuteWithOutput(tc.args, &out, &errBuf); err != nil || !strings.Contains(out.String(), tc.want) {
+			t.Fatalf("%v expected overview containing %q, got err=%v out=%q", tc.args, tc.want, err, out.String())
+		}
 	}
 
 	// Reject --wait --activate when Succeeded job returns empty adapterPath.
+	var emptyPolls atomic.Int32
 	emptyAdapterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -633,6 +671,7 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"jobId":"job-empty-1","status":"Queued","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-empty-1":
+			emptyPolls.Add(1)
 			_, _ = w.Write([]byte(`{"jobId":"job-empty-1","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","adapterPath":""}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -647,8 +686,8 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 		"--ftaas-http", emptyAdapterSrv.URL,
 		"--dataset", seedPath,
 		"--wait", "--poll-interval", "5ms", "--activate",
-	}, &out, &errBuf); err == nil {
-		t.Fatal("expected --wait --activate with empty adapterPath to return an error")
+	}, &out, &errBuf); err == nil || !strings.Contains(err.Error(), "empty adapterPath") || emptyPolls.Load() != 1 {
+		t.Fatalf("expected empty adapterPath error after poll (polls=%d), got %v", emptyPolls.Load(), err)
 	}
 
 	// train activate with rejecting daemon (401) must leave previous active-adapter.json untouched.
@@ -657,7 +696,9 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 	if err := os.WriteFile(manifestPath, []byte(prevManifest), 0600); err != nil {
 		t.Fatalf("seed previous active-adapter.json: %v", err)
 	}
+	var daemonHits atomic.Int32
 	rejectDaemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		daemonHits.Add(1)
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 	}))
@@ -669,8 +710,8 @@ func TestExecuteTrainSubmitFailedJobDoesNotActivateAdapter(t *testing.T) {
 		"--data-dir", dataDir,
 		"--adapter-path", "artifacts/new/model_adapters",
 		"--sentinel-http", rejectDaemon.URL,
-	}, &out, &errBuf); err == nil {
-		t.Fatal("expected train activate against 401 daemon to fail")
+	}, &out, &errBuf); err == nil || !strings.Contains(err.Error(), "HTTP 401") || daemonHits.Load() != 1 {
+		t.Fatalf("expected HTTP 401 error from daemon (hits=%d), got %v", daemonHits.Load(), err)
 	}
 	rawAfter, _ := os.ReadFile(manifestPath)
 	if string(rawAfter) != prevManifest {

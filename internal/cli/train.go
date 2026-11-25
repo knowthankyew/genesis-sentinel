@@ -6,21 +6,26 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/feedback"
+	"github.com/knowthankyew/genesis-sentinel/internal/security"
 	"github.com/knowthankyew/genesis-sentinel/internal/train"
 )
 
 func runTrain(args []string, stdout, stderr io.Writer) error {
 	action := "submit"
 	subArgs := args
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		action = strings.ToLower(strings.TrimSpace(args[0]))
-		subArgs = args[1:]
+	if len(args) > 0 {
+		first := strings.ToLower(strings.TrimSpace(args[0]))
+		if first == "-h" || first == "--help" || !strings.HasPrefix(args[0], "-") {
+			action = first
+			subArgs = args[1:]
+		}
 	}
 
 	switch action {
@@ -86,6 +91,9 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (pass dataset path via --dataset)", fs.Arg(0))
+	}
 	if *activate && !*wait {
 		return fmt.Errorf("--activate requires --wait (pass both --wait --activate, or activate later via `sentinel train activate`)")
 	}
@@ -116,7 +124,19 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 
 	resolvedDataset := strings.TrimSpace(*datasetPath)
 	if resolvedDataset == "" {
-		exportDest := filepath.Join(cfg.FeedbackDir, "sentinel-feedback-train.jsonl")
+		// Create an invocation-owned temporary snapshot inside FeedbackDir so concurrent
+		// `sentinel train submit` invocations never overwrite one another's exported dataset.
+		if mkErr := os.MkdirAll(cfg.FeedbackDir, 0700); mkErr != nil {
+			return fmt.Errorf("create feedback directory %q: %w", cfg.FeedbackDir, mkErr)
+		}
+		tmpSnap, tmpErr := os.CreateTemp(cfg.FeedbackDir, ".sentinel-feedback-*.tmp")
+		if tmpErr != nil {
+			return fmt.Errorf("create temp training export snapshot: %w", tmpErr)
+		}
+		exportDest := tmpSnap.Name()
+		_ = tmpSnap.Close()
+		defer func() { _ = os.Remove(exportDest) }()
+
 		store := feedback.NewStore(cfg.FeedbackDir, cfg.RequireRedaction)
 		sum, exportErr := store.ExportFTaaS(feedback.DefaultFeedbackFilename, exportDest, *seedPerClass, *seed)
 		if exportErr != nil {
@@ -204,6 +224,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 		// writes an unactivated adapter, and skip redundant unserialized local writes when the
 		// daemon already persisted active-adapter.json under its exclusive activation lock.
 		daemonSavedSameDir := false
+		daemonActivated := false
 		if strings.TrimSpace(*sentinelHTTP) != "" {
 			token := *authToken
 			if token == "" {
@@ -213,10 +234,17 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("notify running Sentinel daemon: %w", err)
 			}
-			daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
+			daemonActivated = true
+			if security.IsLoopbackEndpoint(*sentinelHTTP) {
+				daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
+			}
 		}
 		if !daemonSavedSameDir {
 			if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+				if daemonActivated {
+					return fmt.Errorf("running Sentinel daemon already activated adapter %q (job %s), but saving local manifest to %q failed (retry with `sentinel train activate --adapter-path %s --job-id %s` without re-training): %w",
+						state.AdapterPath, state.JobID, cfg.DataDir, state.AdapterPath, state.JobID, err)
+				}
 				return fmt.Errorf("save active adapter: %w", err)
 			}
 		}
@@ -247,6 +275,9 @@ func runTrainStatus(args []string, stdout, stderr io.Writer) error {
 	allowRemote := fs.Bool("allow-remote", false, "Allow non-loopback FTaaS endpoint")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --job-id)", fs.Arg(0))
 	}
 	if strings.TrimSpace(*jobID) == "" {
 		return fmt.Errorf("train status requires --job-id")
@@ -288,6 +319,9 @@ func runTrainList(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --limit)", fs.Arg(0))
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -328,6 +362,9 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --adapter-path)", fs.Arg(0))
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -348,6 +385,7 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 		ActivatedAt: time.Now().UTC(),
 	}
 	daemonSavedSameDir := false
+	daemonActivated := false
 	if strings.TrimSpace(*sentinelHTTP) != "" {
 		token := *authToken
 		if token == "" {
@@ -357,10 +395,17 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
+		daemonActivated = true
+		if security.IsLoopbackEndpoint(*sentinelHTTP) {
+			daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
+		}
 	}
 	if !daemonSavedSameDir {
 		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+			if daemonActivated {
+				return fmt.Errorf("running Sentinel daemon already activated adapter %q (job %s), but saving local manifest to %q failed: %w",
+					state.AdapterPath, state.JobID, cfg.DataDir, err)
+			}
 			return err
 		}
 	}

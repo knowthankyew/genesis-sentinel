@@ -56,7 +56,7 @@ func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 	pm := getPathMutex(dir)
 	pm.Lock()
 
-	dirFile, err := os.Open(dir)
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if !createDir && os.IsNotExist(err) {
 			return func() { pm.Unlock() }, nil
@@ -64,6 +64,7 @@ func acquireFileLock(targetPath string, createDir bool) (func(), error) {
 		pm.Unlock()
 		return nil, fmt.Errorf("open lock directory %q: %w", dir, err)
 	}
+	dirFile := os.NewFile(uintptr(fd), dir)
 
 	for {
 		flockErr := syscall.Flock(int(dirFile.Fd()), syscall.LOCK_EX)

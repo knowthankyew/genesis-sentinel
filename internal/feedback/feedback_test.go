@@ -54,16 +54,46 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		`contact alice@example.com`,
 		"card=3782-822463-10005",
 		"card=4111 1111 1111 1111 2 attempts",
+		"batch 1234 4111 1111 1111 1111",
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.sig1234567890",
+		"postgres://admin:p@ssword@db.internal:5432/app",
+		`password="unterminated_secret_val`,
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBALeakedTruncatedKey",
 	} {
 		if _, found := ScanForPII(sample); !found {
 			t.Fatalf("expected ScanForPII to reject %q", sample)
 		}
 	}
 
-	// Verify boundary card redacts the 16-digit card while keeping trailing " 2 attempts" intact.
+	// Verify boundary card redaction, sliding-window card following another number,
+	// connection URL credentials (with '@' inside password), short-claims JWT,
+	// unterminated quoted credentials, and truncated PEM blocks.
 	cardBoundary, _ := RedactText("card=4111 1111 1111 1111 2 attempts")
 	if cardBoundary != "card=[REDACTED_CARD] 2 attempts" {
 		t.Fatalf("unexpected card boundary redaction: got %q", cardBoundary)
+	}
+	cardSlide, _ := RedactText("batch 1234 4111 1111 1111 1111")
+	if cardSlide != "batch 1234 [REDACTED_CARD]" {
+		t.Fatalf("unexpected sliding card redaction: got %q", cardSlide)
+	}
+	urlCred, _ := RedactText("connect postgres://admin:p@ssword@db.internal:5432/app ok")
+	if strings.Contains(urlCred, "p@ssword") || strings.Contains(urlCred, "admin:") || !strings.Contains(urlCred, "postgres://[REDACTED_SECRET]@db.internal:5432/app") {
+		t.Fatalf("unexpected URL credential redaction: got %q", urlCred)
+	}
+	if cat, found := ScanForPII(urlCred); found {
+		t.Fatalf("scrubbed URL credential failed re-scan (%s): %q", cat, urlCred)
+	}
+	shortJWT, _ := RedactText("tok eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.sig1234567890")
+	if strings.Contains(shortJWT, "sig1234567890") {
+		t.Fatalf("short-claims JWT survived RedactText: %q", shortJWT)
+	}
+	untermCred, _ := RedactText(`password="unterminated_secret_val`)
+	if strings.Contains(untermCred, "unterminated_secret_val") {
+		t.Fatalf("unterminated quoted credential survived RedactText: %q", untermCred)
+	}
+	truncPEM, _ := RedactText("-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBALeakedTruncatedKey")
+	if strings.Contains(truncPEM, "MIIBOgIBAAJBALeakedTruncatedKey") {
+		t.Fatalf("truncated PEM private key survived RedactText: %q", truncPEM)
 	}
 	// Verify oversized complete and unterminated DOCKER_AUTH_CONFIG objects (>16 KiB) never leak trailing auth fields.
 	for _, bigCfg := range []string{
@@ -189,11 +219,16 @@ func TestGenerateSeedDatasetBalancedDisjointAndPIIFree(t *testing.T) {
 		}
 	}
 
-	// Verify deterministic seed generation produces identical records (including ReviewedAt) across calls.
+	// Verify deterministic seed generation produces identical records across all rows.
 	a := GenerateSeedDataset(2, 99)
 	b := GenerateSeedDataset(2, 99)
-	if len(a) != len(b) || a[0].Prompt != b[0].Prompt || !a[0].ReviewedAt.Equal(b[0].ReviewedAt) {
-		t.Fatalf("GenerateSeedDataset is not deterministic across calls: a[0]=%+v b[0]=%+v", a[0], b[0])
+	if len(a) == 0 || len(a) != len(b) {
+		t.Fatalf("GenerateSeedDataset unexpected lengths: len(a)=%d len(b)=%d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Prompt != b[i].Prompt || a[i].Completion != b[i].Completion || a[i].Label != b[i].Label || !a[i].ReviewedAt.Equal(b[i].ReviewedAt) {
+			t.Fatalf("GenerateSeedDataset diverged at record %d: a=%+v b=%+v", i, a[i], b[i])
+		}
 	}
 }
 
@@ -256,6 +291,27 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 	valSum, err := ValidateJSONLFile(exportPath, true)
 	if err != nil || valSum.RecordCount != sum.RecordCount || valSum.SHA256 != sum.SHA256 {
 		t.Fatalf("ValidateJSONLFile mismatch: val=%+v export=%+v err=%v", valSum, sum, err)
+	}
+
+	// Verify writer-to-validator round-trip accepts Sentinel-generated quoted placeholders
+	// (serialized as password=\"[REDACTED_SECRET]\") while still rejecting real quoted credentials.
+	quotedPlaceholderPath := filepath.Join(dir, "quoted-placeholder.jsonl")
+	if _, err := WriteFTaaSDataset(quotedPlaceholderPath, []model.FeedbackRecord{{
+		Prompt:     `login attempt password="real_plaintext_secret" failed`,
+		Completion: "[AUTH-BRUTEFORCE] severity=HIGH mitre=TA0006 explanation=ok",
+		Label:      triage.ClassAuthBruteforce,
+	}}, true); err != nil {
+		t.Fatalf("WriteFTaaSDataset quoted placeholder: %v", err)
+	}
+	if _, err := ValidateJSONLFile(quotedPlaceholderPath, true); err != nil {
+		t.Fatalf("ValidateJSONLFile rejected Sentinel-generated quoted [REDACTED_SECRET] placeholder: %v", err)
+	}
+	rawQuotedCred := filepath.Join(dir, "raw-quoted-cred.jsonl")
+	if err := os.WriteFile(rawQuotedCred, []byte(`{"prompt":"login attempt password=\"real_plaintext_secret\" failed","completion":"[AUTH-BRUTEFORCE]"}`+"\n"), 0600); err != nil {
+		t.Fatalf("write raw-quoted-cred.jsonl: %v", err)
+	}
+	if _, err := ValidateJSONLFile(rawQuotedCred, true); err == nil {
+		t.Fatal("expected ValidateJSONLFile to reject unredacted JSON-escaped quoted credential")
 	}
 
 	// Verify ValidateJSONLFile fails closed on BOTH literal and JSON Unicode-escaped SSN payloads.
@@ -384,6 +440,18 @@ func TestStoreConcurrentAppendsAcrossInstancesPreserveAllRecords(t *testing.T) {
 	if len(recs) != writers*perWriter {
 		t.Fatalf("expected %d records across concurrent Store instances, got %d", writers*perWriter, len(recs))
 	}
+	seenPrompts := make(map[string]int, len(recs))
+	for _, r := range recs {
+		seenPrompts[r.Prompt]++
+	}
+	for w := 0; w < writers; w++ {
+		for i := 0; i < perWriter; i++ {
+			want := fmt.Sprintf("service=api writer=%d seq=%d test log event", w, i)
+			if seenPrompts[want] != 1 {
+				t.Fatalf("expected prompt %q exactly once, got %d", want, seenPrompts[want])
+			}
+		}
+	}
 }
 
 func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
@@ -468,18 +536,59 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 		t.Fatal("expected Record to refuse overwriting a journal containing a malformed row")
 	}
 
-	// Verify oversized record is rejected WITHOUT replacing existing journal history.
-	jSmall := NewAlertJournal(dir)
+	// Verify oversized record is rejected with a clear record-size error WITHOUT modifying existing
+	// journal bytes (seeded in an isolated directory strictly below the reduced cap), AND when
+	// mixed with a valid sibling alert in one batch, the valid sibling is still persisted.
+	isoDir := t.TempDir()
+	jSmall := NewAlertJournal(isoDir)
 	jSmall.maxBytes = 1024
 	jSmall.maxRecordBytes = 1024
+	if err := jSmall.Record(emit.Alert{AlertID: "sentinel-seed", Severity: "LOW", Message: "small seed"}); err != nil {
+		t.Fatalf("seed isolated journal: %v", err)
+	}
+	beforeBytes, err := os.ReadFile(jSmall.Path())
+	if err != nil {
+		t.Fatalf("read isolated journal before: %v", err)
+	}
 	if err := jSmall.Record(emit.Alert{
 		AlertID: "sentinel-too-big",
 		Message: strings.Repeat("X", 2048),
-	}); err == nil {
-		t.Fatal("expected oversized alert record to be rejected")
+	}); err == nil || !strings.Contains(err.Error(), "exceeds journal limit") {
+		t.Fatalf("expected record-size limit error, got %v", err)
 	}
-	if _, found, err := j.FindByID("sentinel-100-5"); err != nil || !found {
-		t.Fatalf("existing journal lost after oversized Record rejection: found=%v err=%v", found, err)
+	afterBytes, err := os.ReadFile(jSmall.Path())
+	if err != nil || string(afterBytes) != string(beforeBytes) {
+		t.Fatalf("oversized single-record rejection altered isolated journal bytes")
+	}
+	if err := jSmall.Record(
+		emit.Alert{AlertID: "sentinel-too-big-2", Message: strings.Repeat("Y", 2048)},
+		emit.Alert{AlertID: "sentinel-good-sibling", Severity: "MEDIUM", Message: "sibling fits"},
+	); err == nil {
+		t.Fatal("expected error for oversized record in mixed batch")
+	}
+	if _, found, err := jSmall.FindByID("sentinel-good-sibling"); err != nil || !found {
+		t.Fatalf("expected valid sibling alert to persist despite oversized neighbor, found=%v err=%v", found, err)
+	}
+
+	// Verify enabling redaction scrubs retained unredacted rows on the next rewrite.
+	reRedactDir := t.TempDir()
+	jUnred := NewAlertJournalWithRedaction(reRedactDir, false)
+	if err := jUnred.Record(emit.Alert{AlertID: "sentinel-old-email", Severity: "LOW", Message: "contact legacy@example.com"}); err != nil {
+		t.Fatalf("seed unredacted journal: %v", err)
+	}
+	jRed := NewAlertJournalWithRedaction(reRedactDir, true)
+	if err := jRed.Record(emit.Alert{AlertID: "sentinel-new-clean", Severity: "LOW", Message: "clean alert"}); err != nil {
+		t.Fatalf("rewrite with redaction enabled: %v", err)
+	}
+	rawRewritten, err := os.ReadFile(jRed.Path())
+	if err != nil {
+		t.Fatalf("read rewritten journal: %v", err)
+	}
+	if strings.Contains(string(rawRewritten), "legacy@example.com") {
+		t.Fatalf("retained unredacted email survived rewrite with redaction enabled: %s", string(rawRewritten))
+	}
+	if _, found, err := jRed.FindByID("sentinel-old-email"); err != nil || !found {
+		t.Fatalf("expected AlertID sentinel-old-email to remain lookupable after redaction rewrite, found=%v err=%v", found, err)
 	}
 
 	// Verify read error does NOT overwrite/wipe the existing journal (Unix chmod semantics).

@@ -178,6 +178,7 @@ type Pipeline struct {
 	asyncNotifyCh        chan struct{}
 	asyncDoneCh          chan struct{}
 	activeAsyncCancel    context.CancelFunc
+	beforeAsyncPublishFn func() // optional test hook invoked right before publish check
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
@@ -422,33 +423,48 @@ func (p *Pipeline) runAsyncTriageWorker() {
 		if len(p.asyncQueue) == 0 {
 			p.asyncQueue = nil
 		}
-		reqCtx, cancelReq := context.WithCancel(context.Background())
-		p.activeAsyncCancel = cancelReq
 		p.asyncMu.Unlock()
 
-		p.processAsyncTriageTask(reqCtx, task)
-
-		p.asyncMu.Lock()
-		p.activeAsyncCancel = nil
-		p.asyncMu.Unlock()
-		cancelReq()
+		p.processAsyncTriageTask(task)
 	}
 }
 
-func (p *Pipeline) processAsyncTriageTask(ctx context.Context, task asyncTriageTask) {
+func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
+	// Select client/epochs AND register activeAsyncCancel atomically under the standard
+	// burnMu.RLock -> asyncMu.Lock order so an adapter hot-swap occurring before this point
+	// never cancels a freshly dequeued task that is about to use the new adapter.
 	p.burnMu.RLock()
 	client := p.triageClient
 	curBurnEpoch := p.burnEpoch.Load()
 	startAdapterEpoch := p.adapterEpoch.Load()
-	p.burnMu.RUnlock()
-
-	if client == nil || curBurnEpoch != task.burnEpoch || ctx.Err() != nil {
+	if client == nil || curBurnEpoch != task.burnEpoch {
+		p.burnMu.RUnlock()
 		return
 	}
+	p.asyncMu.Lock()
+	if p.asyncClosed {
+		p.asyncMu.Unlock()
+		p.burnMu.RUnlock()
+		return
+	}
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	p.activeAsyncCancel = cancelReq
+	p.asyncMu.Unlock()
+	p.burnMu.RUnlock()
+
+	defer func() {
+		p.asyncMu.Lock()
+		p.activeAsyncCancel = nil
+		p.asyncMu.Unlock()
+		cancelReq()
+	}()
 
 	enriched := task.alert
-	if !p.enrichWithTier2(ctx, client, &enriched) {
+	if !p.enrichWithTier2(reqCtx, client, &enriched) {
 		return
+	}
+	if p.beforeAsyncPublishFn != nil {
+		p.beforeAsyncPublishFn()
 	}
 
 	// Re-verify under burnMu.RLock that neither Burn(), Close(), nor an adapter hot-swap
@@ -1117,13 +1133,13 @@ func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, a
 	if err != nil {
 		return false
 	}
-	explanation := verdict.Explanation
+	explanation, _ := security.SanitizeUntrustedLogText(verdict.Explanation, triage.MaxExplanationBytes*3+64)
 	if p.cfg.RequireRedaction {
 		explanation, _ = feedback.RedactText(explanation)
 	}
 	alert.Tier = alert.Tier + "+tier2"
 	alert.TriageClass = verdict.Label
-	alert.TriageConfidence = verdict.Confidence
+	alert.TriageConfidence = math.Round(verdict.Confidence*1000) / 1000
 	alert.TriageMitreTactic = verdict.MitreTactic
 	alert.TriageExplanation = explanation
 	alert.TriageModel = verdict.ModelID
@@ -1311,8 +1327,10 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		JobID       string `json:"job_id"`
 		BaseModel   string `json:"base_model"`
 		AdapterPath string `json:"adapter_path"`
+		DatasetHash string `json:"dataset_hash"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024))
 	if err := dec.Decode(&req); err != nil {
@@ -1350,8 +1368,10 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 	defer p.burnMu.Unlock()
 
 	state := train.ActiveAdapter{
+		JobID:       strings.TrimSpace(req.JobID),
 		BaseModel:   baseModel,
 		AdapterPath: cleanAdapter,
+		DatasetHash: strings.TrimSpace(req.DatasetHash),
 		ActivatedAt: time.Now().UTC(),
 	}
 	// Persist before committing to live triageClient so a disk persistence failure leaves
@@ -1572,42 +1592,44 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 
 	// 3. If a separate custom feedbackDir was configured outside dataDir/feedback, purge ONLY
 	// Sentinel-named feedback files there via an os.Root handle and shared directory lock.
-	// Use trimming only to detect a blank value; preserve the exact configured path (including spaces).
+	// Strip only redundant trailing path separators (so Linux Lstat never follows a symlink
+	// ending in '/') while preserving exact directory names (including trailing spaces).
 	if strings.TrimSpace(feedbackDir) != "" {
+		checkedFeedbackDir := stripTrailingPathSeparators(feedbackDir)
 		cleanDefault := ""
 		if strings.TrimSpace(dataDir) != "" {
 			cleanDefault = filepath.Clean(filepath.Join(dataDir, "feedback"))
 		}
-		if filepath.Clean(feedbackDir) != cleanDefault {
-			customInfo, lstatErr := os.Lstat(feedbackDir)
+		if filepath.Clean(checkedFeedbackDir) != cleanDefault {
+			customInfo, lstatErr := os.Lstat(checkedFeedbackDir)
 			if lstatErr == nil {
 				if customInfo.Mode()&os.ModeSymlink != 0 {
-					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", feedbackDir))
+					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", checkedFeedbackDir))
 				} else if !customInfo.IsDir() {
-					errs = append(errs, fmt.Errorf("custom feedback dir %q is not a directory", feedbackDir))
+					errs = append(errs, fmt.Errorf("custom feedback dir %q is not a directory", checkedFeedbackDir))
 				} else if defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo) {
-					unlockCustom, cLockErr := feedback.AcquireDirLock(feedbackDir)
+					unlockCustom, cLockErr := feedback.AcquireDirLock(checkedFeedbackDir)
 					if cLockErr != nil {
-						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", feedbackDir, cLockErr))
+						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", checkedFeedbackDir, cLockErr))
 					} else {
-						customRoot, openErr := os.OpenRoot(feedbackDir)
+						customRoot, openErr := os.OpenRoot(checkedFeedbackDir)
 						if openErr != nil {
-							errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", feedbackDir, openErr))
+							errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", checkedFeedbackDir, openErr))
 						} else {
 							cStat, cStatErr := customRoot.Stat(".")
 							if cStatErr != nil {
-								errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", feedbackDir, cStatErr))
+								errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", checkedFeedbackDir, cStatErr))
 							} else if !cStat.IsDir() || !os.SameFile(customInfo, cStat) {
 								errs = append(errs, fmt.Errorf("refusing custom feedback cleanup: directory identity changed between Lstat and OpenRoot"))
 							} else {
 								cDir, dOpenErr := customRoot.Open(".")
 								if dOpenErr != nil {
-									errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", feedbackDir, dOpenErr))
+									errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", checkedFeedbackDir, dOpenErr))
 								} else {
 									cEntries, readErr := cDir.ReadDir(-1)
 									_ = cDir.Close()
 									if readErr != nil {
-										errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", feedbackDir, readErr))
+										errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", checkedFeedbackDir, readErr))
 									} else {
 										for _, e := range cEntries {
 											if e.IsDir() {
@@ -1626,7 +1648,7 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 					}
 				}
 			} else if !os.IsNotExist(lstatErr) {
-				errs = append(errs, fmt.Errorf("lstat custom feedback dir %q: %w", feedbackDir, lstatErr))
+				errs = append(errs, fmt.Errorf("lstat custom feedback dir %q: %w", checkedFeedbackDir, lstatErr))
 			}
 		}
 	}
@@ -1653,6 +1675,15 @@ func isOwnedTopLevelFile(name string) bool {
 		return true
 	}
 	return ownedTopLevelTempRe.MatchString(name)
+}
+
+func stripTrailingPathSeparators(p string) string {
+	volLen := len(filepath.VolumeName(p))
+	trimmed := p
+	for len(trimmed) > volLen+1 && (trimmed[len(trimmed)-1] == '/' || trimmed[len(trimmed)-1] == '\\') {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed
 }
 
 // normalizeAlertTimestamp enforces the Unix-seconds alert timestamp contract expected by

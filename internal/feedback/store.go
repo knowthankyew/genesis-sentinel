@@ -619,13 +619,10 @@ func validateJSONLStream(r io.Reader, path string, requirePIIScan bool) (Validat
 			return ValidationSummary{}, fmt.Errorf("dataset %q exceeds FTaaS ceiling of %d records",
 				path, config.DefaultMaxTrainingRecords)
 		}
-		if requirePIIScan {
-			if cat, found := ScanForPII(line); found {
-				return ValidationSummary{}, fmt.Errorf("dataset %q line %d blocked by pre-upload PII/secret check: detected %s",
-					path, count, cat)
-			}
-		}
-
+		// Parse strict JSON object FIRST (rejecting unknown fields, duplicate keys, null
+		// values, and trailing tokens), then scan decoded string fields for PII/secrets so
+		// escaped quoted placeholders such as password=\"[REDACTED_SECRET]\" in Sentinel-generated
+		// JSONL are accepted while literal and \uXXXX-escaped credentials are always blocked.
 		prompt, completion, err := parseStrictFTaaSRecord(line)
 		if err != nil {
 			return ValidationSummary{}, fmt.Errorf("dataset %q line %d %w", path, count, err)
@@ -761,7 +758,10 @@ func (s *Store) isExistingCuratedQueue(outPath string) bool {
 	if dirCanon != outParentCanon {
 		return false
 	}
-	if !isSentinelFeedbackFilename(filepath.Base(outPath)) {
+	// Match case-insensitively as well so case-insensitive filesystems (Windows/macOS)
+	// cannot overwrite sentinel-feedback-team.jsonl via a case alias like Sentinel-Feedback-team.jsonl.
+	base := filepath.Base(outPath)
+	if !isSentinelFeedbackFilename(base) && !isSentinelFeedbackFilename(strings.ToLower(base)) {
 		return false
 	}
 	return isExistingCuratedQueueFile(outPath)

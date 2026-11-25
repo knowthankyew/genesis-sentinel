@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -126,21 +127,31 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			cfg.AdapterPath = adapterPath
 			adapterPathExplicit = true
 		case "triage-timeout":
-			cfg.TriageTimeoutSec = triageTimeout
+			if triageTimeout > 0 {
+				cfg.TriageTimeoutSec = triageTimeout
+			}
 		}
 	})
 
 	// Auto-load persisted active LoRA adapter manifest only when --adapter-path was omitted
 	// and no adapter_path is configured (explicit `--adapter-path=` disables auto-load).
+	// If --base-model was explicitly set to a different model than the manifest's base_model,
+	// decline to pair an incompatible adapter and warn the operator at startup.
 	var adapterManifestLoadErr error
+	var adapterManifestMismatchMsg string
 	if !adapterPathExplicit && cfg.AdapterPath == "" && cfg.DataDir != "" {
 		active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir)
 		if loadErr != nil {
 			adapterManifestLoadErr = loadErr
 		} else if exists {
-			cfg.AdapterPath = active.AdapterPath
-			if !baseModelExplicit && active.BaseModel != "" {
-				cfg.BaseModel = active.BaseModel
+			if baseModelExplicit && active.BaseModel != "" && !strings.EqualFold(active.BaseModel, cfg.BaseModel) {
+				adapterManifestMismatchMsg = fmt.Sprintf("skipping persisted adapter %q trained for %s because --base-model=%s was explicitly requested",
+					active.AdapterPath, active.BaseModel, cfg.BaseModel)
+			} else {
+				cfg.AdapterPath = active.AdapterPath
+				if !baseModelExplicit && active.BaseModel != "" {
+					cfg.BaseModel = active.BaseModel
+				}
 			}
 		}
 	}
@@ -221,6 +232,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	if adapterManifestLoadErr != nil {
 		logger.Printf("[Tier2] Warning: ignoring unreadable active adapter manifest %s: %v",
 			filepath.Join(cfg.DataDir, train.ActiveAdapterFilename), adapterManifestLoadErr)
+	}
+	if adapterManifestMismatchMsg != "" {
+		logger.Printf("[Tier2] Warning: %s", adapterManifestMismatchMsg)
 	}
 	if surpEng := pipe.SurprisalEngine(); surpEng != nil {
 		n, loadErr := surpEng.LoadFromFile(baselinePath)

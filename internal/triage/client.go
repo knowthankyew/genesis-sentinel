@@ -438,6 +438,13 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 
+	if err := ctx.Err(); err != nil {
+		// Context expired during prompt building before any request was dispatched: fail
+		// without opening the circuit breaker for an uncontacted inference service.
+		c.recordFailure(circuitGen, false)
+		return model.TriageVerdict{}, false, err
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		// Distinguish explicit caller cancellation (shutdown/abort -> keep breaker closed) from
@@ -553,6 +560,9 @@ func redactErrSnippet(raw string, secrets ...string) string {
 	for _, sec := range secrets {
 		if len(sec) >= 4 {
 			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
+			if esc := jsonEscapedInner(sec); esc != "" && esc != sec {
+				s = strings.ReplaceAll(s, esc, "[REDACTED_SECRET]")
+			}
 		}
 	}
 	s = diagJWTRe.ReplaceAllString(s, "[REDACTED_JWT]")
@@ -562,4 +572,12 @@ func redactErrSnippet(raw string, secrets ...string) string {
 		s = truncateUTF8(s, 240) + "..."
 	}
 	return s
+}
+
+func jsonEscapedInner(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		return ""
+	}
+	return string(b[1 : len(b)-1])
 }

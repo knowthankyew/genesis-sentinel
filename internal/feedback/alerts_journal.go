@@ -3,6 +3,7 @@ package feedback
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -75,7 +76,9 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	}
 	defer unlock()
 
-	incoming := make([]emit.Alert, len(alerts))
+	recCap := j.effectiveMaxRecordBytes()
+	incoming := make([]emit.Alert, 0, len(alerts))
+	var oversizedErrs []error
 	for i, a := range alerts {
 		a.AlertID = strings.TrimSpace(a.AlertID)
 		if a.AlertID == "" {
@@ -84,7 +87,18 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 		if j.requireRedaction {
 			a = redactAlertForPersistence(a)
 		}
-		incoming[i] = a
+		raw, mErr := json.Marshal(a)
+		if mErr != nil {
+			return fmt.Errorf("marshal alert %q: %w", a.AlertID, mErr)
+		}
+		if len(raw)+1 > recCap || int64(len(raw)+1) > j.maxBytes {
+			oversizedErrs = append(oversizedErrs, fmt.Errorf("alert %q serialized size (%d bytes) exceeds journal limit (%d bytes)", a.AlertID, len(raw)+1, recCap))
+			continue
+		}
+		incoming = append(incoming, a)
+	}
+	if len(incoming) == 0 {
+		return errors.Join(oversizedErrs...)
 	}
 
 	existing, err := j.readAllLocked()
@@ -93,7 +107,12 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	}
 
 	combined := make([]emit.Alert, len(existing), len(existing)+len(incoming))
-	copy(combined, existing)
+	for i, a := range existing {
+		if j.requireRedaction {
+			a = redactAlertForPersistence(a)
+		}
+		combined[i] = a
+	}
 	idxByID := make(map[string]int, len(combined))
 	for i, a := range combined {
 		idxByID[a.AlertID] = i
@@ -111,7 +130,10 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	if len(combined) > j.maxRecords {
 		combined = combined[len(combined)-j.maxRecords:]
 	}
-	return j.writeAtomicLocked(combined)
+	if err := j.writeAtomicLocked(combined); err != nil {
+		return err
+	}
+	return errors.Join(oversizedErrs...)
 }
 
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
@@ -269,6 +291,9 @@ func (j *AlertJournal) readAllLocked() ([]emit.Alert, error) {
 		if strings.TrimSpace(a.AlertID) == "" {
 			return nil, fmt.Errorf("alert journal %q line %d: missing alert_id", j.path, lineNo)
 		}
+		if j.maxRecords > 0 && len(out) >= j.maxRecords {
+			return nil, fmt.Errorf("alert journal %q exceeds safety cap of %d records", j.path, j.maxRecords)
+		}
 		out = append(out, a)
 	}
 	if err := scanner.Err(); err != nil {
@@ -284,8 +309,8 @@ func (j *AlertJournal) writeAtomicLocked(alerts []emit.Alert) error {
 	}
 
 	recCap := j.effectiveMaxRecordBytes()
-	// Serialize from newest to oldest, enforcing per-record and total byte limits while
-	// bounding peak serialized buffer memory strictly to j.maxBytes.
+	// Serialize from newest to oldest, enforcing per-record limits and capping the
+	// total encoded payload rows kept for writing at j.maxBytes.
 	keptRev := make([][]byte, 0, min(len(alerts), 64))
 	var totalBytes int64
 	for i := len(alerts) - 1; i >= 0; i-- {

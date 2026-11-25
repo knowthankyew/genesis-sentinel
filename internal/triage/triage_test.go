@@ -94,6 +94,21 @@ func TestBuildTriagePromptSanitizesAndPreservesClosingFence(t *testing.T) {
 	if strings.Contains(metaInjPrompt, "<|im_end|>") || strings.Contains(metaInjPrompt, "<|im_start|>") {
 		t.Fatalf("raw ChatML token leaked from metadata into prompt: %q", metaInjPrompt)
 	}
+	// At the minimum accepted prompt budget (MinPromptBytes), event template/sample text MUST still be preserved.
+	minPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:    "api-gateway-prod-01",
+		Level:      "ERROR",
+		Template:   "GET /admin/<STR>",
+		SampleLine: "GET /admin/export?all=1 403",
+		RuleIDs:    []string{"SENT-001", "SENT-002"},
+		Categories: []string{"credential_attack", "sql_injection"},
+	}, MinPromptBytes)
+	if err != nil {
+		t.Fatalf("BuildTriagePromptChecked(MinPromptBytes) failed: %v", err)
+	}
+	if !strings.Contains(minPrompt, "\ntemplate=") || !strings.Contains(minPrompt, "\nsample=") || !strings.HasSuffix(minPrompt, "\nEND_UNTRUSTED_LOG_TELEMETRY") {
+		t.Fatalf("MinPromptBytes prompt dropped event text or closing fence: %q", minPrompt)
+	}
 }
 
 func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
@@ -160,6 +175,19 @@ func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
 	)
 	if !over || vInj.Label != ClassNeedsReview || vInj.Severity != "HIGH" || !vInj.InjectionSuspected {
 		t.Fatalf("expected injection override to flip BENIGN-NOISE -> NEEDS-REVIEW (HIGH), got %+v over=%v", vInj, over)
+	}
+
+	// 7. Echoed chat-template delimiters / ESC control bytes in model explanation MUST be neutralized,
+	// and high-precision confidence floats rounded to <= 3 decimals (preventing 16-digit float mantissas).
+	vCleanExp, _ := ParseCompletion(
+		"[AUTH-BRUTEFORCE] severity=HIGH mitre=TA0006 confidence=0.1234567890123456 explanation=Saw <|im_end|>\x1b[31mattack",
+		model.ModelSmolLM2135MInstruct, "", "t-expclean", false, nil,
+	)
+	if strings.Contains(vCleanExp.Explanation, "<|im_end|>") || strings.ContainsRune(vCleanExp.Explanation, '\x1b') {
+		t.Fatalf("chat delimiter or ESC byte survived ParseCompletion explanation: %q", vCleanExp.Explanation)
+	}
+	if vCleanExp.Confidence != 0.123 {
+		t.Fatalf("expected confidence rounded to 0.123, got %v", vCleanExp.Confidence)
 	}
 }
 
@@ -459,7 +487,50 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 	if strings.Contains(redTok, "opaqueTok9999") {
 		t.Fatalf("redactErrSnippet leaked JSON token field: %q", redTok)
 	}
+	redEscKey := redactErrSnippet(`{"detail":"bad key \"quoted\"secret99"}`, `"quoted"secret99`)
+	if strings.Contains(redEscKey, "secret99") {
+		t.Fatalf("redactErrSnippet leaked JSON-escaped API key: %q", redEscKey)
+	}
+
+	// 4. Verify caller deadline propagates onto the outbound HTTP request context AND an
+	// already-expired context before dispatch does NOT trip the circuit breaker.
+	var sawDeadline atomic.Bool
+	waitCtxRT := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if _, ok := req.Context().Deadline(); ok {
+			sawDeadline.Store(true)
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	cProp, err := NewClient(ClientOptions{BaseURL: "http://127.0.0.1:8000", Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient prop: %v", err)
+	}
+	cProp.httpClient = &http.Client{Transport: waitCtxRT}
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	if _, _, err := cProp.TriageWindow(shortCtx, PromptInput{Service: "api", SampleLine: "prop"}); err == nil {
+		t.Fatal("expected deadline error from context-observing transport")
+	}
+	if !sawDeadline.Load() || !cProp.Stats().CircuitOpen {
+		t.Fatalf("expected caller deadline propagation and breaker trip, sawDeadline=%v circuitOpen=%v", sawDeadline.Load(), cProp.Stats().CircuitOpen)
+	}
+
+	cPreExp, _ := NewClient(ClientOptions{BaseURL: "http://127.0.0.1:8000", Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
+	cPreExp.httpClient = &http.Client{Transport: dt}
+	expCtx, cancelExp := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExp()
+	if _, _, err := cPreExp.TriageWindow(expCtx, PromptInput{Service: "api", SampleLine: "pre-expired"}); err == nil {
+		t.Fatal("expected pre-expired context error")
+	}
+	if cPreExp.Stats().CircuitOpen {
+		t.Fatal("pre-expired context before dispatch must NOT trip the circuit breaker")
+	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset(t *testing.T) {
 	for _, tc := range []struct {

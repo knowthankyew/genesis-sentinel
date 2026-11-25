@@ -176,9 +176,10 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatalf("WaitForJob unexpected: %+v updates=%d err=%v", finalJob, updates, err)
 	}
 
-	// Failed job with non-empty adapterPath MUST return a non-nil error.
-	if _, err := client.WaitForJob(context.Background(), "job_failed", 10*time.Millisecond, nil); err == nil {
-		t.Fatal("expected WaitForJob to return error on Failed job with nonempty adapterPath")
+	// Failed job with non-empty adapterPath MUST return the polled terminal detail AND a non-nil error.
+	failedJob, err := client.WaitForJob(context.Background(), "job_failed", 10*time.Millisecond, nil)
+	if err == nil || !strings.Contains(err.Error(), "worker OOM") || failedJob.JobID != "job_failed" || failedJob.Status != "Failed" || failedJob.AdapterPath == "" {
+		t.Fatalf("expected WaitForJob to return failed detail with worker OOM error, got job=%+v err=%v", failedJob, err)
 	}
 
 	jobs, err := client.ListJobs(context.Background(), 5)

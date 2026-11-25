@@ -172,8 +172,10 @@ func DefaultMitreForClass(class string) string {
 	return ""
 }
 
-// FormatCanonicalCompletion renders a canonical structured completion matching the exact
-// format parsed by ParseCompletion and audited by ml/src/surprisal-service.
+// FormatCanonicalCompletion renders a structured completion sharing the field layout parsed
+// by ParseCompletion and audited by ml/src/surprisal-service. Dataset curation accepts custom
+// operator `[A-Z0-9-]` tags (e.g. `[BENIGN-CRON]`), whereas live ParseCompletion intentionally
+// restricts accepted labels to the 8 built-in canonical classes (mapping others fail-closed to NEEDS-REVIEW).
 func FormatCanonicalCompletion(class, severity, mitre, explanation string) string {
 	normClass, ok := NormalizeFeedbackClass(class)
 	if !ok {
@@ -321,10 +323,21 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	framingLen := len(promptHeader) + len(promptFooter)
 	bodyBudget := maxPromptBytes - framingLen
 
-	const fieldLabelsLen = len("\ntemplate=\nsample=")
+	const (
+		fieldLabelsLen     = len("\ntemplate=\nsample=")
+		minEventTextBudget = 32
+	)
 	avail := bodyBudget - len(metaLine) - fieldLabelsLen
-	if avail < 64 {
-		// Keep metadata bounded to the remaining space while always appending promptFooter intact.
+	if avail < minEventTextBudget && bodyBudget >= fieldLabelsLen+minEventTextBudget {
+		// Reserve at least minEventTextBudget bytes for template/sample event text before
+		// truncating metadata so MinPromptBytes still preserves telemetry for classification.
+		maxMetaLen := bodyBudget - fieldLabelsLen - minEventTextBudget
+		if len(metaLine) > maxMetaLen {
+			metaLine = truncateUTF8(metaLine, maxMetaLen)
+		}
+		avail = bodyBudget - len(metaLine) - fieldLabelsLen
+	}
+	if avail < 16 {
 		if len(metaLine) > bodyBudget {
 			metaLine = truncateUTF8(metaLine, bodyBudget)
 		}
@@ -433,6 +446,9 @@ func ParseCompletion(
 			explanation = "Unstructured Tier 2 output defaulted fail-closed to NEEDS-REVIEW."
 		}
 	}
+	// Neutralize any echoed chat-template delimiters and unsafe control bytes before
+	// storing the explanation in a TriageVerdict or emitting it into downstream alerts.
+	explanation, _ = security.SanitizeUntrustedLogText(explanation, MaxExplanationBytes*3+64)
 	explanation = sanitizeSingleLine(explanation, MaxExplanationBytes)
 
 	overridden := false

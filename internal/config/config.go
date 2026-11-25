@@ -175,9 +175,6 @@ func (c *Config) Validate() error {
 	if c.BaselineWindowSize <= 0 || c.BaselineWindowSize > MaxBaselineWindowSize {
 		return fmt.Errorf("baseline_window_size must be between 1 and %d, got %d", MaxBaselineWindowSize, c.BaselineWindowSize)
 	}
-	if c.MaxPromptByte < MinMaxPromptBytes {
-		return fmt.Errorf("max_prompt_bytes must be at least %d to fit required prompt framing, got %d", MinMaxPromptBytes, c.MaxPromptByte)
-	}
 	if c.MaxMemMB <= 0 {
 		return fmt.Errorf("max_mem_mb must be positive, got %d", c.MaxMemMB)
 	}
@@ -189,6 +186,17 @@ func (c *Config) Validate() error {
 		c.TriageMode = "http"
 	default:
 		return fmt.Errorf("invalid triage_mode %q: must be off or http", c.TriageMode)
+	}
+	if c.MaxPromptByte <= 0 {
+		return fmt.Errorf("max_prompt_bytes must be positive, got %d", c.MaxPromptByte)
+	}
+	if c.TriageMode == "http" {
+		if c.MaxPromptByte < MinMaxPromptBytes {
+			return fmt.Errorf("max_prompt_bytes must be at least %d when triage_mode=http to fit required prompt framing, got %d", MinMaxPromptBytes, c.MaxPromptByte)
+		}
+		if strings.TrimSpace(c.InferenceAddr) == "" {
+			return fmt.Errorf("triage_mode \"http\" requires a non-empty inference_http address")
+		}
 	}
 	if c.TriageMaxTokens < 16 || c.TriageMaxTokens > 256 {
 		return fmt.Errorf("triage_max_tokens must be between 16 and 256, got %d", c.TriageMaxTokens)
@@ -303,7 +311,7 @@ func loadFromEnv(cfg *Config) {
 		cfg.TriageMode = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v := os.Getenv("SENTINEL_TRIAGE_MAX_TOKENS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.TriageMaxTokens = n
 		}
 	}
@@ -313,7 +321,7 @@ func loadFromEnv(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("SENTINEL_TRIAGE_TIMEOUT_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.TriageTimeoutSec = n
 		}
 	}

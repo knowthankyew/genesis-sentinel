@@ -40,7 +40,7 @@ type Hyperparameters struct {
 }
 
 // DefaultHyperparameters returns safe SmolLM2-Instruct LoRA defaults matching FTaaS
-// with MaxLength=512 so framed Tier 2 security telemetry windows fit without truncation.
+// with a configured sequence limit of MaxLength=512 tokens.
 func DefaultHyperparameters() Hyperparameters {
 	return Hyperparameters{
 		Epochs:       3,
@@ -498,14 +498,18 @@ func compactErrBody(b []byte, secrets ...string) string {
 			return "[response body omitted: short API key configured]"
 		}
 	}
+	// Scrub any caller-configured opaque API keys/tokens across the ENTIRE bounded response
+	// (already capped by doBounded) BEFORE truncating the display excerpt, including JSON-escaped forms.
 	s := strings.TrimSpace(string(b))
-	if len(s) > 4096 {
-		s = s[:4096]
-	}
-	// Scrub any caller-configured opaque API keys/tokens verbatim even if echoed without labels.
 	for _, sec := range secrets {
 		if len(sec) >= 4 {
 			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
+			if esc, err := json.Marshal(sec); err == nil && len(esc) >= 2 {
+				inner := string(esc[1 : len(esc)-1])
+				if inner != "" && inner != sec {
+					s = strings.ReplaceAll(s, inner, "[REDACTED_SECRET]")
+				}
+			}
 		}
 	}
 	// Redact any echoed Authorization credentials, JWTs, API keys, or PII before error output.

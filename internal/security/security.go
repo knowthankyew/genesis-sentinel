@@ -351,6 +351,16 @@ func (e *sanitizedCauseError) Unwrap() error {
 	return e.orig
 }
 
+func (e *sanitizedCauseError) Timeout() bool {
+	var t interface{ Timeout() bool }
+	return errors.As(e.orig, &t) && t.Timeout()
+}
+
+func (e *sanitizedCauseError) Temporary() bool {
+	var t interface{ Temporary() bool }
+	return errors.As(e.orig, &t) && t.Temporary()
+}
+
 // SanitizeURLError strips userinfo, query parameters, and fragments from wrapped *url.Error
 // transport errors — including any unsanitized redirect URLs embedded inside url.Error.Err —
 // while returning a *url.Error so both errors.As(err, &urlErr) and errors.Is(err, context.Canceled)

@@ -93,7 +93,9 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		case "adapter-path":
 			cfg.AdapterPath = *adapterPath
 		case "triage-timeout":
-			cfg.TriageTimeoutSec = *triageTimeout
+			if *triageTimeout > 0 {
+				cfg.TriageTimeoutSec = *triageTimeout
+			}
 		}
 	})
 	if err := cfg.Validate(); err != nil {

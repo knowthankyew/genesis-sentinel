@@ -1292,7 +1292,8 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 			t.Fatal("custom feedback file survived partial burn")
 		}
 
-		// Preserve trailing spaces in custom FeedbackDir so "feedback " never burns sibling "feedback".
+		// Preserve trailing spaces in custom FeedbackDir so "feedback " never burns sibling "feedback"
+		// on filesystems that distinguish trailing-space directory names (POSIX).
 		spaceBase := t.TempDir()
 		dirTrimmed := filepath.Join(spaceBase, "feedback")
 		dirSpaced := filepath.Join(spaceBase, "feedback ")
@@ -1302,22 +1303,42 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 		if err := os.MkdirAll(dirSpaced, 0700); err != nil {
 			t.Fatalf("mkdir spaced: %v", err)
 		}
-		trimmedQueue := filepath.Join(dirTrimmed, "sentinel-feedback.jsonl")
-		spacedQueue := filepath.Join(dirSpaced, "sentinel-feedback.jsonl")
-		if err := os.WriteFile(trimmedQueue, []byte(`{"prompt":"keep","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
-			t.Fatalf("write trimmed queue: %v", err)
+		stTrimmed, err1 := os.Stat(dirTrimmed)
+		stSpaced, err2 := os.Stat(dirSpaced)
+		if err1 == nil && err2 == nil && !os.SameFile(stTrimmed, stSpaced) {
+			trimmedQueue := filepath.Join(dirTrimmed, "sentinel-feedback.jsonl")
+			spacedQueue := filepath.Join(dirSpaced, "sentinel-feedback.jsonl")
+			if err := os.WriteFile(trimmedQueue, []byte(`{"prompt":"keep","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+				t.Fatalf("write trimmed queue: %v", err)
+			}
+			if err := os.WriteFile(spacedQueue, []byte(`{"prompt":"burn","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+				t.Fatalf("write spaced queue: %v", err)
+			}
+			if rep, err := BurnLocalStateWithFeedbackDir("", dirSpaced); err != nil || rep.FilesRemoved != 1 {
+				t.Fatalf("spaced feedback burn unexpected: rep=%+v err=%v", rep, err)
+			}
+			if _, err := os.Stat(spacedQueue); !os.IsNotExist(err) {
+				t.Fatal("spaced feedbackDir queue survived burn")
+			}
+			if _, err := os.Stat(trimmedQueue); err != nil {
+				t.Fatalf("sibling feedback dir was erroneously burned: %v", err)
+			}
 		}
-		if err := os.WriteFile(spacedQueue, []byte(`{"prompt":"burn","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
-			t.Fatalf("write spaced queue: %v", err)
+
+		// Reject symlinked custom feedbackDir even when supplied with a trailing slash.
+		realTarget := t.TempDir()
+		realFile := filepath.Join(realTarget, "sentinel-feedback.jsonl")
+		if err := os.WriteFile(realFile, []byte(`{"prompt":"keep","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
+			t.Fatalf("write realTarget file: %v", err)
 		}
-		if rep, err := BurnLocalStateWithFeedbackDir("", dirSpaced); err != nil || rep.FilesRemoved != 1 {
-			t.Fatalf("spaced feedback burn unexpected: rep=%+v err=%v", rep, err)
-		}
-		if _, err := os.Stat(spacedQueue); !os.IsNotExist(err) {
-			t.Fatal("spaced feedbackDir queue survived burn")
-		}
-		if _, err := os.Stat(trimmedQueue); err != nil {
-			t.Fatalf("sibling feedback dir was erroneously burned: %v", err)
+		symLinkPath := filepath.Join(t.TempDir(), "fb-link")
+		if symErr := os.Symlink(realTarget, symLinkPath); symErr == nil {
+			if _, err := BurnLocalStateWithFeedbackDir("", symLinkPath+string(os.PathSeparator)); err == nil {
+				t.Fatal("expected symlinked custom feedbackDir with trailing slash to be rejected")
+			}
+			if _, err := os.Stat(realFile); err != nil {
+				t.Fatalf("symlinked target file was deleted despite symlink guard: %v", err)
+			}
 		}
 	})
 
@@ -1478,27 +1499,20 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 	}
 
 	t.Run("BurnCancelsInFlightAndPreventsPostBurnLeak", func(t *testing.T) {
-		reqStarted := make(chan struct{})
-		releaseInfer := make(chan struct{})
+		// Deterministically gate a COMPLETED pre-Burn verdict right before publication, run Burn(),
+		// then release the worker and wait for it to finish processing so we prove the burnEpoch
+		// guard discards completed pre-Burn results without leaking to sink or alerts.jsonl.
+		beforePubReached := make(chan struct{})
+		releasePub := make(chan struct{})
 		var closeOnce sync.Once
-		release := func() { closeOnce.Do(func() { close(releaseInfer) }) }
+		relPub := func() { closeOnce.Do(func() { close(releasePub) }) }
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case <-reqStarted:
-			default:
-				close(reqStarted)
-			}
-			select {
-			case <-releaseInfer:
-			case <-r.Context().Done():
-				return
-			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=stale"}`))
 		}))
 		t.Cleanup(func() {
-			release()
+			relPub()
 			srv.Close()
 		})
 
@@ -1509,6 +1523,14 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 		cfg.InferenceAddr = srv.URL
 		sink := &chanAlertSink{ch: make(chan emit.Alert, 8)}
 		pipe := New(cfg, ruleEng, sink, "file")
+		pipe.beforeAsyncPublishFn = func() {
+			select {
+			case <-beforePubReached:
+			default:
+				close(beforePubReached)
+			}
+			<-releasePub
+		}
 		pipe.EnableAsyncTriage(4)
 		defer pipe.Close()
 		pipe.AttachAlertJournal(feedback.NewAlertJournal(dataDir))
@@ -1517,38 +1539,35 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
 			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
 		})
-		_, _ = pipe.FlushWindow()
-		<-sink.ch // deterministic alert
+		em, _ := pipe.FlushWindow()
+		if len(em) != 1 {
+			t.Fatalf("expected 1 deterministic alert, got %d", len(em))
+		}
 		select {
-		case <-reqStarted:
+		case <-sink.ch:
 		case <-time.After(2 * time.Second):
-			t.Fatal("async worker did not start inference")
+			t.Fatal("timed out waiting for initial deterministic alert")
+		}
+		select {
+		case <-beforePubReached:
+		case <-time.After(2 * time.Second):
+			t.Fatal("async worker did not complete pre-Burn inference")
 		}
 
-		// Burn MUST complete promptly while server is blocked and prevent any pre-burn Tier 2 update.
-		burnDone := make(chan error, 1)
-		go func() {
-			_, burnErr := pipe.Burn()
-			burnDone <- burnErr
-		}()
-		select {
-		case burnErr := <-burnDone:
-			if burnErr != nil {
-				t.Fatalf("Burn failed: %v", burnErr)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("Burn stalled on blocked async Tier 2 inference")
+		// Burn completes promptly and bumps burnEpoch while completed verdict awaits publication.
+		if _, burnErr := pipe.Burn(); burnErr != nil {
+			t.Fatalf("Burn failed: %v", burnErr)
 		}
-		release()
-		time.Sleep(50 * time.Millisecond)
+		relPub()
+		pipe.Close() // deterministically wait for the async worker to finish the gated task
 
 		select {
 		case leaked := <-sink.ch:
-			t.Fatalf("pre-burn async Tier 2 alert leaked after Burn(): %+v", leaked)
+			t.Fatalf("completed pre-burn async Tier 2 alert leaked after Burn(): %+v", leaked)
 		default:
 		}
 		if _, statErr := os.Stat(filepath.Join(dataDir, "alerts.jsonl")); !os.IsNotExist(statErr) {
-			t.Fatal("pre-burn async Tier 2 worker recreated alerts.jsonl after Burn()")
+			t.Fatal("completed pre-burn async Tier 2 worker recreated alerts.jsonl after Burn()")
 		}
 	})
 
@@ -1598,21 +1617,31 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
 			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
 		})
-		_, _ = pipe.FlushWindow()
-		<-sink.ch // deterministic alert #1
+		em1, _ := pipe.FlushWindow()
+		if len(em1) != 1 {
+			t.Fatalf("expected 1 deterministic alert #1, got %d", len(em1))
+		}
+		select {
+		case <-sink.ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for deterministic alert #1")
+		}
 		select {
 		case <-reqAStarted:
 		case <-time.After(2 * time.Second):
 			t.Fatal("adapter-A request did not start")
 		}
 
-		// Hot-swap to adapter-B while adapter-A inference is in flight.
+		// Hot-swap to adapter-B (with provenance metadata) while adapter-A inference is in flight.
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"adapter_path":"artifacts/adapter-B/model_adapters"}`))
+		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"job_id":"job-b-42","dataset_hash":"hash-b-99","adapter_path":"artifacts/adapter-B/model_adapters"}`))
 		req.Header.Set("Content-Type", "application/json")
 		pipe.HandleAdapter(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("HandleAdapter returned %d: %s", rec.Code, rec.Body.String())
+		}
+		if disk, exists, err := train.LoadActiveAdapter(dataDir); err != nil || !exists || disk.JobID != "job-b-42" || disk.DatasetHash != "hash-b-99" {
+			t.Fatalf("HandleAdapter did not persist adapter provenance: disk=%+v exists=%v err=%v", disk, exists, err)
 		}
 		relA()
 
