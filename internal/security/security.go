@@ -453,8 +453,15 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	signals := detectInjectionSignalsNormalized(cleaned)
 
 	// 3. Neutralize model control tokens and spoofed telemetry fence markers
-	// (bounded multi-pass to prevent nested reassembly).
-	for pass := 0; pass < 3 && (hasSpecialTemplateDelimiter(cleaned) || containsASCIIFold(cleaned, "untrusted_log_telemetry")); pass++ {
+	// (bounded multi-pass to prevent nested reassembly; bypass ASCII fence precheck on non-ASCII
+	// inputs so Unicode case-folding variants such as long-s U+017F are also defanged).
+	for pass := 0; pass < 3; pass++ {
+		hasDelim := hasSpecialTemplateDelimiter(cleaned)
+		maybeFence := !isPureASCII(cleaned) || containsASCIIFold(cleaned, "untrusted_log_telemetry")
+		if !hasDelim && !maybeFence {
+			break
+		}
+		prev := cleaned
 		if strings.Contains(cleaned, "<|") {
 			cleaned = specialTokenPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
 				inner := tok[2 : len(tok)-2]
@@ -487,9 +494,12 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 			cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
 			cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
 		}
-		if containsASCIIFold(cleaned, "untrusted_log_telemetry") {
+		if maybeFence {
 			cleaned = telemetryFenceBeginRe.ReplaceAllString(cleaned, "[BEGIN_MARKER]")
 			cleaned = telemetryFenceEndRe.ReplaceAllString(cleaned, "[END_MARKER]")
+		}
+		if cleaned == prev {
+			break
 		}
 	}
 

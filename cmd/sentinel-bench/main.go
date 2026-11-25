@@ -201,7 +201,17 @@ func main() {
 		if sha == "" || sha == "unknown" {
 			sha = "local"
 		}
-		opts.outMD = filepath.ToSlash(filepath.Join("docs", "benchmarks", fmt.Sprintf("%s-%s.md", day, sha)))
+		base := fmt.Sprintf("%s-%s", day, sha)
+		cand := filepath.ToSlash(filepath.Join("docs", "benchmarks", base+".md"))
+		// Allocate a fresh immutable path on same-day same-commit reruns so the prior JSON
+		// continues pointing at its intact prior Markdown until the atomic JSON rename commits.
+		for seq := 2; ; seq++ {
+			if _, statErr := os.Lstat(cand); errors.Is(statErr, os.ErrNotExist) {
+				break
+			}
+			cand = filepath.ToSlash(filepath.Join("docs", "benchmarks", fmt.Sprintf("%s-r%d.md", base, seq)))
+		}
+		opts.outMD = cand
 	}
 	if opts.outMD != "" {
 		relMD, relErr := resolveReportMarkdownPath(opts.outMD, opts.outJSON != "")
@@ -1280,11 +1290,26 @@ func writeJSONReport(path string, r BenchmarkReport) error {
 	return writeFileAtomic(path, raw, 0644)
 }
 
-// publishReportPair acquires cross-process locks for the output pair, rejects matching or
-// symlink destinations, stages both artifacts plus any prior Markdown backup before replacing
-// either file, and restores the prior Markdown (reporting any rollback error and retaining the
-// backup for recovery) if JSON replacement fails.
+// publishReportPair normalizes output paths once, acquires cross-process locks for the output
+// pair, rejects matching or symlink destinations, stages both artifacts plus any prior Markdown
+// backup before replacing either file, and restores the prior Markdown (reporting any rollback
+// error and retaining the backup for recovery) if JSON replacement fails.
 func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkReport) error {
+	if outMD != "" {
+		normMD, err := normalizePublishPath(outMD)
+		if err != nil {
+			return fmt.Errorf("validate markdown report destination: %w", err)
+		}
+		outMD = normMD
+	}
+	if outJSON != "" {
+		normJSON, err := normalizePublishPath(outJSON)
+		if err != nil {
+			return fmt.Errorf("validate json report destination: %w", err)
+		}
+		outJSON = normJSON
+	}
+
 	if outMD != "" && outJSON != "" {
 		sameDest, err := sameDestinationPath(outMD, outJSON)
 		if err != nil {
@@ -1399,6 +1424,73 @@ func publishReportPair(outMD, outJSON string, mdBytes []byte, report BenchmarkRe
 		jsonTmp = ""
 	}
 	return nil
+}
+
+// normalizePublishPath rejects leaf symlinks and ambiguous symlink-parent '..' traversal
+// components, then resolves existing parent symlinks once so validation, locking, staging,
+// and os.Rename all operate on the exact same filesystem destination.
+func normalizePublishPath(p string) (string, error) {
+	if hasParentTraversalAfterSymlink(p) {
+		return "", fmt.Errorf("ambiguous '..' component following symlink in %q", p)
+	}
+	if fi, err := os.Lstat(p); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("refusing to replace symlink destination %q", p)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	canonParent, err := resolveCanonicalPath(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(canonParent, filepath.Base(abs)), nil
+}
+
+// hasParentTraversalAfterSymlink detects paths like "symlink_dir/../file" where lexical
+// filepath.Clean/Abs diverges from kernel symlink-first resolution on POSIX systems.
+func hasParentTraversalAfterSymlink(p string) bool {
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	hasDotDot := false
+	for _, part := range parts {
+		if part == ".." {
+			hasDotDot = true
+			break
+		}
+	}
+	if !hasDotDot {
+		return false
+	}
+	prefix := ""
+	if filepath.IsAbs(p) {
+		prefix = string(os.PathSeparator)
+	}
+	seenSymlink := false
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			if seenSymlink {
+				return true
+			}
+			prefix = filepath.Join(prefix, part)
+			continue
+		}
+		if prefix == "" {
+			prefix = part
+		} else {
+			prefix = filepath.Join(prefix, part)
+		}
+		if fi, err := os.Lstat(prefix); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			seenSymlink = true
+		}
+	}
+	return false
 }
 
 // resolveCanonicalPath resolves symlinks on the deepest existing ancestor of p so paths under
@@ -1542,14 +1634,10 @@ func acquirePublishLocks(paths ...string) (func(), error) {
 				release()
 				return nil, err
 			}
-			// Clear clearly stale lockfiles left by crashed runs (> 5 minutes old).
-			if fi, statErr := os.Stat(t.lockPath); statErr == nil && time.Since(fi.ModTime()) > 5*time.Minute {
-				_ = os.Remove(t.lockPath)
-				continue
-			}
+			// Fail closed rather than unlinking another publisher's lock based on an earlier Stat age check.
 			if time.Now().After(deadline) {
 				release()
-				return nil, fmt.Errorf("timed out waiting for publish lock %q", t.lockPath)
+				return nil, fmt.Errorf("timed out waiting for publish lock %q (if a prior run crashed, remove the lockfile manually and retry)", t.lockPath)
 			}
 			time.Sleep(25 * time.Millisecond)
 		}

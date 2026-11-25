@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -302,8 +303,11 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 		t.Fatalf("expected prior Markdown to be preserved after failed JSON publish, got %q (err=%v)", string(gotMD), err)
 	}
 
-	// Reject matching Markdown and JSON destinations (including equivalent relative/cleaned paths).
-	sameAlias := filepath.Join(pairDir, ".", "report.md")
+	// Reject matching Markdown and JSON destinations using an unnormalized distinct spelling.
+	sameAlias := pairDir + string(os.PathSeparator) + "." + string(os.PathSeparator) + "report.md"
+	if sameAlias == mdPath {
+		t.Fatalf("expected unnormalized alias %q to differ lexically from %q", sameAlias, mdPath)
+	}
 	if err := publishReportPair(mdPath, sameAlias, []byte("# collision\n"), BenchmarkReport{}); err == nil {
 		t.Fatal("expected publishReportPair to reject matching Markdown and JSON destinations")
 	}
@@ -316,17 +320,19 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 	if err := publishReportPair(badJSONTarget, filepath.Join(pairDir, "out.json"), []byte("# new\n"), BenchmarkReport{}); err == nil {
 		t.Fatal("expected publishReportPair to reject non-regular existing Markdown destination")
 	}
-	if os.Geteuid() != 0 {
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		unreadableMD := filepath.Join(pairDir, "unreadable.md")
 		if err := os.WriteFile(unreadableMD, []byte("# secret\n"), 0000); err != nil {
 			t.Fatalf("write unreadable md: %v", err)
 		}
 		defer func() { _ = os.Chmod(unreadableMD, 0644) }()
-		if err := publishReportPair(unreadableMD, filepath.Join(pairDir, "out2.json"), []byte("# replacement\n"), BenchmarkReport{}); err == nil {
-			t.Fatal("expected publishReportPair to fail closed when existing Markdown cannot be read for backup")
-		}
-		if _, statErr := os.Stat(unreadableMD); statErr != nil {
-			t.Fatalf("unreadable prior Markdown was unexpectedly removed: %v", statErr)
+		if _, checkErr := os.ReadFile(unreadableMD); checkErr != nil {
+			if err := publishReportPair(unreadableMD, filepath.Join(pairDir, "out2.json"), []byte("# replacement\n"), BenchmarkReport{}); err == nil {
+				t.Fatal("expected publishReportPair to fail closed when existing Markdown cannot be read for backup")
+			}
+			if _, statErr := os.Stat(unreadableMD); statErr != nil {
+				t.Fatalf("unreadable prior Markdown was unexpectedly removed: %v", statErr)
+			}
 		}
 	}
 
