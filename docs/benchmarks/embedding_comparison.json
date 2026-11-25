@@ -1,0 +1,55 @@
+{
+  "metadata": {
+    "date": "2026-11-25T12:30:09Z",
+    "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+    "offline_mode": true,
+    "platform": "Darwin x86_64",
+    "python_version": "3.12.1",
+    "torch_version": "2.2.2",
+    "model_load_seconds": 0.646,
+    "rss_before_model_mb": 175.72,
+    "rss_after_model_mb": 309.08,
+    "rss_delta_mb": 133.36
+  },
+  "dataset": {
+    "warmup_benign_windows": 30,
+    "eval_total_windows": 50,
+    "eval_benign_windows": 25,
+    "eval_structural_attack_windows": 10,
+    "eval_disguised_semantic_windows": 15,
+    "threshold_nats": 5.0,
+    "semantic_weight_nats": 12.0
+  },
+  "pure_laplace_lk": {
+    "tp": 15,
+    "fp": 0,
+    "fn": 10,
+    "tn": 25,
+    "precision": 1.0,
+    "recall": 0.6,
+    "f1": 0.75,
+    "structural_recall": 1.0,
+    "disguised_semantic_recall": 0.3333,
+    "latency_p50_ms": 0.0405,
+    "latency_p99_ms": 0.0972
+  },
+  "hybrid_laplace_lk_minilm": {
+    "tp": 25,
+    "fp": 0,
+    "fn": 0,
+    "tn": 25,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "structural_recall": 1.0,
+    "disguised_semantic_recall": 1.0,
+    "latency_p50_ms": 5.8451,
+    "latency_p99_ms": 13.2453
+  },
+  "comparison": {
+    "f1_delta": 0.25,
+    "disguised_semantic_recall_delta": 0.6667,
+    "p50_latency_slowdown_x": 144.3,
+    "recommendation": "Keep pure-Go Laplace-LK as the default Tier 1 hot path (P50 0.0405 ms vs hybrid 5.8451 ms, ~144.3x slower with +133.4 MB RSS delta for MiniLM). Hybrid MiniLM improved disguised semantic-only attack recall by +0.6667 (0.3333 -> 1.0000), confirming that semantic embeddings are best reserved as an optional offline/sidecar enrichment tier rather than embedded in the zero-dependency Go binary."
+  }
+}

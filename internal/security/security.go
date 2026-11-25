@@ -38,6 +38,9 @@ var (
 	// gemmaTurnPattern matches Gemma conversation turn delimiters.
 	gemmaTurnPattern = regexp.MustCompile(`<(?:start_of_turn|end_of_turn)>`)
 
+	// llamaInstPattern matches Llama/Mistral instruction and system delimiters.
+	llamaInstPattern = regexp.MustCompile(`(?:<<SYS>>|<</SYS>>|\[/?INST\])`)
+
 	// injectionHeuristics detect common plain-text prompt injection cues inside untrusted log payloads.
 	// Matches are surfaced as TriageVerdict metadata so analysts never mistake injected text for trusted signals.
 	injectionHeuristics = []struct {
@@ -45,8 +48,9 @@ var (
 		re   *regexp.Regexp
 	}{
 		{name: "ignore_previous", re: regexp.MustCompile(`(?i)\b(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?)\b`)},
-		{name: "force_benign_verdict", re: regexp.MustCompile(`(?i)\b(classify|mark|label|treat|output)\s+(this|as)\s+.*\[?benign\]?\b`)},
+		{name: "force_benign_verdict", re: regexp.MustCompile(`(?i)\b(?:classify|mark|label|treat|return|reply|output)\s+(?:(?:this|it)\s+)?(?:as\s+)?(?:a\s+)?[^\n]{0,40}\[?benign(?:[-_ ]noise)?\]?\b`)},
 		{name: "role_override", re: regexp.MustCompile(`(?i)\b(you\s+are\s+now|act\s+as\s+a|new\s+system\s+prompt)\b`)},
+		{name: "telemetry_fence_spoof", re: regexp.MustCompile(`(?i)(?:BEGIN|END)_UNTRUSTED_LOG_TELEMETRY`)},
 	}
 
 	// SanitizeURLError cause scrubbers.
@@ -285,6 +289,90 @@ func NewLoopbackHTTPClient(timeout time.Duration, allowRemote, blockRedirects bo
 	return client
 }
 
+// DetectInjectionSignals inspects raw untrusted log text for chat-template delimiters
+// and semantic prompt-injection cues without allocating a sanitized copy of the string.
+func DetectInjectionSignals(raw string) []string {
+	var signals []string
+	if hasSpecialTemplateDelimiter(raw) {
+		signals = append(signals, "template_delimiter_escape")
+	}
+	for _, h := range injectionHeuristics {
+		if maybeMatchesHeuristic(h.name, raw) && h.re.MatchString(raw) {
+			signals = append(signals, h.name)
+		}
+	}
+	return signals
+}
+
+func hasSpecialTemplateDelimiter(raw string) bool {
+	if strings.Contains(raw, "<|") && specialTokenPattern.MatchString(raw) {
+		return true
+	}
+	if strings.Contains(raw, "_of_turn>") && gemmaTurnPattern.MatchString(raw) {
+		return true
+	}
+	if (strings.Contains(raw, "SYS>>") || strings.Contains(raw, "INST]")) && llamaInstPattern.MatchString(raw) {
+		return true
+	}
+	return false
+}
+
+func maybeMatchesHeuristic(name, raw string) bool {
+	switch name {
+	case "ignore_previous":
+		return containsASCIIFold(raw, "ignore") || containsASCIIFold(raw, "disregard") || containsASCIIFold(raw, "forget")
+	case "force_benign_verdict":
+		return containsASCIIFold(raw, "benign")
+	case "role_override":
+		return containsASCIIFold(raw, "you") || containsASCIIFold(raw, "act") || containsASCIIFold(raw, "prompt")
+	case "telemetry_fence_spoof":
+		return containsASCIIFold(raw, "untrusted_log_telemetry")
+	default:
+		return true
+	}
+}
+
+// containsASCIIFold reports whether s contains the all-lowercase ASCII needle
+// using case-insensitive ASCII matching without allocating.
+func containsASCIIFold(s, lowerNeedle string) bool {
+	n := len(lowerNeedle)
+	if n == 0 {
+		return true
+	}
+	if len(s) < n {
+		return false
+	}
+	firstLo := lowerNeedle[0]
+	var firstHi byte
+	if firstLo >= 'a' && firstLo <= 'z' {
+		firstHi = firstLo - ('a' - 'A')
+	} else {
+		firstHi = firstLo
+	}
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		c := s[i]
+		if c != firstLo && c != firstHi {
+			continue
+		}
+		matched := true
+		for j := 1; j < n; j++ {
+			sc := s[i+j]
+			if sc >= 'A' && sc <= 'Z' {
+				sc += 'a' - 'A'
+			}
+			if sc != lowerNeedle[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
 // SanitizeUntrustedLogText neutralizes chat-template delimiters and unsafe control bytes
 // in untrusted log payloads before they are embedded in Tier 2 triage prompts.
 // It also returns any detected prompt-injection heuristic signal names.
@@ -294,39 +382,69 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	}
 
 	// Detect adversarial injection patterns before rewriting delimiters.
-	var signals []string
-	if specialTokenPattern.MatchString(raw) || gemmaTurnPattern.MatchString(raw) {
-		signals = append(signals, "template_delimiter_escape")
+	signals := DetectInjectionSignals(raw)
+
+	// Neutralize model control tokens only when candidate markers appear.
+	cleaned := raw
+	if strings.Contains(cleaned, "<|") {
+		cleaned = specialTokenPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+			inner := tok[2 : len(tok)-2]
+			return "[" + inner + "]"
+		})
 	}
-	for _, h := range injectionHeuristics {
-		if h.re.MatchString(raw) {
-			signals = append(signals, h.name)
+	if strings.Contains(cleaned, "_of_turn>") {
+		cleaned = gemmaTurnPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+			inner := tok[1 : len(tok)-1]
+			return "[" + inner + "]"
+		})
+	}
+	if strings.Contains(cleaned, "SYS>>") || strings.Contains(cleaned, "INST]") {
+		cleaned = llamaInstPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
+			switch tok {
+			case "<<SYS>>":
+				return "(SYS)"
+			case "<</SYS>>":
+				return "(/SYS)"
+			case "[INST]":
+				return "(INST)"
+			case "[/INST]":
+				return "(/INST)"
+			default:
+				return "[delim]"
+			}
+		})
+	}
+	if strings.Contains(cleaned, "<") {
+		cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
+		cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
+	}
+
+	// Fast path: if cleaned is already printable ASCII (+ \n/\t) within maxBytes, avoid copying.
+	if len(cleaned) <= maxBytes {
+		cleanASCII := true
+		for i := 0; i < len(cleaned); i++ {
+			c := cleaned[i]
+			if (c < 0x20 && c != '\n' && c != '\t') || c >= 0x7f {
+				cleanASCII = false
+				break
+			}
+		}
+		if cleanASCII {
+			return cleaned, signals
 		}
 	}
 
-	// Neutralize model control tokens so hostile log payloads cannot forge assistant turns.
-	cleaned := specialTokenPattern.ReplaceAllStringFunc(raw, func(tok string) string {
-		inner := tok[2 : len(tok)-2]
-		return "[" + inner + "]"
-	})
-	cleaned = gemmaTurnPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
-		inner := tok[1 : len(tok)-1]
-		return "[" + inner + "]"
-	})
-	cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
-	cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
-
-	// Strip non-printable ASCII control characters except horizontal tab and newline.
+	// Strip non-printable ASCII/C1 control characters (except horizontal tab and newline),
+	// Unicode line/paragraph separators (flattened to space), and BiDi override/isolate controls.
 	var b strings.Builder
 	b.Grow(min(len(cleaned), maxBytes))
 	for _, r := range cleaned {
 		if r == '\r' {
 			continue
 		}
-		if r < 0x20 && r != '\n' && r != '\t' {
-			continue
-		}
-		if r == 0x7f {
+		if r == '\u2028' || r == '\u2029' {
+			r = ' '
+		} else if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f) || isBidiControlRune(r) {
 			continue
 		}
 		if b.Len()+utf8.RuneLen(r) > maxBytes {
@@ -336,6 +454,13 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	}
 
 	return b.String(), signals
+}
+
+func isBidiControlRune(r rune) bool {
+	return r == '\u061C' ||
+		r == '\u200E' || r == '\u200F' ||
+		(r >= '\u202A' && r <= '\u202E') ||
+		(r >= '\u2066' && r <= '\u2069')
 }
 
 type sanitizedCauseError struct {

@@ -318,6 +318,34 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate",
         ),
         (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialPromptInjectionAndDelimiterEscapeCampaign",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialLogFloodLosslessSegAndBoundedMemory",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialCorruptedSegTailAndBurnRewindRecovery",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialSelfAlertLoopImmunityAndBaselinePoisoningResistance",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialPIIAndSecretExfiltrationEndToEnd",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/cmd/sentinel-bench",
+            "TestRunBenchmarksOfflineAndMarkdownParity",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/cmd/sentinel-bench",
+            "TestBenchmarkRejectsBitNetModel",
+        ),
+        (
             "github.com/knowthankyew/genesis-sentinel/internal/triage",
             "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials",
         ),
@@ -350,6 +378,7 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/triage",
             "./internal/feedback",
             "./internal/train",
+            "./cmd/sentinel-bench",
             "-run",
             "^(" + "|".join(test_names) + ")$",
         ],

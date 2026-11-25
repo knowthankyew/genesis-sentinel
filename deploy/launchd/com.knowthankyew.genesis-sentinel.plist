@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.knowthankyew.genesis-sentinel</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/sentinel</string>
+        <string>watch</string>
+        <string>--http=127.0.0.1:8090</string>
+        <string>--genesis-tcp=127.0.0.1:9000</string>
+        <string>--genesis-data-dir=/usr/local/var/lib/genesis</string>
+        <string>--data-dir=/usr/local/var/lib/genesis-sentinel</string>
+        <string>--surprisal-mode=inprocess</string>
+        <string>--triage-mode=off</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SENTINEL_MAX_MEM_MB</key>
+        <string>256</string>
+        <key>SENTINEL_REQUIRE_REDACTION</key>
+        <string>true</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/genesis-sentinel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/genesis-sentinel.error.log</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

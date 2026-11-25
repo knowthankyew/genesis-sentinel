@@ -4,11 +4,11 @@
 [![CI](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/knowthankyew/genesis-sentinel/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg)](go.mod)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
-[![Stage: Phase 3 Complete](https://img.shields.io/badge/Stage-Phase%203%20Complete-brightgreen.svg)](docs/ROADMAP.md)
+[![Stage: Phase 4 Complete](https://img.shields.io/badge/Stage-Phase%204%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
-**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.4.0-phase3<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters, loopback-only by default (zero external network egress unless explicitly overridden).
+**Genesis Sentinel** (`v<!-- claim:sentinel_version -->0.5.0-phase4<!-- /claim -->`) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters, loopback-only by default (zero external network egress unless explicitly overridden).
 
-> **Current Status (Phase 3 Complete — Sentinel Core):** The Genesis Bridge (`.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser, RE2 deterministic rule engine, Tier 1 clean-room pure-Go Laplace-LK log surprisal engine, and **Tier 2 local SmolLM2-Instruct LoRA triage & FTaaS feedback loop** (`internal/triage`, `internal/feedback`, `internal/train`, `sentinel feedback`, `sentinel train`, `POST /adapter` live hot-swap, mandatory PII/secret redaction, and prompt-injection fail-closed override) are implemented and race-tested. Phase 4 adversarial hardening & empirical replay benchmarks are up next; see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Current Status (Phase 4 Complete — Hardened & Empirically Benchmarked):** The Genesis Bridge (buffered lossless `.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser with single-leaf anti-DoS bounds and RE2 syntax literal prefilters, Tier 1 pure-Go Laplace-LK log surprisal engine, Tier 2 local SmolLM2-Instruct LoRA triage & FTaaS feedback loop, **adversarial hostile-log test suite**, **pure-Go replay benchmark harness (`cmd/sentinel-bench`)**, **independent claims math recomputation**, and **hardened `deploy/` service units** are implemented and race-tested. Phase 5 (`google/gemma-2-2b-it` reasoning-tier escalation) is next; see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 
@@ -39,7 +39,27 @@ Project Genesis can ingest over one million lines per second in RAM, while local
 * **Localhost-by-Default Zero Egress:** Listen addresses and upstream service URLs (`genesis`, `surprisal-service`, `ftaas`, `inference`) must target loopback (`127.0.0.1` / `localhost` / `::1`) unless explicitly overridden.
 * **Alert-Only Safety Boundary:** Sentinel classifies, alerts, and explains. It never executes destructive host actions (firewall blocks, process kills) from model output.
 * **Hostile-Log Sanitization:** Untrusted log lines are stripped of chat-template control delimiters (`<|...|>`, `<start_of_turn>`, etc.) and scanned for prompt-injection cues before reaching Tier 2.
-* **Claims Are Measured, Not Asserted:** No Sentinel throughput, latency, or detection accuracy metrics will be published until produced by committed benchmarks in `docs/benchmarks/`.
+* **Claims Are Measured, Not Asserted:** Every throughput, latency, memory, and accuracy metric below is emitted by `cmd/sentinel-bench` into [docs/benchmarks/empirical_benchmarks.json](docs/benchmarks/empirical_benchmarks.json) and mathematically recomputed by `scripts/sync_docs.py` and `scripts/audit-claims.py`.
+
+---
+
+## Empirical Benchmarks (Phase 4)
+
+Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-25-659d73c.md](docs/benchmarks/2026-11-25-659d73c.md)).
+
+<!-- BEGIN_EMPIRICAL -->
+| Benchmark Gate | Target | Measured Result | Status |
+| :--- | :--- | :--- | :--- |
+| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->101,492.96 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
+| **Lossless `.seg` Ingestion** | <!-- claim:bench_tier0_dropped_target -->0 dropped<!-- /claim --> | **<!-- claim:bench_tier0_lines_read -->100,000 read<!-- /claim -->** / <!-- claim:bench_tier0_lines_dropped -->0 dropped<!-- /claim --> | <!-- claim:bench_tier0_lossless_status -->PASSED<!-- /claim --> |
+| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 46.381 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 90.499 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
+| **Synthetic Detection Accuracy (Tier 0+1)** | <!-- claim:bench_detection_f1_target -->F1 >= 0.90<!-- /claim --> | **<!-- claim:bench_detection_f1 -->F1 1.0000<!-- /claim -->** (<!-- claim:bench_detection_tp -->TP=100<!-- /claim -->, <!-- claim:bench_detection_fp -->FP=0<!-- /claim -->) | <!-- claim:bench_detection_f1_status -->PASSED<!-- /claim --> |
+| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed override | **<!-- claim:bench_tier2_p50_ms -->P50 3,068.18 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,335.55 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> injection overrides) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
+| **Memory Footprint (Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Heap peak **<!-- claim:bench_mem_heap_peak_mb -->4.42 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->16.93 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
+| **Adversarial Hostile-Log Self-Checks** | All pass | **<!-- claim:bench_adv_passed -->8<!-- /claim -->/<!-- claim:bench_adv_total -->8<!-- /claim -->** passed | <!-- claim:bench_adv_status -->PASSED<!-- /claim --> |
+<!-- END_EMPIRICAL -->
+
+**Offline Semantic Embedding Tradeoff (`sentence-transformers/all-MiniLM-L6-v2`):** In our offline comparison ([docs/benchmarks/embedding_comparison.json](docs/benchmarks/embedding_comparison.json)) over structural + semantically disguised `200 OK` attack logs, combining `all-MiniLM-L6-v2` with Laplace-LK raised overall F1 from **<!-- claim:embed_pure_lk_f1 -->0.7500<!-- /claim -->** to **<!-- claim:embed_hybrid_minilm_f1 -->1.0000<!-- /claim -->** at a cost of **<!-- claim:embed_slowdown_x -->144.3x<!-- /claim -->** slower median latency and **<!-- claim:embed_rss_delta_mb -->+133.36 MB<!-- /claim -->** RSS—supporting our decision to keep pure-Go Laplace-LK on the Tier 1 hot path and reserve neural embeddings for optional sidecar/offline enrichment.
 
 ---
 
@@ -109,6 +129,9 @@ make build
 * [Security Policy & Hostile-Log Threat Model](SECURITY.md)
 * [Governance & Third-Party Attribution Notice](NOTICE.md)
 * [Contributing Guidelines](CONTRIBUTING.md)
+* [Empirical Benchmark Report (Phase 4)](docs/benchmarks/2026-11-25-659d73c.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
+* [Semantic Embedding Tradeoff Experiment](docs/benchmarks/embedding_comparison.json)
+* [Operational Service Units (`launchd`, `systemd`, Compose)](deploy/systemd/genesis-sentinel.service)
 * [Changelog](CHANGELOG.md)
 
 ---
@@ -116,6 +139,12 @@ make build
 ## Verification & Testing
 
 ```bash
+# Build sentinel and sentinel-bench pure-Go binaries
+make build
+
+# Run reproducible empirical benchmark suite
+make bench
+
 # Run unit tests
 make test
 
@@ -125,7 +154,7 @@ make race
 # Run Go vet / static checks
 make lint
 
-# Run claims, zero-dependency, diagram freshness & SBOM governance audit
+# Run claims, benchmark math recomputation, zero-dependency, diagram freshness & SBOM audit
 make audit
 
 # Regenerate deterministic CycloneDX 1.5 SBOM (bom.json)

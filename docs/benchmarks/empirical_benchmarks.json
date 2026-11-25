@@ -1,0 +1,93 @@
+{
+  "metadata": {
+    "date": "2026-11-25T06:36:23-06:00",
+    "sentinel_version": "0.5.0-phase4",
+    "git_commit": "659d73c",
+    "os": "Darwin 25.6.0 x86_64",
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz (16 logical cores)",
+    "memory_bytes": 17179869184,
+    "go_version": "go1.27.1 darwin/amd64",
+    "seed": 42,
+    "report_markdown": "docs/benchmarks/2026-11-25-659d73c.md"
+  },
+  "acceptance_gates": {
+    "throughput_target_lps": 50000,
+    "tier1_p99_target_us": 2000,
+    "detection_f1_target": 0.9,
+    "memory_ceiling_mb": 256,
+    "lossless_dropped_target": 0,
+    "adversarial_pass_target_pct": 100
+  },
+  "tier0_replay": {
+    "lines_written": 100000,
+    "lines_read": 100000,
+    "lines_dropped": 0,
+    "window_events": 5000,
+    "duration_seconds": 0.98529,
+    "throughput_lps": 101492.96,
+    "throughput_gate_status": "PASSED",
+    "lossless_gate_status": "PASSED",
+    "templates_emitted": 248,
+    "collapse_ratio": 403.23,
+    "clusters_active": 18,
+    "alerts_emitted": 27,
+    "corrupted_frames": 0
+  },
+  "tier1_surprisal": {
+    "evaluations": 2000,
+    "baseline_cases": 2000,
+    "threshold_nats": 5,
+    "p50_us": 46.381,
+    "p90_us": 50.503,
+    "p99_us": 90.499,
+    "max_us": 365.528,
+    "p99_gate_status": "PASSED",
+    "benign_mean_nats": 0.001,
+    "anomalous_mean_nats": 45.1319,
+    "separation_nats": 45.1309
+  },
+  "detection_accuracy": {
+    "total_windows": 200,
+    "positive_windows": 100,
+    "negative_windows": 100,
+    "true_positives": 100,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "true_negatives": 100,
+    "tier0_detections": 86,
+    "tier1_only_detections": 14,
+    "precision": 1,
+    "recall": 1,
+    "f1_score": 1,
+    "f1_gate_status": "PASSED"
+  },
+  "tier2_triage": {
+    "enabled": true,
+    "mode": "live_http",
+    "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "adapter_path": "base",
+    "samples_evaluated": 12,
+    "structured_verdicts": 12,
+    "fallbacks": 0,
+    "p50_ms": 3068.179,
+    "p90_ms": 3202.5,
+    "p99_ms": 3335.547,
+    "max_ms": 3335.547,
+    "injection_probes_tested": 3,
+    "injection_overrides_enforced": 3,
+    "injection_override_gate_status": "PASSED"
+  },
+  "memory_profile": {
+    "heap_alloc_plateau_mb": 0.83,
+    "heap_alloc_peak_mb": 4.42,
+    "rss_peak_kb": 17336,
+    "rss_peak_mb": 16.93,
+    "heap_gate_status": "PASSED"
+  },
+  "adversarial_checks": {
+    "total_checks": 8,
+    "passed_checks": 8,
+    "pass_rate_pct": 100,
+    "gate_status": "PASSED"
+  }
+}

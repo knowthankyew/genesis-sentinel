@@ -22,7 +22,7 @@ class TestClaimsLinter(unittest.TestCase):
     def test_go_constants_and_safe_bounds(self):
         """Verify Go core constants match expected architectural bounds."""
         version = sync_docs.extract_go_constant(REPO_ROOT / "internal" / "cli" / "cli.go", "Version")
-        self.assertEqual(version, "0.4.0-phase3")
+        self.assertEqual(version, "0.5.0-phase4")
 
         max_clusters = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "template" / "drain.go", "DefaultMaxClusters"
@@ -224,6 +224,76 @@ class TestClaimsLinter(unittest.TestCase):
         )
         self.assertFalse(ok3)
         self.assertTrue(any("Personal path leak" in e for e in errs3))
+
+    def test_independent_recompute_metrics_passes_on_committed_artifacts(self):
+        """Verify committed empirical_benchmarks.json and embedding_comparison.json pass math recomputation."""
+        bench_json = DOCS_DIR / "benchmarks" / "empirical_benchmarks.json"
+        ok, errs = sync_docs.independent_recompute_metrics(bench_json, repo_root=REPO_ROOT)
+        self.assertTrue(ok, f"Benchmark recomputation failed: {errs}")
+
+        emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
+        if emb_json.is_file():
+            e_ok, e_errs = sync_docs.independent_recompute_embedding_comparison(emb_json)
+            self.assertTrue(e_ok, f"Embedding comparison recomputation failed: {e_errs}")
+
+    def test_negative_benchmark_recomputation_detects_drift_and_leaks(self):
+        """Verify independent_recompute_metrics fails closed on tampered throughput, latency, F1, and /Users/ paths."""
+        bench_json = DOCS_DIR / "benchmarks" / "empirical_benchmarks.json"
+        base_data = json.loads(bench_json.read_text(encoding="utf-8"))
+        md_rel = base_data["metadata"]["report_markdown"]
+        md_text = (REPO_ROOT / md_rel).read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "docs" / "benchmarks").mkdir(parents=True)
+            (tmp_root / md_rel).write_text(md_text, encoding="utf-8")
+
+            # 1. Tampered throughput
+            bad_tps = json.loads(json.dumps(base_data))
+            bad_tps["tier0_replay"]["throughput_lps"] = 9999999.0
+            p1 = tmp_root / "bad_tps.json"
+            p1.write_text(json.dumps(bad_tps), encoding="utf-8")
+            ok1, errs1 = sync_docs.independent_recompute_metrics(p1, repo_root=tmp_root)
+            self.assertFalse(ok1)
+            self.assertTrue(any("throughput recomputation mismatch" in e.lower() for e in errs1), errs1)
+
+            # 2. Inverted Tier 1 latency percentiles
+            bad_lat = json.loads(json.dumps(base_data))
+            bad_lat["tier1_surprisal"]["p90_us"] = bad_lat["tier1_surprisal"]["p50_us"] * 0.5
+            p2 = tmp_root / "bad_lat.json"
+            p2.write_text(json.dumps(bad_lat), encoding="utf-8")
+            ok2, errs2 = sync_docs.independent_recompute_metrics(p2, repo_root=tmp_root)
+            self.assertFalse(ok2)
+            self.assertTrue(any("monotonicity" in e.lower() for e in errs2), errs2)
+
+            # 3. Tampered F1 score
+            bad_f1 = json.loads(json.dumps(base_data))
+            bad_f1["detection_accuracy"]["f1_score"] = 0.50
+            p3 = tmp_root / "bad_f1.json"
+            p3.write_text(json.dumps(bad_f1), encoding="utf-8")
+            ok3, errs3 = sync_docs.independent_recompute_metrics(p3, repo_root=tmp_root)
+            self.assertFalse(ok3)
+            self.assertTrue(any("f1_score mismatch" in e.lower() for e in errs3), errs3)
+
+            # 4. Leaked /Users/ path in JSON
+            bad_path = json.loads(json.dumps(base_data))
+            bad_path["metadata"]["cpu"] = "/Users/alice/cpu"
+            p4 = tmp_root / "bad_path.json"
+            p4.write_text(json.dumps(bad_path), encoding="utf-8")
+            ok4, errs4 = sync_docs.independent_recompute_metrics(p4, repo_root=tmp_root)
+            self.assertFalse(ok4)
+            self.assertTrue(any("/Users/" in e for e in errs4), errs4)
+
+            # 5. Tampered embedding comparison F1 delta
+            emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
+            if emb_json.is_file():
+                bad_emb = json.loads(emb_json.read_text(encoding="utf-8"))
+                bad_emb["comparison"]["f1_delta"] = 0.99
+                p5 = tmp_root / "bad_emb.json"
+                p5.write_text(json.dumps(bad_emb), encoding="utf-8")
+                ok5, errs5 = sync_docs.independent_recompute_embedding_comparison(p5)
+                self.assertFalse(ok5)
+                self.assertTrue(any("f1_delta mismatch" in e for e in errs5), errs5)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,8 @@ var (
 	leadingMetaFieldRe  = regexp.MustCompile(`(?i)^\s*(severity|mitre|confidence)\s*[:=]\s*([^\s;,]+)\s*[,;]?\s*`)
 	explanationPrefixRe = regexp.MustCompile(`(?i)^explanation\s*[:=]\s*(.*)$`)
 	explanationField    = regexp.MustCompile(`(?i)\bexplanation\s*[:=]\s*(.+)$`)
+	beginFenceRe        = regexp.MustCompile(`(?i)BEGIN_UNTRUSTED_LOG_TELEMETRY`)
+	endFenceRe          = regexp.MustCompile(`(?i)END_UNTRUSTED_LOG_TELEMETRY`)
 )
 
 // AllClasses returns the ordered canonical Tier 2 security triage taxonomy classes.
@@ -503,8 +505,8 @@ func ParseCompletion(
 }
 
 func defangFenceMarkers(s string) string {
-	s = strings.ReplaceAll(s, "BEGIN_UNTRUSTED_LOG_TELEMETRY", "[BEGIN_MARKER]")
-	s = strings.ReplaceAll(s, "END_UNTRUSTED_LOG_TELEMETRY", "[END_MARKER]")
+	s = beginFenceRe.ReplaceAllString(s, "[BEGIN_MARKER]")
+	s = endFenceRe.ReplaceAllString(s, "[END_MARKER]")
 	return s
 }
 

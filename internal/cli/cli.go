@@ -15,7 +15,7 @@ import (
 )
 
 // Version identifies the current Genesis Sentinel release stage.
-const Version = "0.4.0-phase3"
+const Version = "0.5.0-phase4"
 
 // openDirFn launches the OS file manager for `sentinel data open` (overridable in tests).
 var openDirFn = openDirectoryOS

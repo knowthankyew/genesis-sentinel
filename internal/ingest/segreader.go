@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -328,6 +329,9 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 		return nil, false, false, fmt.Errorf("seek segment %q: %w", segPath, err)
 	}
 
+	br := bufio.NewReaderSize(f, 64*1024)
+	payloadScratch := make([]byte, 4096)
+
 	var (
 		events []model.LogEvent
 		header [MagicHeaderLen]byte
@@ -349,7 +353,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 			return events, true, false, nil
 		}
 
-		if _, err := io.ReadFull(f, header[:]); err != nil {
+		if _, err := io.ReadFull(br, header[:]); err != nil {
 			if isEOFError(err) {
 				return events, !isLatest, false, nil
 			}
@@ -367,6 +371,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 				return events, false, false, recErr
 			}
 			if recovered {
+				br.Reset(f)
 				continue
 			}
 			return events, doneSeg, false, nil
@@ -395,6 +400,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 					if recovered {
 						r.corruptedFrames++
 						r.clearStallStateLocked()
+						br.Reset(f)
 						continue
 					}
 				}
@@ -406,6 +412,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 				return events, false, false, recErr
 			}
 			if recovered {
+				br.Reset(f)
 				continue
 			}
 			return events, doneSeg, false, nil
@@ -417,8 +424,13 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 			return events, false, false, nil
 		}
 
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(f, payload); err != nil {
+		var payload []byte
+		if int(payloadLen) <= len(payloadScratch) {
+			payload = payloadScratch[:payloadLen]
+		} else {
+			payload = make([]byte, payloadLen)
+		}
+		if _, err := io.ReadFull(br, payload); err != nil {
 			if isEOFError(err) {
 				if isLatest {
 					return events, false, false, nil
@@ -438,6 +450,7 @@ func (r *SegReader) readSegmentLocked(segID uint64, isLatest bool, budget *batch
 				return events, false, false, recErr
 			}
 			if recovered {
+				br.Reset(f)
 				continue
 			}
 			return events, doneSeg, false, nil

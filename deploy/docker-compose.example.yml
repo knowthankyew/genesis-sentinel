@@ -1,0 +1,68 @@
+# Example local-only compose topology pairing Project Genesis with Genesis Sentinel.
+# All published host ports bind strictly to 127.0.0.1 (zero external network exposure).
+# Genesis writes CRC32 .seg segments to a shared volume mounted read-only (:ro) into Sentinel.
+
+services:
+  genesis:
+    image: ghcr.io/knowthankyew/genesis:latest
+    command:
+      - server
+      - -tcp=0.0.0.0:9000
+      - -http=0.0.0.0:8080
+      - -data-dir=/var/lib/genesis
+      - -max-mem-mb=350
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9000:9000"
+    environment:
+      - GENESIS_ALLOW_ALL_INTERFACES=true
+    volumes:
+      - genesis-segs:/var/lib/genesis
+    networks:
+      - sentinel-local
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  sentinel:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command:
+      - watch
+      - --http=0.0.0.0:8090
+      - --genesis-data-dir=/var/lib/genesis
+      - --genesis-tcp=genesis:9000
+      - --data-dir=/var/lib/genesis-sentinel
+      - --surprisal-mode=inprocess
+      - --triage-mode=off
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      - SENTINEL_MAX_MEM_MB=256
+      - SENTINEL_REQUIRE_REDACTION=true
+      # Required inside Docker bridge networking so Sentinel can bind container :8090
+      # and reach the sibling 'genesis' container over the private internal network.
+      - SENTINEL_ALLOW_ALL_INTERFACES=true
+      - SENTINEL_ALLOW_REMOTE_ENDPOINTS=true
+    volumes:
+      - genesis-segs:/var/lib/genesis:ro
+      - sentinel-state:/var/lib/genesis-sentinel
+    depends_on:
+      - genesis
+    networks:
+      - sentinel-local
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  genesis-segs:
+  sentinel-state:
+
+networks:
+  sentinel-local:
+    internal: true

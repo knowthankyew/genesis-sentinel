@@ -1,0 +1,44 @@
+[Unit]
+Description=Genesis Sentinel - Local-First Tiered Log Triage & Anomaly Sidecar
+Documentation=https://github.com/knowthankyew/genesis-sentinel
+After=network.target genesis.service
+Wants=genesis.service
+
+[Service]
+Type=simple
+User=genesis-sentinel
+Group=genesis-sentinel
+StateDirectory=genesis-sentinel
+StateDirectoryMode=0700
+Environment=SENTINEL_MAX_MEM_MB=256
+Environment=SENTINEL_REQUIRE_REDACTION=true
+ExecStart=/usr/local/bin/sentinel watch \
+    --http=127.0.0.1:8090 \
+    --genesis-tcp=127.0.0.1:9000 \
+    --genesis-data-dir=/var/lib/genesis \
+    --data-dir=/var/lib/genesis-sentinel \
+    --surprisal-mode=inprocess \
+    --triage-mode=off
+
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+MemoryMax=512M
+
+# Hardened sandboxing (alert-only, read-only access to Genesis .seg directory, loopback-only)
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadOnlyPaths=/var/lib/genesis
+ReadWritePaths=/var/lib/genesis-sentinel
+
+[Install]
+WantedBy=multi-user.target

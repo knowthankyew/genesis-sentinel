@@ -1,10 +1,14 @@
-.PHONY: all build test race lint fmt audit sbom claims-test clean
+.PHONY: all build bench test race lint fmt audit sbom claims-test clean
 
 all: build
 
 build:
 	@mkdir -p bin
 	go build -o bin/sentinel ./cmd/sentinel
+	go build -o bin/sentinel-bench ./cmd/sentinel-bench
+
+bench: build
+	./bin/sentinel-bench --lines 100000 --out-json docs/benchmarks/empirical_benchmarks.json --out-md auto
 
 test:
 	go test -v ./...

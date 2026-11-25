@@ -20,7 +20,7 @@ flowchart TD
     end
 
     subgraph SentinelCore["Genesis Sentinel Sidecar (Pure Go Stdlib)"]
-        Entry["CLI Entrypoint<br/><code>cmd/sentinel/main.go</code>"]
+        Entry["CLI Entrypoint & Replay Bench<br/><code>cmd/sentinel/main.go</code> &bull; <code>cmd/sentinel-bench/main.go</code>"]
         CLI["Subcommand Router<br/><code>internal/cli/cli.go</code> &bull; <code>internal/cli/watch.go</code> &bull; <code>internal/cli/scan.go</code> &bull; <code>internal/cli/feedback.go</code> &bull; <code>internal/cli/train.go</code>"]
         Cfg["Config & Invariant Guard<br/><code>internal/config/config.go</code>"]
         Sec["Loopback, Auth & Prompt Sanitizer<br/><code>internal/security/security.go</code>"]
@@ -55,7 +55,7 @@ flowchart TD
 
 ---
 
-## 2. Implemented Subsystems (Phases 0–3)
+## 2. Implemented Subsystems (Phases 0–4)
 
 1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/feedback.go`, `internal/cli/train.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
    - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
@@ -84,6 +84,9 @@ flowchart TD
    - Frames sanitized Tier 0/1 alerts inside explicit `BEGIN_UNTRUSTED_LOG_TELEMETRY` / `END_UNTRUSTED_LOG_TELEMETRY` boundaries and queries local `ml/src/FtaaSService.Inference` (`POST /api/v1/inference/generate`, `DefaultTriageMaxTokens = <!-- claim:triage_default_max_tokens -->64 tokens<!-- /claim -->`) over dial-time loopback HTTP with a generation-tracked circuit breaker, stale-runtime verdict discard (`ErrStaleRuntime`), and atomic `POST /adapter` hot-swapping. Live `watch` mode runs Tier 2 asynchronously so deterministic Tier 0/1 alerts emit immediately and follow-up enrichments correlate by `AlertID`/`TraceID` (upserting `alerts.jsonl`), while offline `scan` enriches synchronously in one pass.
    - Parses structured bracketed verdicts across the 8 starter security classes (`[BENIGN-NOISE]`, `[RECON-SCAN]`, `[AUTH-BRUTEFORCE]`, `[INJECTION-ATTEMPT]`, `[EXFIL-SUSPECT]`, `[PRIV-ESC]`, `[POLICY-ANOMALY]`, `[NEEDS-REVIEW]`), failing closed to `[NEEDS-REVIEW]` on unstructured outputs and overriding `[BENIGN-NOISE]` back to `[NEEDS-REVIEW]` (`HIGH`) whenever prompt-injection signals were detected on the input log.
    - Records up to `MaxAlertJournalRecords = <!-- claim:feedback_max_alert_journal_records -->2,000<!-- /claim -->` recent alerts in `~/.genesis-sentinel/alerts.jsonl` so `sentinel feedback --alert-id` can curate operator labels (`tp`/`fp`/custom class), scrub PII/secrets (PEM keys, JWTs, Bearer tokens, API keys, credentials, emails, SSA-valid SSNs, Luhn-valid payment cards), generate deterministic synthetic seed splits (`sentinel feedback seed`), and submit audited JSONL jobs to local FTaaS (`POST /api/v1/jobs`, `POST /api/v1/jobs/audit`) via `sentinel train`.
+8. **Phase 4 Adversarial Hardening, Replay Benchmark Harness & Operational Units (`cmd/sentinel-bench/main.go`, `internal/pipeline/adversarial_test.go`, `scripts/eval_embedding_comparison.py`, `deploy/`):**
+   - Hardens `internal/security.SanitizeUntrustedLogText` against Llama/Mistral `[INST]`/`<<SYS>>` tags, Unicode BiDi/C1 controls, and case-insensitive `BEGIN/END_UNTRUSTED_LOG_TELEMETRY` fence spoofing; adds a per-leaf Drain cluster cap (`maxLeafClusters = 128`) against single-leaf quadratic flood DoS, 64 KiB buffered reads in `SegReader`, and provably sound `regexp/syntax` ASCII literal prefilters in `internal/rules/engine.go`.
+   - Provides `cmd/sentinel-bench` (pure Go stdlib) to emit machine-readable `docs/benchmarks/empirical_benchmarks.json` and Markdown reports (`docs/benchmarks/YYYY-MM-DD-<commit>.md`) validated mathematically by `scripts/sync_docs.py` (`independent_recompute_metrics`) and `scripts/audit-claims.py`, plus an isolated offline `sentence-transformers/all-MiniLM-L6-v2` semantic embedding comparison (`scripts/eval_embedding_comparison.py`) and hardened `launchd`, `systemd`, `Dockerfile`, and `docker-compose.example.yml` operational templates under `deploy/`.
 
 ---
 
@@ -116,4 +119,4 @@ sequenceDiagram
 2. **Localhost-by-Default Zero Egress:** All listeners and upstream service URLs enforce loopback (`127.0.0.1` / `localhost` / `::1`) unless explicitly overridden.
 3. **Alert-Only Safety Boundary:** Sentinel classifies, alerts, and explains. It never executes destructive host containment commands from model output.
 4. **Loop Prevention:** Sentinel emits alerts back to Genesis under `service=sentinel` (configurable) and strictly drops incoming events from its own alert service before Tier 0 processing.
-5. **Claims Are Measured, Not Asserted:** No throughput, latency, memory, or detection-accuracy figures are stated for Sentinel until produced by committed benchmarks in `docs/benchmarks/`.
+5. **Claims Are Measured, Not Asserted:** All published throughput, latency, memory, and detection-accuracy metrics are produced by `cmd/sentinel-bench` in `docs/benchmarks/empirical_benchmarks.json` and independently recomputed on every audit run via `scripts/sync_docs.py` and `scripts/audit-claims.py`.

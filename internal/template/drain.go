@@ -37,6 +37,9 @@ const (
 	maxAdditionalSamples = 16
 	// maxOverflowBuckets bounds distinct (service, level) overflow windows when at capacity.
 	maxOverflowBuckets = 256
+	// maxLeafClusters caps clusters stored in any single prefix-tree leaf (including wildcard
+	// "<*>" leaves) so a same-length high-cardinality log flood cannot degrade lookup to O(MaxClusters).
+	maxLeafClusters = 128
 	// maxClusterTokenBytes masks overly long individual tokens in templates so random blobs do not bloat clusters.
 	maxClusterTokenBytes = 256
 	// maxClusterTokens caps normalized tokens retained per cluster template.
@@ -319,7 +322,7 @@ func (m *DrainMiner) ExtractTemplate(service, level, msg string) (string, string
 	for _, tok := range tokens {
 		clusterCost += len(tok)
 	}
-	if atCap || m.clusterBytes+clusterCost > m.maxClusterBytes {
+	if atCap || len(node.clusters) >= maxLeafClusters || m.clusterBytes+clusterCost > m.maxClusterBytes {
 		rollback()
 		return OverflowTemplateID(service, level), "<OVERFLOW>", true
 	}

@@ -181,6 +181,237 @@
       "format_rule": "{value:,}",
       "used_in": ["docs/ARCHITECTURE.md"],
       "description": "Maximum recent alerts retained in local alerts.jsonl for operator feedback lookup"
+    },
+    "bench_tier0_target_lps": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "acceptance_gates.throughput_target_lps",
+      "format_rule": ">= {value:,.0f} lines/sec",
+      "used_in": ["README.md"],
+      "description": "Phase 4 Tier 0+1 lossless .seg replay throughput target"
+    },
+    "bench_tier0_throughput_lps": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.throughput_lps",
+      "format_rule": "{value:,.2f} lines/sec",
+      "used_in": ["README.md"],
+      "description": "Measured pure-Go Tier 0+1 lossless .seg replay throughput"
+    },
+    "bench_tier0_collapse_ratio": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.collapse_ratio",
+      "format_rule": "{value:.2f}x",
+      "used_in": ["README.md"],
+      "description": "Measured Drain template collapse ratio on Track A 100k .seg replay"
+    },
+    "bench_tier0_throughput_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.throughput_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Tier 0+1 throughput acceptance gate status"
+    },
+    "bench_tier0_dropped_target": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "acceptance_gates.lossless_dropped_target",
+      "format_rule": "{value} dropped",
+      "used_in": ["README.md"],
+      "description": "Lossless .seg replay dropped-line target"
+    },
+    "bench_tier0_lines_read": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.lines_read",
+      "format_rule": "{value:,} read",
+      "used_in": ["README.md"],
+      "description": "Measured lines read during 100k lossless .seg replay"
+    },
+    "bench_tier0_lines_dropped": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.lines_dropped",
+      "format_rule": "{value} dropped",
+      "used_in": ["README.md"],
+      "description": "Measured dropped lines during 100k lossless .seg replay"
+    },
+    "bench_tier0_lossless_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier0_replay.lossless_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Lossless .seg ingestion acceptance gate status"
+    },
+    "bench_tier1_p99_target_us": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "acceptance_gates.tier1_p99_target_us",
+      "format_rule": "< {value:,.0f} us",
+      "used_in": ["README.md"],
+      "description": "Tier 1 Laplace-LK P99 scoring latency target in microseconds"
+    },
+    "bench_tier1_p50_us": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier1_surprisal.p50_us",
+      "format_rule": "P50 {value:.3f} us",
+      "used_in": ["README.md"],
+      "description": "Measured Tier 1 Laplace-LK P50 scoring latency against full 2000-case baseline"
+    },
+    "bench_tier1_p99_us": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier1_surprisal.p99_us",
+      "format_rule": "P99 {value:.3f} us",
+      "used_in": ["README.md"],
+      "description": "Measured Tier 1 Laplace-LK P99 scoring latency against full 2000-case baseline"
+    },
+    "bench_tier1_p99_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier1_surprisal.p99_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Tier 1 P99 latency acceptance gate status"
+    },
+    "bench_detection_f1_target": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "acceptance_gates.detection_f1_target",
+      "format_rule": "F1 >= {value:.2f}",
+      "used_in": ["README.md"],
+      "description": "Labeled synthetic Tier 0+1 detection F1 target"
+    },
+    "bench_detection_f1": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "detection_accuracy.f1_score",
+      "format_rule": "F1 {value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Measured F1 score on labeled 200-window synthetic evaluation"
+    },
+    "bench_detection_tp": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "detection_accuracy.true_positives",
+      "format_rule": "TP={value}",
+      "used_in": ["README.md"],
+      "description": "Measured true positives on labeled 200-window synthetic evaluation"
+    },
+    "bench_detection_fp": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "detection_accuracy.false_positives",
+      "format_rule": "FP={value}",
+      "used_in": ["README.md"],
+      "description": "Measured false positives on labeled 200-window synthetic evaluation"
+    },
+    "bench_detection_f1_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "detection_accuracy.f1_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Detection accuracy acceptance gate status"
+    },
+    "bench_tier2_p50_ms": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier2_triage.p50_ms",
+      "format_rule": "P50 {value:,.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Measured live CPU Tier 2 SmolLM2-135M-Instruct P50 triage latency"
+    },
+    "bench_tier2_p99_ms": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier2_triage.p99_ms",
+      "format_rule": "P99 {value:,.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Measured live CPU Tier 2 SmolLM2-135M-Instruct P99 triage latency"
+    },
+    "bench_tier2_inj_enforced": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier2_triage.injection_overrides_enforced",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Live Tier 2 injection probes prevented from downgrading to BENIGN-NOISE"
+    },
+    "bench_tier2_inj_tested": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier2_triage.injection_probes_tested",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Total live Tier 2 injection probes evaluated"
+    },
+    "bench_tier2_override_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "tier2_triage.injection_override_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Live Tier 2 hostile injection override acceptance gate status"
+    },
+    "bench_mem_ceiling_mb": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "acceptance_gates.memory_ceiling_mb",
+      "format_rule": "<= {value:.0f} MB",
+      "used_in": ["README.md"],
+      "description": "Go heap memory budget ceiling"
+    },
+    "bench_mem_heap_peak_mb": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "memory_profile.heap_alloc_peak_mb",
+      "format_rule": "{value:.2f} MB",
+      "used_in": ["README.md"],
+      "description": "Measured Go heap peak allocation during benchmark"
+    },
+    "bench_mem_rss_peak_mb": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "memory_profile.rss_peak_mb",
+      "format_rule": "{value:.2f} MB",
+      "used_in": ["README.md"],
+      "description": "Measured OS process peak RSS during benchmark"
+    },
+    "bench_mem_heap_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "memory_profile.heap_gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Memory ceiling acceptance gate status"
+    },
+    "bench_adv_passed": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "adversarial_checks.passed_checks",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Passed inline adversarial hostile-log safety checks"
+    },
+    "bench_adv_total": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "adversarial_checks.total_checks",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Total inline adversarial hostile-log safety checks"
+    },
+    "bench_adv_status": {
+      "source_artifact": "docs/benchmarks/empirical_benchmarks.json",
+      "json_path": "adversarial_checks.gate_status",
+      "format_rule": "{value}",
+      "used_in": ["README.md"],
+      "description": "Adversarial safety self-check acceptance gate status"
+    },
+    "embed_pure_lk_f1": {
+      "source_artifact": "docs/benchmarks/embedding_comparison.json",
+      "json_path": "pure_laplace_lk.f1",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Offline comparison F1 for pure Laplace-LK on structural + disguised semantic logs"
+    },
+    "embed_hybrid_minilm_f1": {
+      "source_artifact": "docs/benchmarks/embedding_comparison.json",
+      "json_path": "hybrid_laplace_lk_minilm.f1",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Offline comparison F1 for hybrid Laplace-LK + all-MiniLM-L6-v2"
+    },
+    "embed_slowdown_x": {
+      "source_artifact": "docs/benchmarks/embedding_comparison.json",
+      "json_path": "comparison.p50_latency_slowdown_x",
+      "format_rule": "{value:.1f}x",
+      "used_in": ["README.md"],
+      "description": "Measured P50 latency slowdown of hybrid MiniLM relative to pure Laplace-LK"
+    },
+    "embed_rss_delta_mb": {
+      "source_artifact": "docs/benchmarks/embedding_comparison.json",
+      "json_path": "metadata.rss_delta_mb",
+      "format_rule": "+{value:.2f} MB",
+      "used_in": ["README.md"],
+      "description": "Measured RSS overhead of loading cached all-MiniLM-L6-v2 weights"
     }
   }
 }

@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0-phase4] - 2026-11-25
+
+### Added
+- **Adversarial Hostile-Log Test Suite (`internal/pipeline/adversarial_test.go`):** Added automated red-team test coverage spanning multi-vector chat-template/fence-spoof prompt injection campaigns (both sync and async Tier 2 fail-closed overrides), 50,000-line high-cardinality multi-segment `.seg` log floods with zero drops and bounded Drain RAM, corrupted `.seg` tails + `genesis burn` rewind recovery, self-alert loop immunity, Tier 1 baseline poisoning resistance, and end-to-end PII/secret exfiltration guards across alerts, `alerts.jsonl`, feedback queues, and FTaaS JSONL exports.
+- **Pure-Go Replay Benchmark Harness (`cmd/sentinel-bench`):** Added zero-dependency benchmark runner measuring Tier 0+1 lossless `.seg` throughput & Drain collapse ratio, Tier 1 Laplace-LK P50/P90/P99/Max latency & benign/anomalous separation, labeled 200-window synthetic detection Precision/Recall/F1, live loopback Tier 2 `SmolLM2-135M-Instruct` latency & injection-override safety, Go heap & OS MaxRSS footprint, and inline adversarial self-checks; committed `docs/benchmarks/empirical_benchmarks.json` and `docs/benchmarks/2026-11-25-659d73c.md`.
+- **Offline Semantic Embedding Comparison (`scripts/eval_embedding_comparison.py`, `docs/benchmarks/embedding_comparison.json`):** Added an isolated offline PyTorch/Transformers experiment comparing pure Laplace-LK log features against hybrid Laplace-LK + cached `sentence-transformers/all-MiniLM-L6-v2` on structural and disguised semantic attacks.
+- **Independent Claims Math Recomputation (`scripts/sync_docs.py`, `scripts/audit-claims.py`, `tests/test_claims_linter.py`):** Added `independent_recompute_metrics()` and `independent_recompute_embedding_comparison()` verifying throughput, collapse ratio, percentile monotonicity, confusion-matrix Precision/Recall/F1, memory bounds, JSON-to-Markdown parity, and personal home-directory path leak prevention, plus registered governed empirical claims in `docs/claims_registry.json` and `README.md`.
+- **Operational Deployment Artifacts (`deploy/`, `Dockerfile`):** Added macOS `launchd` plist (`deploy/launchd/com.knowthankyew.genesis-sentinel.plist`), hardened Linux `systemd` unit (`deploy/systemd/genesis-sentinel.service`), local-only `deploy/docker-compose.example.yml`, and distroless multi-stage `Dockerfile`.
+
+### Changed
+- **Sanitizer & Hot-Path Performance Hardening (`internal/security`, `internal/rules`, `internal/template`, `internal/ingest`):** Hardened `SanitizeUntrustedLogText` for Llama/Mistral `[INST]`/`<<SYS>>` tags, Unicode BiDi/C1 controls, and case-insensitive `telemetry_fence_spoof` detection; added a zero-allocation `DetectInjectionSignals` fast path, `regexp/syntax`-derived sound ASCII literal rule prefilters, per-leaf Drain cluster cap (`maxLeafClusters = 128`) against single-leaf flood DoS, and 64 KiB buffered reads in `SegReader`, raising 100,000-line `.seg` replay throughput past 100k lines/sec.
+
+---
+
 ## [0.4.0-phase3] - 2026-11-24
 
 ### Added

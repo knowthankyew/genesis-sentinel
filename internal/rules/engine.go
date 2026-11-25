@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
@@ -48,10 +49,11 @@ type RulePack struct {
 }
 
 type compiledRule struct {
-	rule     Rule
-	re       *regexp.Regexp
-	services map[string]struct{}
-	levels   map[string]struct{}
+	rule       Rule
+	re         *regexp.Regexp
+	anyOfLower []string // sound ASCII literal prefilter derived from regexp/syntax AST
+	services   map[string]struct{}
+	levels     map[string]struct{}
 }
 
 type compiledSuppression struct {
@@ -208,6 +210,7 @@ func NewEngine(pack RulePack) (*Engine, error) {
 				return nil, fmt.Errorf("compile rule %s regex: %w", r.ID, err)
 			}
 			cr.re = re
+			cr.anyOfLower = extractRequiredASCIILiterals(r.Pattern)
 		}
 		if len(r.Services) > 0 {
 			cr.services = make(map[string]struct{}, len(r.Services))
@@ -287,15 +290,30 @@ func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes
 
 	var res EventEvaluation
 
-	// 2. Check adversarial prompt-injection signals across message, service, and level.
-	cleanMsg, msgSigs := security.SanitizeUntrustedLogText(ev.Message, maxPromptBytes)
-	_, svcSigs := security.SanitizeUntrustedLogText(ev.Service, 128)
-	_, lvlSigs := security.SanitizeUntrustedLogText(ev.Level, 64)
+	// 2. Check adversarial prompt-injection signals across message, service, and level
+	// without allocating sanitized sample copies unless an injection or rule actually matches.
+	msgSigs := security.DetectInjectionSignals(ev.Message)
+	svcSigs := security.DetectInjectionSignals(ev.Service)
+	lvlSigs := security.DetectInjectionSignals(ev.Level)
 	injSignals := mergeUniqueSignals(msgSigs, svcSigs, lvlSigs)
+
+	var (
+		cleanMsg      string
+		cleanMsgReady bool
+	)
+	getCleanMsg := func() string {
+		if !cleanMsgReady {
+			cleanMsg, _ = security.SanitizeUntrustedLogText(ev.Message, maxPromptBytes)
+			cleanMsgReady = true
+		}
+		return cleanMsg
+	}
+
 	if len(injSignals) > 0 {
+		cm := getCleanMsg()
 		res.InjectionSuspected = true
 		res.InjectionSignals = injSignals
-		res.InjectionSample = cleanMsg
+		res.InjectionSample = cm
 		res.Matches = append(res.Matches, EventRuleMatch{
 			RuleHit: model.RuleHit{
 				RuleID:      "SENT-006",
@@ -304,7 +322,7 @@ func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes
 				Description: "Adversarial LLM control delimiter or prompt-injection phrase detected in untrusted log",
 			},
 			MinCount:        1,
-			SanitizedSample: cleanMsg,
+			SanitizedSample: cm,
 			Entropy:         evEntropy,
 		})
 	}
@@ -330,8 +348,13 @@ func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes
 		if cr.rule.MinEntropy > 0 && evEntropy < cr.rule.MinEntropy {
 			continue
 		}
-		if cr.re != nil && !cr.re.MatchString(ev.Message) {
-			continue
+		if cr.re != nil {
+			if len(cr.anyOfLower) > 0 && isPureASCII(ev.Message) && !containsAnyASCIIFold(ev.Message, cr.anyOfLower) {
+				continue
+			}
+			if !cr.re.MatchString(ev.Message) {
+				continue
+			}
 		}
 		minCount := cr.rule.MinCount
 		if minCount == 0 {
@@ -345,7 +368,7 @@ func (e *Engine) MatchEvent(ev model.LogEvent, evEntropy float64, maxPromptBytes
 				Description: cr.rule.Description,
 			},
 			MinCount:        minCount,
-			SanitizedSample: cleanMsg,
+			SanitizedSample: getCleanMsg(),
 			Entropy:         evEntropy,
 		})
 	}
@@ -722,4 +745,170 @@ func mergeUniqueSignals(groups ...[]string) []string {
 		}
 	}
 	return out
+}
+
+// extractRequiredASCIILiterals inspects a Go RE2 syntax tree and returns a sound set of
+// lowercase ASCII substrings such that any ASCII match of pattern MUST contain at least one
+// element (case-insensitively). Returns nil whenever any branch lacks a guaranteed ASCII literal.
+func extractRequiredASCIILiterals(pattern string) []string {
+	ast, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	ast = ast.Simplify()
+	lits, ok := requiredBranchLiterals(ast)
+	if !ok || len(lits) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(lits))
+	out := make([]string, 0, len(lits))
+	for _, l := range lits {
+		if _, dup := seen[l]; !dup {
+			seen[l] = struct{}{}
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func requiredBranchLiterals(re *syntax.Regexp) ([]string, bool) {
+	if re == nil {
+		return nil, false
+	}
+	switch re.Op {
+	case syntax.OpCapture:
+		if len(re.Sub) == 1 {
+			return requiredBranchLiterals(re.Sub[0])
+		}
+		return nil, false
+	case syntax.OpLiteral:
+		lit, ok := asciiLowerLiteral(re.Rune)
+		if !ok || len(lit) == 0 {
+			return nil, false
+		}
+		return []string{lit}, true
+	case syntax.OpAlternate:
+		if len(re.Sub) == 0 {
+			return nil, false
+		}
+		var out []string
+		for _, sub := range re.Sub {
+			branchLits, ok := requiredBranchLiterals(sub)
+			if !ok || len(branchLits) == 0 {
+				return nil, false
+			}
+			out = append(out, branchLits...)
+		}
+		return out, true
+	case syntax.OpConcat:
+		// A match of Concat must satisfy EVERY child; pick the single child whose required
+		// literal set has the largest minimum literal length (preferring a single long literal).
+		var best []string
+		bestScore := 0
+		for _, sub := range re.Sub {
+			subLits, ok := requiredBranchLiterals(sub)
+			if !ok || len(subLits) == 0 {
+				continue
+			}
+			minLen := len(subLits[0])
+			for _, l := range subLits[1:] {
+				if len(l) < minLen {
+					minLen = len(l)
+				}
+			}
+			// Prefer single-literal constraints and longer substrings.
+			score := minLen * 10
+			if len(subLits) == 1 {
+				score += 5
+			}
+			if score > bestScore {
+				bestScore = score
+				best = subLits
+			}
+		}
+		if len(best) == 0 {
+			return nil, false
+		}
+		return best, true
+	case syntax.OpPlus:
+		if len(re.Sub) == 1 {
+			return requiredBranchLiterals(re.Sub[0])
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
+}
+
+func asciiLowerLiteral(runes []rune) (string, bool) {
+	if len(runes) == 0 {
+		return "", false
+	}
+	buf := make([]byte, len(runes))
+	for i, r := range runes {
+		if r < 0x20 || r > 0x7e {
+			return "", false
+		}
+		b := byte(r)
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		buf[i] = b
+	}
+	return string(buf), true
+}
+
+func isPureASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func containsAnyASCIIFold(s string, lowerNeedles []string) bool {
+	for _, needle := range lowerNeedles {
+		if containsASCIIFold(s, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsASCIIFold(s, lowerNeedle string) bool {
+	n := len(lowerNeedle)
+	if n == 0 {
+		return true
+	}
+	if len(s) < n {
+		return false
+	}
+	firstLo := lowerNeedle[0]
+	firstHi := firstLo
+	if firstLo >= 'a' && firstLo <= 'z' {
+		firstHi = firstLo - ('a' - 'A')
+	}
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		c := s[i]
+		if c != firstLo && c != firstHi {
+			continue
+		}
+		matched := true
+		for j := 1; j < n; j++ {
+			sc := s[i+j]
+			if sc >= 'A' && sc <= 'Z' {
+				sc += 'a' - 'A'
+			}
+			if sc != lowerNeedle[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
