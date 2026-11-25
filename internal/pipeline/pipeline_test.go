@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1584,6 +1585,68 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 		}
 		if _, statErr := os.Stat(filepath.Join(dataDir, "alerts.jsonl")); !os.IsNotExist(statErr) {
 			t.Fatal("completed pre-burn async Tier 2 worker recreated alerts.jsonl after Burn()")
+		}
+	})
+
+	t.Run("BurnCancelsActiveHTTPRequest", func(t *testing.T) {
+		reqStarted := make(chan struct{})
+		reqCanceled := make(chan struct{})
+		releaseHandler := make(chan struct{})
+		var closeRelOnce sync.Once
+		relHandler := func() { closeRelOnce.Do(func() { close(releaseHandler) }) }
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Drain the POST JSON body just like the real inference endpoint so Go's HTTP/1.1
+			// server starts its background read loop and detects client TCP cancellation.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-reqStarted:
+			default:
+				close(reqStarted)
+			}
+			select {
+			case <-r.Context().Done():
+				select {
+				case <-reqCanceled:
+				default:
+					close(reqCanceled)
+				}
+			case <-releaseHandler:
+			}
+		}))
+		t.Cleanup(func() {
+			relHandler()
+			srv.Close()
+		})
+
+		dataDir := t.TempDir()
+		cfg := config.DefaultConfig()
+		cfg.DataDir = dataDir
+		cfg.TriageMode = "http"
+		cfg.InferenceAddr = srv.URL
+		pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+		pipe.EnableAsyncTriage(4)
+		defer pipe.Close()
+
+		pipe.IngestEvent(model.LogEvent{
+			ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN",
+			Message: "GET /../../../../etc/passwd HTTP/1.1 403",
+		})
+		if em, _ := pipe.FlushWindow(); len(em) != 1 {
+			t.Fatalf("expected 1 deterministic alert, got %d", len(em))
+		}
+		select {
+		case <-reqStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("async worker did not dispatch HTTP request")
+		}
+		if _, err := pipe.Burn(); err != nil {
+			t.Fatalf("Burn failed: %v", err)
+		}
+		select {
+		case <-reqCanceled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Burn did not cancel active in-flight Tier 2 HTTP request")
 		}
 	})
 

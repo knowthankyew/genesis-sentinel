@@ -405,7 +405,8 @@ func runFeedbackAlerts(args []string, stdout, stderr io.Writer) error {
 			cls = "-"
 		}
 		if _, err := fmt.Fprintf(stdout, "%s  [%s] tier=%s service=%s triage=%s  %s\n",
-			a.AlertID, a.Severity, a.Tier, a.SourceService, cls, escapeForTerminal(a.Template)); err != nil {
+			escapeForTerminal(a.AlertID), escapeForTerminal(a.Severity), escapeForTerminal(a.Tier),
+			escapeForTerminal(a.SourceService), escapeForTerminal(cls), escapeForTerminal(a.Template)); err != nil {
 			return err
 		}
 	}

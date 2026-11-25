@@ -629,10 +629,24 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 	if evTS := normalizeAlertTimestamp(ev.Timestamp, 0); evTS > bucket.lastSeenUnix {
 		bucket.lastSeenUnix = evTS
 	}
+	// When redaction is enabled, compute a pre-truncation redacted sample once per matching
+	// event so a credential spanning MaxPromptByte (e.g. long URL userinfo) cannot leak a prefix.
+	var redactedEventSample string
+	redactedSampleReady := false
+	getSafeSample := func(fallback string) string {
+		if !p.cfg.RequireRedaction {
+			return fallback
+		}
+		if !redactedSampleReady {
+			redactedEventSample = sanitizeAndRedactField(ev.Message, p.cfg.MaxPromptByte, true)
+			redactedSampleReady = true
+		}
+		return redactedEventSample
+	}
 	if evEval.InjectionSuspected {
 		bucket.injSuspected = true
 		if bucket.injSample == "" && evEval.InjectionSample != "" {
-			bucket.injSample = evEval.InjectionSample
+			bucket.injSample = getSafeSample(evEval.InjectionSample)
 		}
 		if bucket.injSignalLookup == nil {
 			bucket.injSignalLookup = make(map[string]struct{}, len(evEval.InjectionSignals))
@@ -650,7 +664,7 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 			acc = &ruleAccumulator{
 				hit:             m.RuleHit,
 				minCount:        m.MinCount,
-				sanitizedSample: m.SanitizedSample,
+				sanitizedSample: getSafeSample(m.SanitizedSample),
 				maxEntropy:      m.Entropy,
 			}
 			bucket.rules[m.RuleHit.RuleID] = acc
@@ -659,7 +673,7 @@ func (p *Pipeline) IngestEvent(ev model.LogEvent) {
 		if m.Entropy > acc.maxEntropy {
 			acc.maxEntropy = m.Entropy
 			if m.SanitizedSample != "" {
-				acc.sanitizedSample = m.SanitizedSample
+				acc.sanitizedSample = getSafeSample(m.SanitizedSample)
 			}
 		}
 	}
@@ -930,9 +944,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			topFeats      map[string]float64
 		)
 		if sc, ok := scoresByKey[k]; ok && sc.TotalNats > 0 {
-			surpNats = sc.TotalNats
-			surpThreshold = sc.ThresholdNats
-			topFeats = surprisal.TopFeatures(sc.FeatureContribs, 4)
+			surpNats = round4(sc.TotalNats)
+			surpThreshold = round4(sc.ThresholdNats)
+			topFeats = roundFeatureMap4(surprisal.TopFeatures(sc.FeatureContribs, 4))
 			if sc.Anomalous {
 				tierLabel = "tier0+tier1"
 				// Preserve the higher severity across both tiers so a LOW Tier 0 rule
@@ -1033,14 +1047,16 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		seq := p.alertSeq.Add(1)
 		alertID := fmt.Sprintf("sentinel-%d-%s-%d", nowUnix, p.instanceID, seq)
 		ts := normalizeAlertTimestamp(w.LastSeenUnix, nowUnix)
-		roundedEntropy := math.Round(w.SampleEntropy*10000) / 10000
-		topFeats := surprisal.TopFeatures(sw.score.FeatureContribs, 4)
+		roundedEntropy := round4(w.SampleEntropy)
+		roundedSurp := round4(sw.score.TotalNats)
+		roundedThresh := round4(sw.score.ThresholdNats)
+		topFeats := roundFeatureMap4(surprisal.TopFeatures(sw.score.FeatureContribs, 4))
 
 		msg := fmt.Sprintf("[SURPRISAL-001] statistical_anomaly on service=%s count=%d surprisal=%.2fnats (threshold=%.2f) entropy=%.2f sample=%q",
 			cleanService,
 			w.Count,
-			sw.score.TotalNats,
-			sw.score.ThresholdNats,
+			roundedSurp,
+			roundedThresh,
 			roundedEntropy,
 			truncateSummary(cleanSample, 220),
 		)
@@ -1059,8 +1075,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			Template:             cleanTemplate,
 			Count:                w.Count,
 			SampleEntropy:        roundedEntropy,
-			SurprisalNats:        sw.score.TotalNats,
-			SurprisalThreshold:   sw.score.ThresholdNats,
+			SurprisalNats:        roundedSurp,
+			SurprisalThreshold:   roundedThresh,
 			TopSurprisalFeatures: topFeats,
 			RuleIDs:              []string{"SURPRISAL-001"},
 			Categories:           []string{"statistical_anomaly"},
@@ -1695,6 +1711,26 @@ func stripTrailingPathSeparators(p string) string {
 func sanitizeAndRedactField(raw string, maxBytes int, requireRedaction bool) string {
 	s, _ := sanitizeAndRedactWithSignals(raw, maxBytes, requireRedaction)
 	return s
+}
+
+// round4 normalizes alert float fields to <= 4 decimal places so JSON encoding never emits
+// 16-digit float mantissas that could interact with Genesis --redact numeric patterns.
+func round4(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return math.Round(v*10000) / 10000
+}
+
+func roundFeatureMap4(m map[string]float64) map[string]float64 {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(m))
+	for k, v := range m {
+		out[k] = round4(v)
+	}
+	return out
 }
 
 // sanitizeAndRedactWithSignals neutralizes chat delimiters and scrubs credentials/URL userinfo

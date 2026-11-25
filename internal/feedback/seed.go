@@ -455,8 +455,17 @@ func generateSeedSubset(perClass int, seed uint64, indexOffset int, selectScenar
 	if perClass <= 0 {
 		return nil
 	}
-	rng := rand.New(rand.NewSource(int64(seed)))
 	specs := starterClassSpecs()
+	if len(specs) == 0 {
+		return nil
+	}
+	// Guard against integer overflow or unbounded allocation if a library caller passes an
+	// extreme count directly (CLI paths also reject values above the FTaaS record ceiling).
+	maxPerClass := config.DefaultMaxTrainingRecords / len(specs)
+	if perClass > maxPerClass {
+		perClass = maxPerClass
+	}
+	rng := rand.New(rand.NewSource(int64(seed)))
 	records := make([]model.FeedbackRecord, 0, perClass*len(specs))
 	now := deterministicSeedTimestamp
 

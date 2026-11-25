@@ -168,8 +168,10 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatal("expected GetJob to reject mismatched jobId response")
 	}
 
+	waitOKCtx, cancelOK := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelOK()
 	var updates int
-	finalJob, err := client.WaitForJob(context.Background(), subRes.JobID, 10*time.Millisecond, func(JobDetail) {
+	finalJob, err := client.WaitForJob(waitOKCtx, subRes.JobID, 10*time.Millisecond, func(JobDetail) {
 		updates++
 	})
 	if err != nil || finalJob.Status != "Succeeded" || finalJob.AdapterPath != "artifacts/job_abc123/model_adapters" || updates != 2 {
@@ -177,7 +179,9 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	}
 
 	// Failed job with non-empty adapterPath MUST return the polled terminal detail AND a non-nil error.
-	failedJob, err := client.WaitForJob(context.Background(), "job_failed", 10*time.Millisecond, nil)
+	waitFailCtx, cancelFail := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFail()
+	failedJob, err := client.WaitForJob(waitFailCtx, "job_failed", 10*time.Millisecond, nil)
 	if err == nil || !strings.Contains(err.Error(), "worker OOM") || failedJob.JobID != "job_failed" || failedJob.Status != "Failed" || failedJob.AdapterPath == "" {
 		t.Fatalf("expected WaitForJob to return failed detail with worker OOM error, got job=%+v err=%v", failedJob, err)
 	}

@@ -523,6 +523,9 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 	}
 	if !c.openUntil.IsZero() && c.circuitGen == circuitGen {
 		c.openUntil = time.Time{}
+		// Advance circuitGen on recovery so a concurrent post-cooldown sibling failure
+		// from the same generation cannot immediately re-open the freshly recovered breaker.
+		c.circuitGen++
 	}
 	c.mu.Unlock()
 
@@ -560,9 +563,13 @@ func redactErrSnippet(raw string, secrets ...string) string {
 	// can never bypass configured secret replacement.
 	work := raw
 	if hasSecret {
-		if decoded, ok := scrubDecodedJSONBody([]byte(raw), secrets); ok {
-			work = decoded
+		decoded, ok := scrubDecodedJSONBody([]byte(raw), secrets)
+		if !ok {
+			// Fail closed when an authenticated error response is non-JSON or undecodable
+			// so alternate escape spellings can never disclose configured credentials.
+			return "[response body omitted: non-JSON authenticated error]"
 		}
+		work = decoded
 	}
 	// Sanitize and redact secrets/JWTs across the ENTIRE bounded response (capped at 256 KiB
 	// by the reader) BEFORE truncating to 240 bytes so even oversized JWTs are never sliced.
@@ -588,8 +595,14 @@ func redactErrSnippet(raw string, secrets ...string) string {
 }
 
 func scrubDecodedJSONBody(raw []byte, secrets []string) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var parsed any
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := dec.Decode(&parsed); err != nil {
+		return "", false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return "", false
 	}
 	scrubbed := scrubJSONValue(parsed, secrets)

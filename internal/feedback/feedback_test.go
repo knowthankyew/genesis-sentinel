@@ -38,6 +38,7 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	// boundary card ("4111 1111 1111 1111 2 attempts"), credential assignments, emails, and 4-6-5 Amex cards.
 	for _, sample := range []string{
 		"Authorization: Bearer opaqueToken123456",
+		"Authorization: Bearer abc",
 		"Authorization: Basic dXNlcjpwYXNz",
 		"Basic YTpi",
 		"Basic YTo/",
@@ -60,6 +61,7 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.sig1234567890",
 		"postgres://admin:p@ssword@db.internal:5432/app",
 		"postgres://admin:p;a,ss@db.internal:5432/app",
+		"postgres://admin:p'a)ss@db.internal:5432/app",
 		`password="unterminated_secret_val`,
 		`DB_PASSWORD="part1"'part2' nextarg`,
 		"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBALeakedTruncatedKey",
@@ -358,6 +360,7 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 		"dup-key.jsonl":      `{"prompt":"first clean prompt","prompt":"second clean prompt","completion":"[BENIGN-NOISE]"}` + "\n",
 		"null-prompt.jsonl":  `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
 		"null-weight.jsonl":  `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","weight":null}` + "\n",
+		"padded-10001.jsonl": `{"prompt":"` + strings.Repeat(" ", 10001) + `abc","completion":"[BENIGN-NOISE]"}` + "\n",
 		"nbsp-prefix.jsonl":  "\u00a0" + `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
 		"invalid-utf8.jsonl": "{\"prompt\":\"bad \xff utf8\",\"completion\":\"[BENIGN-NOISE]\"}\n",
 		"email-pii.jsonl":    `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",

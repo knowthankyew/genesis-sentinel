@@ -623,12 +623,15 @@ func validateJSONLStream(r io.Reader, path string, requirePIIScan bool) (Validat
 		// values, and trailing tokens), then scan decoded string fields for PII/secrets so
 		// escaped quoted placeholders such as password=\"[REDACTED_SECRET]\" in Sentinel-generated
 		// JSONL are accepted while literal and \uXXXX-escaped credentials are always blocked.
-		prompt, completion, err := parseStrictFTaaSRecord(line)
+		rawPrompt, rawCompletion, err := parseStrictFTaaSRecord(line)
 		if err != nil {
 			return ValidationSummary{}, fmt.Errorf("dataset %q line %d %w", path, count, err)
 		}
-		prompt = strings.TrimSpace(prompt)
-		completion = strings.TrimSpace(completion)
+		if utf8.RuneCountInString(rawPrompt) > MaxFieldChars || utf8.RuneCountInString(rawCompletion) > MaxFieldChars {
+			return ValidationSummary{}, fmt.Errorf("dataset %q line %d exceeds FTaaS %d-character per-field limit", path, count, MaxFieldChars)
+		}
+		prompt := strings.TrimSpace(rawPrompt)
+		completion := strings.TrimSpace(rawCompletion)
 		if err := validateFieldLengths(prompt, completion); err != nil {
 			return ValidationSummary{}, fmt.Errorf("dataset %q line %d %w", path, count, err)
 		}
@@ -692,13 +695,13 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 			return "", "", fmt.Errorf("invalid JSON: non-string object key")
 		}
 		if _, dup := seen[key]; dup {
-			return "", "", fmt.Errorf("duplicate JSON key %q is prohibited", key)
+			return "", "", fmt.Errorf("contains duplicate JSON key (prohibited)")
 		}
 		seen[key] = struct{}{}
 
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return "", "", fmt.Errorf("invalid JSON value for %q: %w", key, err)
+			return "", "", fmt.Errorf("contains unreadable JSON property value")
 		}
 		switch key {
 		case "prompt":
@@ -706,7 +709,7 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 				return "", "", fmt.Errorf("prompt must be a JSON string")
 			}
 			if err := json.Unmarshal(raw, &prompt); err != nil {
-				return "", "", fmt.Errorf("prompt must be a JSON string: %w", err)
+				return "", "", fmt.Errorf("prompt must be a JSON string")
 			}
 			hasPrompt = true
 		case "completion":
@@ -714,7 +717,7 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 				return "", "", fmt.Errorf("completion must be a JSON string")
 			}
 			if err := json.Unmarshal(raw, &completion); err != nil {
-				return "", "", fmt.Errorf("completion must be a JSON string: %w", err)
+				return "", "", fmt.Errorf("completion must be a JSON string")
 			}
 			hasComp = true
 		case "weight":
@@ -726,7 +729,7 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 				return "", "", fmt.Errorf("has invalid weight")
 			}
 		default:
-			return "", "", fmt.Errorf("contains unexpected field %q (only prompt, completion, and optional weight are permitted)", key)
+			return "", "", fmt.Errorf("contains unexpected JSON field (only prompt, completion, and optional weight are permitted)")
 		}
 	}
 

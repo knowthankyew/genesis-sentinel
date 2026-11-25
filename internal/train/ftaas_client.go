@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -506,12 +507,21 @@ func compactErrBody(b []byte, secrets ...string) string {
 	// so HTML-escaped and non-HTML-escaped spellings can never bypass redaction.
 	s := strings.TrimSpace(string(b))
 	if hasSecret {
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
 		var parsed any
-		if err := json.Unmarshal(b, &parsed); err == nil {
-			if out, mErr := json.Marshal(scrubJSONSecrets(parsed, secrets)); mErr == nil {
-				s = string(out)
-			}
+		if err := dec.Decode(&parsed); err != nil {
+			return "[response body omitted: non-JSON authenticated error]"
 		}
+		var trailing any
+		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return "[response body omitted: non-JSON authenticated error]"
+		}
+		out, mErr := json.Marshal(scrubJSONSecrets(parsed, secrets))
+		if mErr != nil {
+			return "[response body omitted: non-JSON authenticated error]"
+		}
+		s = string(out)
 	}
 	for _, sec := range secrets {
 		if len(sec) >= 4 {

@@ -25,7 +25,7 @@ var (
 	urlSchemeRe = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,15}://`)
 
 	// Authorization Bearer and Basic credentials (both plain headers and JSON-quoted header keys).
-	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
+	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]+)`)
 	bearerRe         = regexp.MustCompile(`(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
 	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{4,}={0,2})`)
 
@@ -253,16 +253,16 @@ func redactURLCredentials(s string) (string, bool) {
 		authEnd := authStart
 		for authEnd < len(s) {
 			ch := s[authEnd]
-			// Preserve valid RFC 3986 userinfo punctuation (such as ';' and ',') during
-			// authority scanning so passwords containing ';' or ',' still reach the last '@'.
-			if ch <= ' ' || ch == '/' || ch == '?' || ch == '#' || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == ')' || ch == ']' || ch == '}' {
+			// Preserve valid RFC 3986 userinfo punctuation (such as ';', ',', '\'', ')') during
+			// authority scanning so passwords containing those characters still reach the last '@'.
+			if ch <= ' ' || ch == '/' || ch == '?' || ch == '#' || ch == '"' || ch == '`' || ch == '<' || ch == '>' || ch == ']' || ch == '}' {
 				break
 			}
 			authEnd++
 		}
 		authority := s[authStart:authEnd]
 		if atIdx := strings.LastIndexByte(authority, '@'); atIdx > 0 && atIdx < len(authority)-1 {
-			hostPart := strings.TrimRight(authority[atIdx+1:], ",;")
+			hostPart := strings.TrimRight(authority[atIdx+1:], ",;')")
 			trailingPunct := len(authority[atIdx+1:]) - len(hostPart)
 			userinfo := authority[:atIdx]
 			if len(hostPart) > 0 && strings.ContainsRune(userinfo, ':') && !isRedactedPlaceholder(userinfo) {

@@ -189,6 +189,14 @@ func TestParseCompletionFailClosedAndInjectionOverride(t *testing.T) {
 	if vCleanExp.Confidence != 0.123 {
 		t.Fatalf("expected confidence rounded to 0.123, got %v", vCleanExp.Confidence)
 	}
+	// 8. A second line containing severity=LOW must NOT override verdict metadata on line 1.
+	vMultiLine, _ := ParseCompletion(
+		"[AUTH-BRUTEFORCE]\nseverity=LOW\nRepeated SSH brute force.",
+		model.ModelSmolLM2135MInstruct, "", "t-multiline", false, nil,
+	)
+	if vMultiLine.Label != ClassAuthBruteforce || vMultiLine.Severity != "HIGH" {
+		t.Fatalf("expected trailing line severity=LOW not to downgrade line-1 class default HIGH, got %+v", vMultiLine)
+	}
 }
 
 func TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials(t *testing.T) {
@@ -406,6 +414,69 @@ func TestClientStaleCircuitGenerationDoesNotReopenRecoveredBreaker(t *testing.T)
 	if reqNum.Load() != 4 {
 		t.Fatalf("expected 4 HTTP calls, got %d", reqNum.Load())
 	}
+
+	// Verify concurrent post-cooldown recovery advances circuitGen so a slower sibling failure
+	// started after cooldown cannot re-open the freshly recovered breaker.
+	postFailStarted := make(chan struct{})
+	releasePostFail := make(chan struct{})
+	var closePostOnce sync.Once
+	relPost := func() { closePostOnce.Do(func() { close(releasePostFail) }) }
+	var pNum atomic.Int32
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch pNum.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusInternalServerError) // trip breaker
+		case 2:
+			close(postFailStarted)
+			<-releasePostFail
+			w.WriteHeader(http.StatusInternalServerError) // slow post-cooldown sibling failure
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"completion":"[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok"}`))
+		}
+	}))
+	t.Cleanup(func() {
+		relPost()
+		srv2.Close()
+	})
+	c2, err := NewClient(ClientOptions{BaseURL: srv2.URL, Cooldown: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient c2: %v", err)
+	}
+	fakeNow2 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	var c2Mu sync.Mutex
+	c2.nowFn = func() time.Time {
+		c2Mu.Lock()
+		defer c2Mu.Unlock()
+		return fakeNow2
+	}
+	_, _, _ = c2.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "trip"})
+	if !c2.Stats().CircuitOpen {
+		t.Fatal("expected initial failure to open c2 breaker")
+	}
+	c2Mu.Lock()
+	fakeNow2 = fakeNow2.Add(35 * time.Second)
+	c2Mu.Unlock()
+
+	sibErr := make(chan error, 1)
+	go func() {
+		_, _, err := c2.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "slow-fail"})
+		sibErr <- err
+	}()
+	select {
+	case <-postFailStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-cooldown sibling request did not reach server")
+	}
+	// Concurrent call succeeds and recovers breaker (advancing circuitGen).
+	if _, _, err := c2.TriageWindow(context.Background(), PromptInput{Service: "api", SampleLine: "fast-recover"}); err != nil {
+		t.Fatalf("expected fast post-cooldown call to recover breaker: %v", err)
+	}
+	relPost()
+	<-sibErr
+	if c2.Stats().CircuitOpen {
+		t.Fatal("slow post-cooldown sibling failure re-opened an already recovered breaker")
+	}
 }
 
 type deadlineRoundTripper struct {
@@ -487,9 +558,13 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 	if strings.Contains(redTok, "opaqueTok9999") {
 		t.Fatalf("redactErrSnippet leaked JSON token field: %q", redTok)
 	}
-	redEscKey := redactErrSnippet(`{"detail":"bad key \"quoted\"<angle>secret99"}`, `"quoted"<angle>secret99`)
+	redEscKey := redactErrSnippet(`{"detail":"bad key \"quoted\"<angle>secret99","big":1e9999}`, `"quoted"<angle>secret99`)
 	if strings.Contains(redEscKey, "secret99") {
-		t.Fatalf("redactErrSnippet leaked JSON-escaped API key with angle brackets: %q", redEscKey)
+		t.Fatalf("redactErrSnippet leaked JSON-escaped API key with angle brackets and large JSON number: %q", redEscKey)
+	}
+	redNonJSON := redactErrSnippet(`not-json raw secret99`, `"quoted"<angle>secret99`)
+	if strings.Contains(redNonJSON, "secret99") {
+		t.Fatalf("redactErrSnippet leaked non-JSON authenticated error body: %q", redNonJSON)
 	}
 
 	// 4. Verify caller deadline propagates deterministically onto the outbound HTTP request context

@@ -375,7 +375,24 @@ func ParseCompletion(
 	injSuspected bool,
 	injSignals []string,
 ) (model.TriageVerdict, bool) {
-	cleaned := sanitizeSingleLine(rawCompletion, 2048)
+	// Isolate the first non-empty verdict line BEFORE flattening newlines so trailing lines
+	// (e.g. a second line containing "severity=LOW") cannot override verdict metadata.
+	firstLine := ""
+	var trailingLines []string
+	for _, rawLine := range strings.FieldsFunc(rawCompletion, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == '\u2028' || r == '\u2029'
+	}) {
+		t := strings.TrimSpace(rawLine)
+		if t == "" {
+			continue
+		}
+		if firstLine == "" {
+			firstLine = t
+		} else {
+			trailingLines = append(trailingLines, t)
+		}
+	}
+	cleaned := sanitizeSingleLine(firstLine, 2048)
 
 	// Extract class strictly from the leading verdict tag position against the 8 canonical
 	// classes (aliases such as [NOISE] or custom tags fail closed to NEEDS-REVIEW in live triage).
@@ -439,6 +456,9 @@ func ParseCompletion(
 		explanation = strings.TrimSpace(em[1])
 	} else if metaCursor != "" {
 		explanation = strings.TrimSpace(metaCursor)
+	}
+	if explanation == "" && len(trailingLines) > 0 {
+		explanation = strings.Join(trailingLines, " ")
 	}
 	if explanation == "" {
 		if matchedTag {
