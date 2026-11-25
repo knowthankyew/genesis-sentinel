@@ -1,6 +1,6 @@
 <!-- diagram-meta
 last-validated: 2026-11-24
-validated-commit: f55b481
+validated-commit: 6d9186f
 covers: [cmd/, internal/]
 -->
 
