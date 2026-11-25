@@ -869,3 +869,35 @@ func TestSegReaderScratchBufferDoesNotAliasEvents(t *testing.T) {
 		t.Fatalf("syslog 3164 frame 6 aliased/corrupted: %+v", evs[6])
 	}
 }
+
+func TestSegReaderRecoveryAfterInvalidHeaderInsideReadAhead(t *testing.T) {
+	// Place a valid frame, followed by a corrupted invalid-length header + junk, followed
+	// immediately (well inside the 64 KiB bufio.Reader read-ahead buffer) by another valid frame.
+	// Recovery must seek f back to the logical offset of the trailing valid frame before br.Reset(f).
+	segDir := t.TempDir()
+	segPath := filepath.Join(segDir, "00000001.seg")
+	var raw bytes.Buffer
+	_ = WriteSegmentFrame(&raw, []byte(`{"timestamp":1700000101,"service":"api","level":"INFO","message":"before-corrupt-header"}`))
+	// Invalid zero-length header + 16 garbage bytes inside read-ahead window
+	raw.Write([]byte{0, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef})
+	raw.Write(bytes.Repeat([]byte{0xff}, 16))
+	_ = WriteSegmentFrame(&raw, []byte(`{"timestamp":1700000102,"service":"api","level":"WARN","message":"after-corrupt-inside-readahead"}`))
+	if err := os.WriteFile(segPath, raw.Bytes(), 0600); err != nil {
+		t.Fatalf("write seg: %v", err)
+	}
+
+	r, err := NewSegReader(segDir, "", 0)
+	if err != nil {
+		t.Fatalf("NewSegReader: %v", err)
+	}
+	evs, err := r.ReadBatch(10)
+	if err != nil {
+		t.Fatalf("ReadBatch: %v", err)
+	}
+	if len(evs) != 2 || evs[0].Message != "before-corrupt-header" || evs[1].Message != "after-corrupt-inside-readahead" {
+		t.Fatalf("buffered read-ahead skipped valid frame during recovery: got %+v", evs)
+	}
+	if r.Stats().CorruptedFrames == 0 {
+		t.Fatalf("expected CorruptedFrames > 0, got %+v", r.Stats())
+	}
+}

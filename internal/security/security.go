@@ -41,6 +41,10 @@ var (
 	// llamaInstPattern matches Llama/Mistral instruction and system delimiters.
 	llamaInstPattern = regexp.MustCompile(`(?:<<SYS>>|<</SYS>>|\[/?INST\])`)
 
+	// telemetryFenceBeginRe / telemetryFenceEndRe match spoofed prompt data-fence markers case-insensitively.
+	telemetryFenceBeginRe = regexp.MustCompile(`(?i)BEGIN_UNTRUSTED_LOG_TELEMETRY`)
+	telemetryFenceEndRe   = regexp.MustCompile(`(?i)END_UNTRUSTED_LOG_TELEMETRY`)
+
 	// injectionHeuristics detect common plain-text prompt injection cues inside untrusted log payloads.
 	// Matches are surfaced as TriageVerdict metadata so analysts never mistake injected text for trusted signals.
 	injectionHeuristics = []struct {
@@ -448,8 +452,9 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	// 2. Detect adversarial injection patterns on the control-normalized text.
 	signals := detectInjectionSignalsNormalized(cleaned)
 
-	// 3. Neutralize model control tokens (bounded multi-pass to prevent nested reassembly).
-	for pass := 0; pass < 3 && hasSpecialTemplateDelimiter(cleaned); pass++ {
+	// 3. Neutralize model control tokens and spoofed telemetry fence markers
+	// (bounded multi-pass to prevent nested reassembly).
+	for pass := 0; pass < 3 && (hasSpecialTemplateDelimiter(cleaned) || containsASCIIFold(cleaned, "untrusted_log_telemetry")); pass++ {
 		if strings.Contains(cleaned, "<|") {
 			cleaned = specialTokenPattern.ReplaceAllStringFunc(cleaned, func(tok string) string {
 				inner := tok[2 : len(tok)-2]
@@ -481,6 +486,10 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 		if strings.Contains(cleaned, "<s>") || strings.Contains(cleaned, "</s>") {
 			cleaned = strings.ReplaceAll(cleaned, "<s>", "[s]")
 			cleaned = strings.ReplaceAll(cleaned, "</s>", "[/s]")
+		}
+		if containsASCIIFold(cleaned, "untrusted_log_telemetry") {
+			cleaned = telemetryFenceBeginRe.ReplaceAllString(cleaned, "[BEGIN_MARKER]")
+			cleaned = telemetryFenceEndRe.ReplaceAllString(cleaned, "[END_MARKER]")
 		}
 	}
 

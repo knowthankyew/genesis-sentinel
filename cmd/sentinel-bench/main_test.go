@@ -245,9 +245,42 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 		t.Fatalf("expected ErrExperimentalModelExcluded for BitNet model, got %v", err)
 	}
 
-	extPath := filepath.Join(t.TempDir(), "outside.md")
+	// Reject --surprisal-evals 1 so separation is never computed with an empty benign cohort.
+	if _, err := runBenchmarks(benchOptions{
+		lines:          100,
+		windowEvents:   50,
+		surprisalEvals: 1,
+		baselineSize:   50,
+		seed:           42,
+	}); err == nil {
+		t.Fatal("expected runBenchmarks to reject --surprisal-evals 1")
+	}
+
+	// Keep outside-path and symlink-escape tests independent of TMPDIR using t.Chdir.
+	tmpRoot := t.TempDir()
+	workDir := filepath.Join(tmpRoot, "workspace")
+	siblingDir := filepath.Join(tmpRoot, "outside")
+	if err := os.MkdirAll(filepath.Join(workDir, "docs"), 0755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+	if err := os.MkdirAll(siblingDir, 0755); err != nil {
+		t.Fatalf("mkdir siblingDir: %v", err)
+	}
+	t.Chdir(workDir)
+
+	extPath := filepath.Join(siblingDir, "outside.md")
 	if _, relErr := resolveReportMarkdownPath(extPath, true); relErr == nil {
 		t.Fatalf("expected external --out-md %q to be rejected when publishing JSON", extPath)
+	}
+	symOutDir := filepath.Join(workDir, "docs", "out-link")
+	if err := os.Symlink(siblingDir, symOutDir); err == nil {
+		if _, relErr := resolveReportMarkdownPath(filepath.Join("docs", "out-link", "report.md"), true); relErr == nil {
+			t.Fatal("expected symlinked directory escaping workspace to be rejected by resolveReportMarkdownPath")
+		}
+	}
+	// New in-workspace subdirectory must still resolve cleanly.
+	if relOK, relErr := resolveReportMarkdownPath(filepath.Join("docs", "newdir", "report.md"), true); relErr != nil || relOK != "docs/newdir/report.md" {
+		t.Fatalf("expected new in-workspace path to resolve cleanly, got %q err=%v", relOK, relErr)
 	}
 
 	// Verify publishReportPair preserves prior Markdown if JSON publication fails (e.g. target is a directory).
@@ -294,6 +327,28 @@ func TestBenchmarkRejectsBitNetModelAndExternalReportPath(t *testing.T) {
 		}
 		if _, statErr := os.Stat(unreadableMD); statErr != nil {
 			t.Fatalf("unreadable prior Markdown was unexpectedly removed: %v", statErr)
+		}
+	}
+
+	// Reject symlink destination and preserve symlink target intact.
+	symTarget := filepath.Join(pairDir, "real-target.md")
+	if err := os.WriteFile(symTarget, []byte("# original target\n"), 0644); err != nil {
+		t.Fatalf("write symTarget: %v", err)
+	}
+	symLink := filepath.Join(pairDir, "link-report.md")
+	if err := os.Symlink(symTarget, symLink); err == nil {
+		if err := publishReportPair(symLink, filepath.Join(pairDir, "sym-out.json"), []byte("# overwrite\n"), BenchmarkReport{}); err == nil {
+			t.Fatal("expected publishReportPair to reject symlink Markdown destination")
+		}
+		if fi, lerr := os.Lstat(symLink); lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("symlink destination was damaged: fi=%v err=%v", fi, lerr)
+		}
+	}
+
+	// On case-insensitive filesystems (e.g. macOS APFS), fresh paths differing only by case must be rejected.
+	if isCaseInsensitiveDir(pairDir) {
+		if err := publishReportPair(filepath.Join(pairDir, "casecheck.md"), filepath.Join(pairDir, "CASECHECK.MD"), []byte("# case\n"), BenchmarkReport{}); err == nil {
+			t.Fatal("expected publishReportPair to reject fresh case-insensitive collision paths")
 		}
 	}
 

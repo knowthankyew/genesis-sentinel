@@ -910,11 +910,29 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		cleanService := bucket.displayService
 		cleanLevel := bucket.displayLevel
-		cleanTemplate := sanitizeAndRedactField(tmplStr, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
+		cleanTemplate, tmplSigs := sanitizeAndRedactWithSignals(tmplStr, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
 		if p.cfg.RequireRedaction {
 			cleanService, _ = feedback.RedactText(cleanService)
 			cleanLevel, _ = feedback.RedactText(cleanLevel)
 			bestSample, _ = feedback.RedactText(bestSample)
+		}
+		alertInjSuspected := bucket.injSuspected
+		alertInjSignals := append([]string(nil), bucket.injSignals...)
+		if len(tmplSigs) > 0 {
+			seenSig := make(map[string]struct{}, len(alertInjSignals)+len(tmplSigs))
+			for _, s := range alertInjSignals {
+				seenSig[s] = struct{}{}
+			}
+			for _, s := range tmplSigs {
+				if _, ok := seenSig[s]; !ok {
+					seenSig[s] = struct{}{}
+					alertInjSignals = append(alertInjSignals, s)
+				}
+			}
+			if !alertInjSuspected {
+				alertInjSuspected = true
+				p.injectionSignals.Add(1)
+			}
 		}
 
 		p.ruleHitsTotal.Add(uint64(len(qualifyingHits)))
@@ -995,8 +1013,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			RuleIDs:              ruleIDs,
 			Categories:           categories,
 			Severity:             severity,
-			InjectionSuspected:   bucket.injSuspected,
-			InjectionSignals:     bucket.injSignals,
+			InjectionSuspected:   alertInjSuspected,
+			InjectionSignals:     alertInjSignals,
 			SanitizedSample:      bestSample,
 		}
 
@@ -1025,12 +1043,12 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		w := sw.win
 		cleanService, svcSigs := sanitizeAndRedactWithSignals(w.Service, 128, p.cfg.RequireRedaction)
 		cleanLevel, lvlSigs := sanitizeAndRedactWithSignals(w.Level, 64, p.cfg.RequireRedaction)
-		cleanTemplate := sanitizeAndRedactField(w.Template, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
+		cleanTemplate, tmplSigs := sanitizeAndRedactWithSignals(w.Template, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
 		cleanSample, msgSigs := sanitizeAndRedactWithSignals(w.SampleLine, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
 
 		var injSignals []string
 		seenSig := make(map[string]struct{})
-		for _, list := range [][]string{msgSigs, svcSigs, lvlSigs} {
+		for _, list := range [][]string{msgSigs, tmplSigs, svcSigs, lvlSigs} {
 			for _, s := range list {
 				if _, ok := seenSig[s]; !ok {
 					seenSig[s] = struct{}{}

@@ -320,8 +320,10 @@ def main() -> int:
         hybrid_preds.append(1 if total_s >= DEFAULT_THRESHOLD_NATS else 0)
 
     rss_after_model = rss_mb()
-    lk_lat_sorted = sorted(lk_lat_ms)
-    hyb_lat_sorted = sorted(hybrid_lat_ms)
+    lk_raw_rounded = [round(v, 4) for v in lk_lat_ms]
+    hyb_raw_rounded = [round(v, 4) for v in hybrid_lat_ms]
+    lk_lat_sorted = sorted(lk_raw_rounded)
+    hyb_lat_sorted = sorted(hyb_raw_rounded)
 
     lk_metrics = compute_metrics(lk_preds, eval_set)
     hyb_metrics = compute_metrics(hybrid_preds, eval_set)
@@ -358,15 +360,33 @@ def main() -> int:
         f"rather than embedded in the zero-dependency Go binary."
     )
 
+    import subprocess as _sp
+    git_rev = "unknown"
+    try:
+        git_rev = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stderr=_sp.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception:
+        pass
+
     result = {
         "metadata": {
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "git_commit": git_rev,
+            "command": f"python scripts/eval_embedding_comparison.py --semantic-weight {args.semantic_weight:g}",
             "model_id": MODEL_ID,
             "offline_mode": True,
+            "execution_device": "cpu",
             "platform": f"{platform.system()} {platform.machine()}",
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
             "model_load_seconds": load_sec,
+            "warmup_samples_excluded": 1,
+            "sample_inclusion_rule": "all_post_warmup_eval_windows_in_order",
             "rss_measurement_method": "ru_maxrss_peak_process_post_import",
             "rss_before_model_mb": rss_before_model,
             "rss_after_model_mb": rss_after_model,
@@ -385,17 +405,20 @@ def main() -> int:
             **lk_metrics,
             "latency_p50_ms": lk_p50,
             "latency_p99_ms": round(pct(lk_lat_sorted, 99), 4),
+            "raw_samples_ms": lk_raw_rounded,
         },
         "hybrid_laplace_lk_minilm": {
             **hyb_metrics,
             "latency_p50_ms": hyb_p50,
             "latency_p99_ms": round(pct(hyb_lat_sorted, 99), 4),
+            "raw_samples_ms": hyb_raw_rounded,
         },
         "comparison": {
             "f1_delta": round(hyb_metrics["f1"] - lk_metrics["f1"], 4),
             "fp_delta": fp_delta,
             "disguised_semantic_recall_delta": recall_delta,
             "p50_latency_slowdown_x": latency_ratio,
+            "comparison_direction": "hybrid_p50_ms / pure_laplace_lk_p50_ms (>1 means hybrid is slower)",
             "recommendation": recommendation,
         },
     }

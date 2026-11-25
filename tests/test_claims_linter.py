@@ -266,14 +266,33 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok2)
             self.assertTrue(any("monotonicity" in e.lower() for e in errs2), errs2)
 
-            # 3. Tampered F1 score
+            # 3. Tampered F1 score (strictly distinct from fixture F1 and checked at exact 4-decimal precision)
             bad_f1 = json.loads(json.dumps(base_data))
-            bad_f1["detection_accuracy"]["f1_score"] = 0.50
+            orig_f1 = float(base_data["detection_accuracy"]["f1_score"])
+            bad_f1["detection_accuracy"]["f1_score"] = 0.25 if orig_f1 > 0.5 else 0.90
             p3 = tmp_root / "bad_f1.json"
             p3.write_text(json.dumps(bad_f1), encoding="utf-8")
             ok3, errs3 = sync_docs.independent_recompute_metrics(p3, repo_root=tmp_root)
             self.assertFalse(ok3)
             self.assertTrue(any("f1_score mismatch" in e.lower() for e in errs3), errs3)
+
+            # Sub-tolerance 4-decimal F1 drift (e.g. 0.9996 vs 1.0000) must also be rejected!
+            tiny_f1 = json.loads(json.dumps(base_data))
+            tiny_f1["detection_accuracy"]["f1_score"] = round(orig_f1 - 0.0004 if orig_f1 >= 0.0004 else orig_f1 + 0.0004, 4)
+            p_tiny = tmp_root / "tiny_f1.json"
+            p_tiny.write_text(json.dumps(tiny_f1), encoding="utf-8")
+            ok_tiny, errs_tiny = sync_docs.independent_recompute_metrics(p_tiny, repo_root=tmp_root)
+            self.assertFalse(ok_tiny)
+            self.assertTrue(any("f1_score mismatch" in e.lower() for e in errs_tiny), errs_tiny)
+
+            # Raw Tier 1 latency sample tamper must fail percentile recomputation!
+            bad_raw_t1 = json.loads(json.dumps(base_data))
+            bad_raw_t1["tier1_surprisal"]["raw_samples_us"] = [1.0] * bad_raw_t1["tier1_surprisal"]["evaluations"]
+            p_raw1 = tmp_root / "bad_raw_t1.json"
+            p_raw1.write_text(json.dumps(bad_raw_t1), encoding="utf-8")
+            ok_raw1, errs_raw1 = sync_docs.independent_recompute_metrics(p_raw1, repo_root=tmp_root)
+            self.assertFalse(ok_raw1)
+            self.assertTrue(any("raw-sample recomputation mismatch" in e for e in errs_raw1), errs_raw1)
 
             # 4. Leaked personal host path in JSON
             bad_path = json.loads(json.dumps(base_data))
@@ -284,37 +303,78 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok4)
             self.assertTrue(any("personal host path" in e for e in errs4), errs4)
 
-            # 5. Tampered embedding comparison F1 delta & subgroup recall
-            emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
-            if emb_json.is_file():
-                bad_emb = json.loads(emb_json.read_text(encoding="utf-8"))
-                bad_emb["comparison"]["f1_delta"] = 0.99
-                p5 = tmp_root / "bad_emb.json"
-                p5.write_text(json.dumps(bad_emb), encoding="utf-8")
-                ok5, errs5 = sync_docs.independent_recompute_embedding_comparison(p5)
-                self.assertFalse(ok5)
-                self.assertTrue(any("f1_delta mismatch" in e for e in errs5), errs5)
+            # 5. Unconditional self-contained embedding comparison negative tests (independent of optional artifact)
+            fixed_emb = {
+                "metadata": {"date": "2026-11-25T00:00:00Z", "model_id": "test", "offline_mode": True},
+                "dataset": {
+                    "eval_total_windows": 4,
+                    "eval_benign_windows": 2,
+                    "eval_structural_attack_windows": 1,
+                    "eval_disguised_semantic_windows": 1,
+                },
+                "pure_laplace_lk": {
+                    "tp": 1, "fp": 0, "fn": 1, "tn": 2,
+                    "structural_tp": 1, "disguised_semantic_tp": 0,
+                    "precision": 1.0, "recall": 0.5, "f1": 0.6667,
+                    "structural_recall": 1.0, "disguised_semantic_recall": 0.0,
+                    "latency_p50_ms": 0.02, "latency_p99_ms": 0.04,
+                    "raw_samples_ms": [0.01, 0.02, 0.03, 0.04],
+                },
+                "hybrid_laplace_lk_minilm": {
+                    "tp": 2, "fp": 0, "fn": 0, "tn": 2,
+                    "structural_tp": 1, "disguised_semantic_tp": 1,
+                    "precision": 1.0, "recall": 1.0, "f1": 1.0,
+                    "structural_recall": 1.0, "disguised_semantic_recall": 1.0,
+                    "latency_p50_ms": 6.0, "latency_p99_ms": 8.0,
+                    "raw_samples_ms": [5.0, 6.0, 7.0, 8.0],
+                },
+                "comparison": {
+                    "f1_delta": 0.3333,
+                    "fp_delta": 0,
+                    "disguised_semantic_recall_delta": 1.0,
+                    "p50_latency_slowdown_x": 300.0,
+                },
+            }
+            p_emb_ok = tmp_root / "fixed_emb_ok.json"
+            p_emb_ok.write_text(json.dumps(fixed_emb), encoding="utf-8")
+            ok_e0, errs_e0 = sync_docs.independent_recompute_embedding_comparison(p_emb_ok)
+            self.assertTrue(ok_e0, errs_e0)
 
-                # Tampering subgroup recall and matching delta must STILL fail against subgroup_tp!
-                bad_sub = json.loads(emb_json.read_text(encoding="utf-8"))
-                bad_sub["pure_laplace_lk"]["disguised_semantic_recall"] = 0.5
-                bad_sub["comparison"]["disguised_semantic_recall_delta"] = round(
-                    bad_sub["hybrid_laplace_lk_minilm"]["disguised_semantic_recall"] - 0.5, 4
-                )
-                p_sub = tmp_root / "bad_sub.json"
-                p_sub.write_text(json.dumps(bad_sub), encoding="utf-8")
-                ok_sub, errs_sub = sync_docs.independent_recompute_embedding_comparison(p_sub)
-                self.assertFalse(ok_sub)
-                self.assertTrue(any("disguised_semantic_recall mismatch" in e for e in errs_sub), errs_sub)
+            bad_emb = json.loads(json.dumps(fixed_emb))
+            bad_emb["comparison"]["f1_delta"] = 0.99
+            p5 = tmp_root / "bad_emb.json"
+            p5.write_text(json.dumps(bad_emb), encoding="utf-8")
+            ok5, errs5 = sync_docs.independent_recompute_embedding_comparison(p5)
+            self.assertFalse(ok5)
+            self.assertTrue(any("f1_delta mismatch" in e for e in errs5), errs5)
 
-                # Non-finite NaN constant in embedding JSON must be rejected deterministically!
-                nan_emb = json.loads(emb_json.read_text(encoding="utf-8"))
-                nan_emb["comparison"]["f1_delta"] = float("nan")
-                p_emb_nan = tmp_root / "emb_nan.json"
-                p_emb_nan.write_text(json.dumps(nan_emb, allow_nan=True), encoding="utf-8")
-                ok_en, errs_en = sync_docs.independent_recompute_embedding_comparison(p_emb_nan)
-                self.assertFalse(ok_en)
-                self.assertTrue(any("Non-standard non-finite JSON constant" in e for e in errs_en), errs_en)
+            # Negative disguised_semantic_recall (-0.0004 vs 0.0000) must be rejected as out of [0, 1]!
+            neg_emb = json.loads(json.dumps(fixed_emb))
+            neg_emb["pure_laplace_lk"]["disguised_semantic_recall"] = -0.0004
+            p_neg = tmp_root / "neg_emb.json"
+            p_neg.write_text(json.dumps(neg_emb), encoding="utf-8")
+            ok_neg, errs_neg = sync_docs.independent_recompute_embedding_comparison(p_neg)
+            self.assertFalse(ok_neg)
+            self.assertTrue(any("out of [0, 1] range" in e for e in errs_neg), errs_neg)
+
+            # Tampering subgroup recall and matching delta must STILL fail against subgroup_tp!
+            bad_sub = json.loads(json.dumps(fixed_emb))
+            bad_sub["pure_laplace_lk"]["disguised_semantic_recall"] = 0.5
+            bad_sub["comparison"]["disguised_semantic_recall_delta"] = 0.5
+            p_sub = tmp_root / "bad_sub.json"
+            p_sub.write_text(json.dumps(bad_sub), encoding="utf-8")
+            ok_sub, errs_sub = sync_docs.independent_recompute_embedding_comparison(p_sub)
+            self.assertFalse(ok_sub)
+            self.assertTrue(any("disguised_semantic_recall mismatch" in e for e in errs_sub), errs_sub)
+
+            # Non-finite NaN constant in embedding JSON must be rejected deterministically!
+            nan_emb = json.loads(json.dumps(fixed_emb))
+            nan_emb["comparison"]["f1_delta"] = float("nan")
+            p_emb_nan = tmp_root / "emb_nan.json"
+            p_emb_nan.write_text(json.dumps(nan_emb, allow_nan=True), encoding="utf-8")
+            ok_en, errs_en = sync_docs.independent_recompute_embedding_comparison(p_emb_nan)
+            self.assertFalse(ok_en)
+            self.assertTrue(any("Non-standard non-finite JSON constant" in e for e in errs_en), errs_en)
 
             # 6. Non-finite NaN, integer overflow (10**400), JSON-escaped personal path, invalid UTF-8, and bad shapes
             nan_bench = json.loads(json.dumps(base_data))
@@ -399,6 +459,8 @@ class TestClaimsLinter(unittest.TestCase):
                 ("unclosed_comment_case", md_text.replace(real_row, f"<!-- unclosed comment\n{real_row}")),
                 ("tilde_fence_case", md_text.replace(real_row, f"~~~\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n{real_row}\n~~~\n{stale_row}")),
                 ("four_backtick_fence_case", md_text.replace(real_row, f"````markdown\n```\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n{real_row}\n```\n````\n{stale_row}")),
+                ("pre_html_block_case", md_text.replace(real_row, f"<pre>\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n{real_row}\n</pre>\n{stale_row}")),
+                ("narrowed_header_case", md_text.replace("| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |", "| Metric | Measured Result |\n| :--- | :--- |", 1)),
                 ("missing_delimiter_case", md_text.replace("| :--- | :--- | :--- |\n", "")),
             ]
             for case_name, variant_md in md_variants:
@@ -412,16 +474,39 @@ class TestClaimsLinter(unittest.TestCase):
                 self.assertFalse(ok_var, f"{case_name} unexpectedly passed")
                 self.assertTrue(any("published-table parity error" in e for e in errs_var), (case_name, errs_var))
 
-            # Stale Tier 2 rows in Markdown when tier2_triage.enabled is false must be rejected!
-            if base_data["tier2_triage"].get("enabled"):
-                disabled_t2 = json.loads(json.dumps(base_data))
-                disabled_t2["tier2_triage"]["enabled"] = False
-                disabled_t2["tier2_triage"]["injection_override_gate_status"] = "SKIPPED"
-                p_stale_t2 = tmp_root / "stale_t2.json"
-                p_stale_t2.write_text(json.dumps(disabled_t2), encoding="utf-8")
-                ok_st2, errs_st2 = sync_docs.independent_recompute_metrics(p_stale_t2, repo_root=tmp_root)
-                self.assertFalse(ok_st2)
-                self.assertTrue(any("stale Tier 2 row" in e for e in errs_st2), errs_st2)
+            # Positive GFM edge cases: indented code containing literal '<!--' before a valid table
+            # AND outer-pipe-less delimiter rows (':--- | :--- | :---') MUST still pass!
+            indented_code_md = "\n    <!-- literal comment in indented code block\n\n" + md_text.replace(
+                "| :--- | :--- | :--- |",
+                ":--- | :--- | :---",
+                1,
+            )
+            ind_root = tmp_root / "indented_code_ok"
+            (ind_root / "docs" / "benchmarks").mkdir(parents=True)
+            (ind_root / md_rel).write_text(indented_code_md, encoding="utf-8")
+            p_ind = ind_root / "bench.json"
+            p_ind.write_text(json.dumps(base_data), encoding="utf-8")
+            ok_ind, errs_ind = sync_docs.independent_recompute_metrics(p_ind, repo_root=ind_root)
+            self.assertTrue(ok_ind, errs_ind)
+
+            # Unconditional stale Tier 2 row rejection when tier2_triage.enabled is false!
+            stale_t2_root = tmp_root / "stale_t2_case"
+            (stale_t2_root / "docs" / "benchmarks").mkdir(parents=True)
+            stale_t2_md = md_text
+            if "**Inference Latency P50 / P90 / P99 / Max**" not in stale_t2_md:
+                stale_t2_md += (
+                    "\n| Metric | Measured Result | Gate |\n| :--- | :--- | :--- |\n"
+                    "| **Inference Latency P50 / P90 / P99 / Max** | `1.000 ms` / `1.000 ms` / `1.000 ms` / `1.000 ms` | — |\n"
+                )
+            (stale_t2_root / md_rel).write_text(stale_t2_md, encoding="utf-8")
+            disabled_t2 = json.loads(json.dumps(base_data))
+            disabled_t2["tier2_triage"]["enabled"] = False
+            disabled_t2["tier2_triage"]["injection_override_gate_status"] = "SKIPPED"
+            p_stale_t2 = stale_t2_root / "stale_t2.json"
+            p_stale_t2.write_text(json.dumps(disabled_t2), encoding="utf-8")
+            ok_st2, errs_st2 = sync_docs.independent_recompute_metrics(p_stale_t2, repo_root=stale_t2_root)
+            self.assertFalse(ok_st2)
+            self.assertTrue(any("stale Tier 2 row" in e for e in errs_st2), errs_st2)
 
             p_list = tmp_root / "bench_list.json"
             p_list.write_text("[]", encoding="utf-8")

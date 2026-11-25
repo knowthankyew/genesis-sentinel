@@ -15,6 +15,10 @@ bench: build
 # Regenerate governed empirical benchmark artifacts against a live loopback Tier 2 inference server.
 INFERENCE_HTTP ?= http://127.0.0.1:8000
 bench-publish: build
+	@if [ -z "$$(printf '%s' "$(INFERENCE_HTTP)" | tr -d '[:space:]')" ]; then \
+		echo "ERROR: INFERENCE_HTTP must be non-empty for bench-publish (use 'make bench' for offline runs)" >&2; \
+		exit 1; \
+	fi
 	./bin/sentinel-bench --lines 100000 --window-events 5000 --surprisal-evals 2000 --inference-http "$(INFERENCE_HTTP)" --triage-samples 12 --out-json docs/benchmarks/empirical_benchmarks.json --out-md auto
 
 test:

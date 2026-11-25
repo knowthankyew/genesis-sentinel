@@ -142,8 +142,12 @@ make build
 # Build sentinel and sentinel-bench pure-Go binaries
 make build
 
-# Run reproducible empirical benchmark suite
+# Run offline Tier 0+1 benchmark verification (writes to untracked bin/bench-local/; skips Tier 2)
 make bench
+
+# Regenerate governed docs/benchmarks/ artifacts against a running loopback Tier 2 inference server
+# (overwrites docs/benchmarks/empirical_benchmarks.json and dated Markdown report)
+make bench-publish INFERENCE_HTTP=http://127.0.0.1:8000
 
 # Run unit tests
 make test

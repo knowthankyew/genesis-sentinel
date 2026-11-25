@@ -125,23 +125,34 @@ def apply_format_rule(claim_id: str, fmt: str, value) -> str:
         raise ValueError(f"Claim '{claim_id}': invalid format_rule {fmt!r}: {exc}") from exc
 
 
-def resolve_claim_value(claim_id: str, claim_cfg: dict, repo_root: Path = REPO_ROOT) -> str:
-    """Resolve and format a registered claim value from its Go source or empirical JSON artifact."""
+def resolve_claim_value(
+    claim_id: str,
+    claim_cfg: dict,
+    repo_root: Path = REPO_ROOT,
+    validated_json_cache: dict[Path, dict] | None = None,
+) -> str:
+    """Resolve and format a registered claim value from its Go source or validated JSON snapshot."""
     artifact_rel = claim_cfg.get("source_artifact")
     if not artifact_rel:
         raise ValueError(f"Claim '{claim_id}' missing 'source_artifact'")
     artifact_path = repo_root / artifact_rel
-    if not artifact_path.is_file():
-        raise FileNotFoundError(f"Source artifact not found for claim '{claim_id}': {artifact_path}")
+    resolved_artifact = artifact_path.resolve()
 
     fmt = claim_cfg.get("format_rule", "{value}")
 
     if "go_const" in claim_cfg:
+        if not artifact_path.is_file():
+            raise FileNotFoundError(f"Source artifact not found for claim '{claim_id}': {artifact_path}")
         val = extract_go_constant(artifact_path, claim_cfg["go_const"])
         return apply_format_rule(claim_id, fmt, val)
 
     if "json_path" in claim_cfg:
-        data = _loads_strict_json(artifact_path.read_text(encoding="utf-8"))
+        if validated_json_cache is not None and resolved_artifact in validated_json_cache:
+            data = validated_json_cache[resolved_artifact]
+        else:
+            if not artifact_path.is_file():
+                raise FileNotFoundError(f"Source artifact not found for claim '{claim_id}': {artifact_path}")
+            data = _loads_strict_json(artifact_path.read_text(encoding="utf-8"))
         cur = data
         for part in claim_cfg["json_path"].split("."):
             if isinstance(cur, dict) and part in cur:
@@ -186,6 +197,40 @@ def _round_go(val: float, digits: int) -> float:
     frac, whole = math.modf(abs(scaled))
     rounded = whole + (1.0 if frac >= 0.5 else 0.0)
     return math.copysign(rounded / scale, scaled)
+
+
+def _nearest_rank_percentile(sorted_vals: list[float], p: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if p <= 0:
+        return sorted_vals[0]
+    if p >= 100:
+        return sorted_vals[-1]
+    idx = max(0, min(len(sorted_vals) - 1, math.ceil((p / 100.0) * len(sorted_vals)) - 1))
+    return sorted_vals[idx]
+
+
+def _req_sample_array(
+    section: dict,
+    key: str,
+    expected_len: int,
+    errors: list[str],
+    prefix: str,
+) -> list[float] | None:
+    val = section.get(key)
+    if not isinstance(val, list):
+        errors.append(f"{prefix}.{key} must be a JSON array of raw timing samples, got {type(val).__name__}")
+        return None
+    if len(val) != expected_len:
+        errors.append(f"{prefix}.{key} length mismatch: expected {expected_len} samples, got {len(val)}")
+        return None
+    out: list[float] = []
+    for idx, item in enumerate(val):
+        if not _is_finite_num(item) or float(item) <= 0:
+            errors.append(f"{prefix}.{key}[{idx}] must be a positive finite number, got {item!r}")
+            return None
+        out.append(float(item))
+    return out
 
 
 def _contains_personal_host_path(obj) -> bool:
@@ -249,14 +294,31 @@ def _req_num(section: dict, key: str, errors: list[str], prefix: str) -> float |
     return float(val)
 
 
-def _parse_gfm_pipe_row(raw_line: str) -> tuple[str, list[str]] | None:
-    """Parse an outer-pipe GFM table row outside 4-space/tab indented code blocks."""
+_HTML_TYPE1_OPEN_RE = re.compile(r"^ {0,3}<(pre|script|style|textarea)(?:[\s>]|$)", re.IGNORECASE)
+_HTML_TYPE6_OPEN_RE = re.compile(
+    r"^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
+    r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|"
+    r"head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|"
+    r"p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[\s/>]|$)",
+    re.IGNORECASE,
+)
+
+
+def _parse_gfm_row(raw_line: str, require_outer_pipes: bool = False) -> tuple[str, list[str]] | None:
+    """Parse a GFM table row outside 4-space/tab indented code blocks (optional outer pipes)."""
     if raw_line.startswith("    ") or raw_line.startswith("\t"):
         return None
     line = raw_line.strip()
-    if not (line.startswith("|") and line.endswith("|") and len(line) >= 3):
+    if not line or "|" not in line:
         return None
-    cells = [c.strip() for c in re.split(r"(?<!\\)\|", line[1:-1])]
+    if require_outer_pipes and not (line.startswith("|") and line.endswith("|") and len(line) >= 3):
+        return None
+    inner = line
+    if inner.startswith("|"):
+        inner = inner[1:]
+    if inner.endswith("|") and not inner.endswith(r"\|"):
+        inner = inner[:-1]
+    cells = [c.strip() for c in re.split(r"(?<!\\)\|", inner)]
     if len(cells) < 2:
         return None
     return line, cells
@@ -268,16 +330,21 @@ def _is_gfm_delimiter_row(cells: list[str]) -> bool:
 
 def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[str], list[str]]:
     """
-    Strip CommonMark fenced code blocks (backticks and tildes of length >= 3, honoring fence
-    character and minimum closing length with trailing whitespace only) and HTML comments
-    (including unclosed '<!--' comments running through EOF), then collect body rows strictly
-    from valid GFM tables (header row immediately followed by a matching-column delimiter row).
+    Strip CommonMark fenced code blocks (backticks and tildes >= 3), 4-space/tab indented code
+    blocks (before scanning for HTML comments), raw HTML blocks (Type 1 <pre>/<script>/<style>/
+    <textarea> and Type 6 block tags), and HTML comments (including unclosed '<!--' through EOF),
+    then collect rendered body rows strictly from valid GFM tables (header row immediately
+    followed by a matching-column delimiter row, supporting optional outer pipes and honoring
+    GFM column-width truncation on body rows).
     Returns (published_table_rows, seen_bold_labels, duplicate_bold_labels).
     """
     cleaned_lines: list[str] = []
     fence_char: str | None = None
     fence_len = 0
     in_comment = False
+    html_type1_end: re.Pattern[str] | None = None
+    in_html_type6 = False
+    can_start_indented_code = True
 
     for raw_line in md_text.splitlines():
         if fence_char is not None:
@@ -285,6 +352,21 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
             if close_m and len(close_m.group(1)) >= fence_len:
                 fence_char = None
                 fence_len = 0
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        if html_type1_end is not None:
+            if html_type1_end.search(raw_line):
+                html_type1_end = None
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        if in_html_type6:
+            if raw_line.strip() == "":
+                in_html_type6 = False
+                can_start_indented_code = True
             cleaned_lines.append("")
             continue
 
@@ -296,6 +378,21 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
                 continue
             in_comment = False
             line = line[end_idx + 3:]
+            if line.strip() == "":
+                cleaned_lines.append("")
+                can_start_indented_code = True
+                continue
+
+        if line.strip() == "":
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        # Classify 4-space / tab indented code blocks BEFORE scanning for HTML comments or fences.
+        if can_start_indented_code and (line.startswith("    ") or line.startswith("\t")):
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
 
         open_m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
         if open_m:
@@ -305,7 +402,25 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
                 fence_char = marker[0]
                 fence_len = len(marker)
                 cleaned_lines.append("")
+                can_start_indented_code = True
                 continue
+
+        # CommonMark §4.6 Type 1 raw HTML blocks (<pre>, <script>, <style>, <textarea>)
+        m1 = _HTML_TYPE1_OPEN_RE.match(line)
+        if m1:
+            end_re = re.compile(rf"</{m1.group(1)}>", re.IGNORECASE)
+            if not end_re.search(line):
+                html_type1_end = end_re
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        # CommonMark §4.6 Type 6 raw HTML blocks (<div>, <table>, etc., terminated by blank line)
+        if _HTML_TYPE6_OPEN_RE.match(line):
+            in_html_type6 = True
+            cleaned_lines.append("")
+            can_start_indented_code = False
+            continue
 
         out_parts: list[str] = []
         pos = 0
@@ -320,7 +435,9 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
                 in_comment = True
                 break
             pos = end_idx + 3
-        cleaned_lines.append("".join(out_parts))
+        cleaned = "".join(out_parts)
+        cleaned_lines.append(cleaned)
+        can_start_indented_code = cleaned.strip() == ""
 
     rows: set[str] = set()
     seen_labels: set[str] = set()
@@ -328,19 +445,27 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
     i = 0
     total_lines = len(cleaned_lines)
     while i < total_lines:
-        hdr = _parse_gfm_pipe_row(cleaned_lines[i])
+        hdr = _parse_gfm_row(cleaned_lines[i], require_outer_pipes=False)
         if hdr is not None and i + 1 < total_lines:
-            delim = _parse_gfm_pipe_row(cleaned_lines[i + 1])
+            delim = _parse_gfm_row(cleaned_lines[i + 1], require_outer_pipes=False)
             if delim is not None and len(delim[1]) == len(hdr[1]) and _is_gfm_delimiter_row(delim[1]):
+                header_cols = len(hdr[1])
                 i += 2
                 while i < total_lines:
-                    body = _parse_gfm_pipe_row(cleaned_lines[i])
+                    body = _parse_gfm_row(cleaned_lines[i], require_outer_pipes=False)
                     if body is None:
                         break
                     line, parts = body
-                    rows.add(line)
-                    if parts[0].startswith("**") and parts[0].endswith("**"):
-                        lbl = parts[0]
+                    # GFM §4.10 discards body cells beyond the header column width.
+                    if len(parts) > header_cols:
+                        rendered_parts = parts[:header_cols]
+                        rendered_line = "| " + " | ".join(rendered_parts) + " |"
+                    else:
+                        rendered_parts = parts
+                        rendered_line = line
+                    rows.add(rendered_line)
+                    if rendered_parts[0].startswith("**") and rendered_parts[0].endswith("**"):
+                        lbl = rendered_parts[0]
                         if lbl in seen_labels:
                             dup_labels.append(lbl)
                         else:
@@ -351,7 +476,11 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
     return rows, seen_labels, dup_labels
 
 
-def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = REPO_ROOT) -> tuple[bool, list[str]]:
+def independent_recompute_metrics(
+    benchmark_json_path: Path,
+    repo_root: Path = REPO_ROOT,
+    validated_json_cache: dict[Path, dict] | None = None,
+) -> tuple[bool, list[str]]:
     """
     Independently verify mathematical consistency of docs/benchmarks/empirical_benchmarks.json,
     strict schema & finite-number bounds, status gate derivations from recomputed metrics,
@@ -459,9 +588,9 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if t0.get("lossless_gate_status") != exp_lossless_status:
                 errors.append(f"tier0_replay lossless_gate_status mismatch: expected {exp_lossless_status!r}")
 
-    # 3. Tier 1 surprisal latency percentile monotonicity and benign/anomalous separation
+    # 3. Tier 1 surprisal latency percentile recomputation from raw samples & benign/anomalous separation
     p99_target_us = _req_num(gates, "tier1_p99_target_us", errors, "acceptance_gates")
-    _req_int(t1, "evaluations", errors, "tier1_surprisal", min_val=1)
+    t1_evals = _req_int(t1, "evaluations", errors, "tier1_surprisal", min_val=2)
     _req_int(t1, "baseline_cases", errors, "tier1_surprisal", min_val=1)
     p50_us = _req_num(t1, "p50_us", errors, "tier1_surprisal")
     p90_us = _req_num(t1, "p90_us", errors, "tier1_surprisal")
@@ -470,6 +599,7 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     benign_mean = _req_num(t1, "benign_mean_nats", errors, "tier1_surprisal")
     anom_mean = _req_num(t1, "anomalous_mean_nats", errors, "tier1_surprisal")
     stored_sep = _req_num(t1, "separation_nats", errors, "tier1_surprisal")
+    raw_t1_samples = _req_sample_array(t1, "raw_samples_us", t1_evals, errors, "tier1_surprisal") if t1_evals is not None else None
 
     if p50_us is not None and p90_us is not None and p99_us is not None and max_us is not None:
         if not (0 < p50_us <= p90_us <= p99_us <= max_us):
@@ -477,6 +607,17 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
                 f"Tier 1 latency percentile monotonicity violated: "
                 f"p50={p50_us}us, p90={p90_us}us, p99={p99_us}us, max={max_us}us"
             )
+        if raw_t1_samples is not None:
+            sorted_t1 = sorted(raw_t1_samples)
+            for lbl, stored_v, p_rank in (
+                ("p50_us", p50_us, 50.0),
+                ("p90_us", p90_us, 90.0),
+                ("p99_us", p99_us, 99.0),
+                ("max_us", max_us, 100.0),
+            ):
+                calc_v = _round_go(_nearest_rank_percentile(sorted_t1, p_rank), 3)
+                if f"{stored_v:.3f}" != f"{calc_v:.3f}":
+                    errors.append(f"Tier 1 {lbl} raw-sample recomputation mismatch: stored {stored_v:.3f}, calculated {calc_v:.3f}")
         if p99_target_us is not None:
             exp_p99_status = "PASSED" if p99_us < p99_target_us else "MISSED TARGET"
             if t1.get("p99_gate_status") != exp_p99_status:
@@ -518,12 +659,15 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
         calc_prec = _round_go(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
         calc_rec = _round_go(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
         calc_f1 = _round_go((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
-        if abs(calc_prec - stored_prec) > 0.0005:
-            errors.append(f"Detection precision mismatch: stored {stored_prec}, calculated {calc_prec}")
-        if abs(calc_rec - stored_rec) > 0.0005:
-            errors.append(f"Detection recall mismatch: stored {stored_rec}, calculated {calc_rec}")
-        if abs(calc_f1 - stored_f1) > 0.0005:
-            errors.append(f"Detection f1_score mismatch: stored {stored_f1}, calculated {calc_f1}")
+        for score_lbl, s_val, c_val in (
+            ("precision", stored_prec, calc_prec),
+            ("recall", stored_rec, calc_rec),
+            ("f1_score", stored_f1, calc_f1),
+        ):
+            if not (0.0 <= s_val <= 1.0):
+                errors.append(f"Detection {score_lbl} out of [0, 1] range: {s_val}")
+            elif f"{s_val:.4f}" != f"{c_val:.4f}":
+                errors.append(f"Detection {score_lbl} mismatch: stored {s_val:.4f}, calculated {c_val:.4f}")
         if f1_target is not None:
             exp_f1_status = "PASSED" if calc_f1 >= f1_target else "MISSED TARGET"
             if det.get("f1_gate_status") != exp_f1_status:
@@ -536,16 +680,29 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
     if not isinstance(t2_enabled, bool):
         errors.append(f"tier2_triage.enabled must be a boolean, got {t2_enabled!r}")
     elif t2_enabled:
+        t2_samples = _req_int(t2, "samples_evaluated", errors, "tier2_triage", min_val=1)
         t2_p50 = _req_num(t2, "p50_ms", errors, "tier2_triage")
         t2_p90 = _req_num(t2, "p90_ms", errors, "tier2_triage")
         t2_p99 = _req_num(t2, "p99_ms", errors, "tier2_triage")
         t2_max = _req_num(t2, "max_ms", errors, "tier2_triage")
+        raw_t2_samples = _req_sample_array(t2, "raw_samples_ms", t2_samples, errors, "tier2_triage") if t2_samples is not None else None
         if None not in (t2_p50, t2_p90, t2_p99, t2_max):
             if not (0 < t2_p50 <= t2_p90 <= t2_p99 <= t2_max):
                 errors.append(
                     f"Tier 2 latency percentile monotonicity violated: "
                     f"p50={t2_p50}ms, p90={t2_p90}ms, p99={t2_p99}ms, max={t2_max}ms"
                 )
+            if raw_t2_samples is not None:
+                sorted_t2 = sorted(raw_t2_samples)
+                for lbl, stored_v, p_rank in (
+                    ("p50_ms", t2_p50, 50.0),
+                    ("p90_ms", t2_p90, 90.0),
+                    ("p99_ms", t2_p99, 99.0),
+                    ("max_ms", t2_max, 100.0),
+                ):
+                    calc_v = _round_go(_nearest_rank_percentile(sorted_t2, p_rank), 3)
+                    if f"{stored_v:.3f}" != f"{calc_v:.3f}":
+                        errors.append(f"Tier 2 {lbl} raw-sample recomputation mismatch: stored {stored_v:.3f}, calculated {calc_v:.3f}")
         inj_attempted = _req_int(t2, "injection_probes_attempted", errors, "tier2_triage", min_val=0)
         inj_failed = _req_int(t2, "injection_probes_failed", errors, "tier2_triage", min_val=0)
         inj_safe = _req_int(t2, "injection_probes_safe", errors, "tier2_triage", min_val=0)
@@ -672,10 +829,15 @@ def independent_recompute_metrics(benchmark_json_path: Path, repo_root: Path = R
             if row not in published_rows:
                 errors.append(f"Benchmark JSON/Markdown published-table parity error: expected row {row!r} missing from {report_rel}")
 
+    if not errors and validated_json_cache is not None:
+        validated_json_cache[benchmark_json_path.resolve()] = data
     return len(errors) == 0, errors
 
 
-def independent_recompute_embedding_comparison(embedding_json_path: Path) -> tuple[bool, list[str]]:
+def independent_recompute_embedding_comparison(
+    embedding_json_path: Path,
+    validated_json_cache: dict[Path, dict] | None = None,
+) -> tuple[bool, list[str]]:
     """Independently verify mathematical consistency of docs/benchmarks/embedding_comparison.json."""
     errors: list[str] = []
     if not embedding_json_path.exists():
@@ -752,35 +914,56 @@ def independent_recompute_embedding_comparison(embedding_json_path: Path) -> tup
         f1 = round((2 * tp) / (2 * tp + fp + fn), 4) if (2 * tp + fp + fn) > 0 else 0.0
         struct_rec = round(struct_tp / max(eval_struct, 1), 4)
         disg_rec = round(disg_tp / max(eval_disg, 1), 4)
-        if abs(prec - stored_prec) > 0.0005:
-            errors.append(f"embedding_comparison {key} precision mismatch: stored {stored_prec}, calc {prec}")
-        if abs(rec - stored_rec) > 0.0005:
-            errors.append(f"embedding_comparison {key} recall mismatch: stored {stored_rec}, calc {rec}")
-        if abs(f1 - stored_f1) > 0.0005:
-            errors.append(f"embedding_comparison {key} f1 mismatch: stored {stored_f1}, calc {f1}")
-        if abs(struct_rec - stored_struct_rec) > 0.0005:
-            errors.append(f"embedding_comparison {key} structural_recall mismatch: stored {stored_struct_rec}, calc {struct_rec}")
-        if abs(disg_rec - stored_disg_rec) > 0.0005:
-            errors.append(f"embedding_comparison {key} disguised_semantic_recall mismatch: stored {stored_disg_rec}, calc {disg_rec}")
+        for score_lbl, s_val, c_val in (
+            ("precision", stored_prec, prec),
+            ("recall", stored_rec, rec),
+            ("f1", stored_f1, f1),
+            ("structural_recall", stored_struct_rec, struct_rec),
+            ("disguised_semantic_recall", stored_disg_rec, disg_rec),
+        ):
+            if not (0.0 <= s_val <= 1.0):
+                errors.append(f"embedding_comparison {key} {score_lbl} out of [0, 1] range: {s_val}")
+            elif f"{s_val:.4f}" != f"{c_val:.4f}":
+                errors.append(f"embedding_comparison {key} {score_lbl} mismatch: stored {s_val:.4f}, calc {c_val:.4f}")
         if not (0 < p50 <= p99):
             errors.append(f"embedding_comparison {key} latency ordering invalid: p50={p50}, p99={p99}")
-        recomputed[key] = {"f1": f1, "disg_rec": disg_rec, "fp": fp}
+        raw_emb_samples = _req_sample_array(sec, "raw_samples_ms", eval_total, errors, key)
+        if raw_emb_samples is not None:
+            sorted_emb = sorted(raw_emb_samples)
+            calc_p50 = round(_nearest_rank_percentile(sorted_emb, 50.0), 4)
+            calc_p99 = round(_nearest_rank_percentile(sorted_emb, 99.0), 4)
+            if f"{p50:.4f}" != f"{calc_p50:.4f}":
+                errors.append(f"embedding_comparison {key} latency_p50_ms raw-sample mismatch: stored {p50:.4f}, calc {calc_p50:.4f}")
+            if f"{p99:.4f}" != f"{calc_p99:.4f}":
+                errors.append(f"embedding_comparison {key} latency_p99_ms raw-sample mismatch: stored {p99:.4f}, calc {calc_p99:.4f}")
+        recomputed[key] = {"f1": f1, "disg_rec": disg_rec, "fp": fp, "p50": p50}
 
     if "pure_laplace_lk" in recomputed and "hybrid_laplace_lk_minilm" in recomputed:
         stored_f1_delta = _req_num(cmp_sec, "f1_delta", errors, "comparison")
         stored_disg_delta = _req_num(cmp_sec, "disguised_semantic_recall_delta", errors, "comparison")
+        stored_slowdown = _req_num(cmp_sec, "p50_latency_slowdown_x", errors, "comparison")
         if stored_f1_delta is not None:
             exp_f1_delta = round(recomputed["hybrid_laplace_lk_minilm"]["f1"] - recomputed["pure_laplace_lk"]["f1"], 4)
-            if abs(exp_f1_delta - stored_f1_delta) > 0.0005:
-                errors.append(f"embedding_comparison f1_delta mismatch: stored {stored_f1_delta}, calc {exp_f1_delta}")
+            if f"{stored_f1_delta:.4f}" != f"{exp_f1_delta:.4f}":
+                errors.append(f"embedding_comparison f1_delta mismatch: stored {stored_f1_delta:.4f}, calc {exp_f1_delta:.4f}")
         if stored_disg_delta is not None:
             exp_disg_delta = round(recomputed["hybrid_laplace_lk_minilm"]["disg_rec"] - recomputed["pure_laplace_lk"]["disg_rec"], 4)
-            if abs(exp_disg_delta - stored_disg_delta) > 0.0005:
+            if f"{stored_disg_delta:.4f}" != f"{exp_disg_delta:.4f}":
                 errors.append(
                     f"embedding_comparison disguised_semantic_recall_delta mismatch: "
-                    f"stored {stored_disg_delta}, calc {exp_disg_delta}"
+                    f"stored {stored_disg_delta:.4f}, calc {exp_disg_delta:.4f}"
+                )
+        if stored_slowdown is not None:
+            lk_p50_v = float(recomputed["pure_laplace_lk"]["p50"])
+            hyb_p50_v = float(recomputed["hybrid_laplace_lk_minilm"]["p50"])
+            exp_slowdown = round(hyb_p50_v / max(lk_p50_v, 0.0001), 1)
+            if f"{stored_slowdown:.1f}" != f"{exp_slowdown:.1f}":
+                errors.append(
+                    f"embedding_comparison p50_latency_slowdown_x mismatch: stored {stored_slowdown:.1f}, calc {exp_slowdown:.1f}"
                 )
 
+    if not errors and validated_json_cache is not None:
+        validated_json_cache[embedding_json_path.resolve()] = data
     return len(errors) == 0, errors
 
 
@@ -933,6 +1116,7 @@ def sync_document(
     registry_path: Path,
     write: bool = False,
     repo_root: Path = REPO_ROOT,
+    validated_json_cache: dict[Path, dict] | None = None,
 ) -> tuple[bool, list[str]]:
     """Verify or update claim markers in doc_path against registry_path."""
     messages: list[str] = []
@@ -952,7 +1136,12 @@ def sync_document(
 
     for claim_id, claim_cfg in claims.items():
         try:
-            resolved_values[claim_id] = resolve_claim_value(claim_id, claim_cfg, repo_root=repo_root)
+            resolved_values[claim_id] = resolve_claim_value(
+                claim_id,
+                claim_cfg,
+                repo_root=repo_root,
+                validated_json_cache=validated_json_cache,
+            )
         except Exception as exc:
             errors.append(f"Failed to resolve claim '{claim_id}': {exc}")
 
@@ -1035,8 +1224,13 @@ def main() -> int:
     print(f"=== Genesis Sentinel Claims Synchronizer & Linter v2 (mode: {'WRITE' if do_write else 'CHECK'}) ===")
     overall_success = True
 
+    validated_json_cache: dict[Path, dict] = {}
     bench_json = REPO_ROOT / "docs" / "benchmarks" / "empirical_benchmarks.json"
-    metrics_ok, metrics_errs = independent_recompute_metrics(bench_json, repo_root=REPO_ROOT)
+    metrics_ok, metrics_errs = independent_recompute_metrics(
+        bench_json,
+        repo_root=REPO_ROOT,
+        validated_json_cache=validated_json_cache,
+    )
     if not metrics_ok:
         overall_success = False
         for err in metrics_errs:
@@ -1046,7 +1240,10 @@ def main() -> int:
 
     emb_json = REPO_ROOT / "docs" / "benchmarks" / "embedding_comparison.json"
     if emb_json.exists():
-        emb_ok, emb_errs = independent_recompute_embedding_comparison(emb_json)
+        emb_ok, emb_errs = independent_recompute_embedding_comparison(
+            emb_json,
+            validated_json_cache=validated_json_cache,
+        )
         if not emb_ok:
             overall_success = False
             for err in emb_errs:
@@ -1078,7 +1275,13 @@ def main() -> int:
                 print(f"[FAIL] Failed to parse {args.registry}: {exc}", file=sys.stderr)
 
     for doc_target in target_docs:
-        doc_ok, doc_msgs = sync_document(doc_target, args.registry, write=do_write, repo_root=REPO_ROOT)
+        doc_ok, doc_msgs = sync_document(
+            doc_target,
+            args.registry,
+            write=do_write,
+            repo_root=REPO_ROOT,
+            validated_json_cache=validated_json_cache,
+        )
         if not doc_ok:
             overall_success = False
             for err in doc_msgs:
