@@ -85,6 +85,15 @@ func TestConfigRejectsBitNetAndNonLoopback(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected NaN triage_temperature to fail validation")
 	}
+	cfg = DefaultConfig()
+	cfg.TriageTimeoutSec = 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected triage_timeout_sec < 5 to fail validation")
+	}
+	cfg.TriageTimeoutSec = 301
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected triage_timeout_sec > 300 to fail validation")
+	}
 }
 
 func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {

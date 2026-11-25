@@ -50,6 +50,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		inferenceHTTP      string
 		baseModel          string
 		adapterPath        string
+		triageTimeout      int
 		pollInterval       time.Duration
 		dryRun             bool
 		stdoutAlerts       bool
@@ -71,6 +72,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&inferenceHTTP, "inference-http", "", "Loopback URL for ml/src/FtaaSService.Inference (:8000)")
 	fs.StringVar(&baseModel, "base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
 	fs.StringVar(&adapterPath, "adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
+	fs.IntVar(&triageTimeout, "triage-timeout", 0, "Tier 2 flush-wide inference budget in seconds (5-300, default 45)")
 	fs.DurationVar(&pollInterval, "poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
 	fs.BoolVar(&dryRun, "dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
 	fs.BoolVar(&stdoutAlerts, "stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
@@ -119,6 +121,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			cfg.BaseModel = baseModel
 		case "adapter-path":
 			cfg.AdapterPath = adapterPath
+		case "triage-timeout":
+			cfg.TriageTimeoutSec = triageTimeout
 		}
 	})
 

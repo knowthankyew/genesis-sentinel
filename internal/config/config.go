@@ -23,8 +23,9 @@ const (
 	DefaultMaxTrainingRecords   = 50000
 	DefaultMaxTrainingFileBytes = 25 * 1024 * 1024
 	MaxBaselineWindowSize       = 10000
-	DefaultTriageMaxTokens      = 96
+	DefaultTriageMaxTokens      = 64
 	DefaultTriageTemperature    = 0.1
+	DefaultTriageTimeoutSec     = 45
 )
 
 // Config represents all operational configuration options for Genesis Sentinel.
@@ -57,6 +58,7 @@ type Config struct {
 	TriageMode        string  `json:"triage_mode"` // "off" (default) | "http"
 	TriageMaxTokens   int     `json:"triage_max_tokens"`
 	TriageTemperature float64 `json:"triage_temperature"`
+	TriageTimeoutSec  int     `json:"triage_timeout_sec"`
 	BaseModel         string  `json:"base_model"`
 	AdapterPath       string  `json:"adapter_path"`
 	FTaaSAPIAddr      string  `json:"ftaas_api_http"`
@@ -105,6 +107,7 @@ func DefaultConfig() *Config {
 		TriageMode:           "off",
 		TriageMaxTokens:      DefaultTriageMaxTokens,
 		TriageTemperature:    DefaultTriageTemperature,
+		TriageTimeoutSec:     DefaultTriageTimeoutSec,
 		BaseModel:            model.ModelSmolLM2135MInstruct,
 		AdapterPath:          "",
 		FTaaSAPIAddr:         "http://127.0.0.1:5100",
@@ -189,6 +192,9 @@ func (c *Config) Validate() error {
 	}
 	if math.IsNaN(c.TriageTemperature) || math.IsInf(c.TriageTemperature, 0) || c.TriageTemperature < 0 || c.TriageTemperature > 1.0 {
 		return fmt.Errorf("triage_temperature must be finite and in [0.0, 1.0], got %v", c.TriageTemperature)
+	}
+	if c.TriageTimeoutSec < 5 || c.TriageTimeoutSec > 300 {
+		return fmt.Errorf("triage_timeout_sec must be between 5 and 300, got %d", c.TriageTimeoutSec)
 	}
 	if trimmedAdapter := strings.TrimSpace(c.AdapterPath); trimmedAdapter != "" {
 		if strings.HasPrefix(trimmedAdapter, "/") || strings.ContainsRune(trimmedAdapter, '\\') ||
@@ -291,6 +297,11 @@ func loadFromEnv(cfg *Config) {
 	if v := os.Getenv("SENTINEL_TRIAGE_TEMPERATURE"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.TriageTemperature = f
+		}
+	}
+	if v := os.Getenv("SENTINEL_TRIAGE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TriageTimeoutSec = n
 		}
 	}
 	if v := os.Getenv("SENTINEL_BASE_MODEL"); v != "" {

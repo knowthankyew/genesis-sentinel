@@ -37,9 +37,11 @@ type Hyperparameters struct {
 	LoraRank     int     `json:"loraRank"`
 	LoraAlpha    int     `json:"loraAlpha"`
 	LoraDropout  float64 `json:"loraDropout"`
+	MaxLength    int     `json:"maxLength,omitempty"`
 }
 
-// DefaultHyperparameters returns safe SmolLM2-Instruct LoRA defaults matching FTaaS.
+// DefaultHyperparameters returns safe SmolLM2-Instruct LoRA defaults matching FTaaS
+// with MaxLength=512 so framed Tier 2 security telemetry windows fit without truncation.
 func DefaultHyperparameters() Hyperparameters {
 	return Hyperparameters{
 		Epochs:       3,
@@ -48,6 +50,7 @@ func DefaultHyperparameters() Hyperparameters {
 		LoraRank:     8,
 		LoraAlpha:    32,
 		LoraDropout:  0.05,
+		MaxLength:    512,
 	}
 }
 
@@ -70,6 +73,9 @@ func (h Hyperparameters) Validate() error {
 	}
 	if math.IsNaN(h.LoraDropout) || math.IsInf(h.LoraDropout, 0) || h.LoraDropout < 0 || h.LoraDropout >= 1 {
 		return fmt.Errorf("loraDropout must be in [0, 1), got %v", h.LoraDropout)
+	}
+	if h.MaxLength != 0 && (h.MaxLength < 64 || h.MaxLength > 2048) {
+		return fmt.Errorf("maxLength must be in [64, 2048], got %d", h.MaxLength)
 	}
 	return nil
 }

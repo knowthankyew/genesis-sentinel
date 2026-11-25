@@ -189,11 +189,16 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 
 	var triageClient *triage.Client
 	if strings.EqualFold(cfg.TriageMode, "http") && cfg.InferenceAddr != "" {
+		reqTimeout := 20 * time.Second
+		if cfg.TriageTimeoutSec > 0 && time.Duration(cfg.TriageTimeoutSec)*time.Second < reqTimeout {
+			reqTimeout = time.Duration(cfg.TriageTimeoutSec) * time.Second
+		}
 		if tc, err := triage.NewClient(triage.ClientOptions{
 			BaseURL:        cfg.InferenceAddr,
 			BaseModel:      cfg.BaseModel,
 			AdapterPath:    cfg.AdapterPath,
 			APIKey:         cfg.FTaaSAPIKey,
+			Timeout:        reqTimeout,
 			MaxTokens:      cfg.TriageMaxTokens,
 			Temperature:    cfg.TriageTemperature,
 			MaxPromptBytes: cfg.MaxPromptByte,
@@ -537,7 +542,11 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		cancelTriage context.CancelFunc
 	)
 	if triageClient != nil {
-		triageCtx, cancelTriage = context.WithTimeout(context.Background(), 15*time.Second)
+		flushBudget := time.Duration(p.cfg.TriageTimeoutSec) * time.Second
+		if flushBudget <= 0 {
+			flushBudget = config.DefaultTriageTimeoutSec * time.Second
+		}
+		triageCtx, cancelTriage = context.WithTimeout(context.Background(), flushBudget)
 		defer cancelTriage()
 	}
 

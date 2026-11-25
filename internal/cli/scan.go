@@ -60,6 +60,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	inferenceHTTP := fs.String("inference-http", "", "Loopback URL for ml/src/FtaaSService.Inference (:8000)")
 	baseModel := fs.String("base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
 	adapterPath := fs.String("adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
+	triageTimeout := fs.Int("triage-timeout", 0, "Tier 2 flush-wide inference budget in seconds (5-300, default 45)")
 	windowEvents := fs.Int("window-events", 0, "Optional event batch size per window flush during offline replay (0 = single flush)")
 	asJSON := fs.Bool("json", false, "Emit full ScanReport as JSON")
 	emitGenesis := fs.Bool("emit-genesis", false, "Also emit detected alerts to Genesis TCP ingest")
@@ -91,6 +92,8 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 			cfg.BaseModel = *baseModel
 		case "adapter-path":
 			cfg.AdapterPath = *adapterPath
+		case "triage-timeout":
+			cfg.TriageTimeoutSec = *triageTimeout
 		}
 	})
 	if err := cfg.Validate(); err != nil {

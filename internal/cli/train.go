@@ -71,6 +71,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	loraRank := fs.Int("lora-rank", defHP.LoraRank, "LoRA rank r (1-128)")
 	loraAlpha := fs.Int("lora-alpha", defHP.LoraAlpha, "LoRA alpha (1-512)")
 	loraDropout := fs.Float64("lora-dropout", defHP.LoraDropout, "LoRA dropout ([0, 1))")
+	maxLength := fs.Int("max-length", defHP.MaxLength, "Tokenization max sequence length for FTaaS worker (64-2048, default 512)")
 	preflight := fs.Bool("preflight", true, "Enable FTaaS surprisal preflight redundancy ablation & anomaly audit")
 	auditOnly := fs.Bool("audit-only", false, "Run POST /api/v1/jobs/audit preflight dry-run without queuing training")
 	ablationThreshold := fs.Float64("ablation-threshold", 0.15, "Audit ablation threshold in nats (with --audit-only)")
@@ -149,6 +150,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 		LoraRank:     *loraRank,
 		LoraAlpha:    *loraAlpha,
 		LoraDropout:  *loraDropout,
+		MaxLength:    *maxLength,
 	}
 
 	subRes, err := client.SubmitJob(ctx, train.SubmitRequest{

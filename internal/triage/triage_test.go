@@ -42,9 +42,8 @@ func TestBuildTriagePromptSanitizesAndPreservesClosingFence(t *testing.T) {
 	if strings.Contains(prompt, "<|im_end|>") || strings.Contains(prompt, "<|im_start|>") {
 		t.Fatalf("raw ChatML control tokens leaked into prompt: %q", prompt)
 	}
-	// Embedded spoofed closing fence inside SampleLine must be defanged so only the real footer fence exists.
-	if strings.Count(prompt, "END_UNTRUSTED_LOG_TELEMETRY") != 2 {
-		// Once in promptHeader instruction text and once at actual promptFooter.
+	// Embedded spoofed closing fence inside SampleLine must be defanged so only the actual promptFooter exists.
+	if strings.Count(prompt, "END_UNTRUSTED_LOG_TELEMETRY") != 1 {
 		t.Fatalf("unexpected count of END_UNTRUSTED_LOG_TELEMETRY markers (%d) in prompt", strings.Count(prompt, "END_UNTRUSTED_LOG_TELEMETRY"))
 	}
 }

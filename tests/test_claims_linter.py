@@ -122,7 +122,7 @@ class TestClaimsLinter(unittest.TestCase):
         triage_tokens = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "config" / "config.go", "DefaultTriageMaxTokens"
         )
-        self.assertEqual(triage_tokens, 96)
+        self.assertEqual(triage_tokens, 64)
 
         max_exp = sync_docs.extract_go_constant(
             REPO_ROOT / "internal" / "triage" / "taxonomy.go", "MaxExplanationBytes"
