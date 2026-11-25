@@ -208,19 +208,25 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 			DatasetHash: finalJob.DatasetHash,
 			ActivatedAt: time.Now().UTC(),
 		}
-		// Notify a running daemon BEFORE updating the local manifest so a 401/rejection
-		// never leaves active-adapter.json pointing to an unactivated adapter.
+		// Notify a running daemon BEFORE updating any local manifest so a 401/rejection never
+		// writes an unactivated adapter, and skip redundant unserialized local writes when the
+		// daemon already persisted active-adapter.json under its exclusive activation lock.
+		daemonSavedSameDir := false
 		if strings.TrimSpace(*sentinelHTTP) != "" {
 			token := *authToken
 			if token == "" {
 				token = cfg.AuthToken
 			}
-			if err := train.NotifyDaemonAdapter(ctx, *sentinelHTTP, token, state, cfg.AllowRemoteEndpoints); err != nil {
+			daemonDir, err := train.NotifyDaemonAdapter(ctx, *sentinelHTTP, token, state, cfg.AllowRemoteEndpoints)
+			if err != nil {
 				return fmt.Errorf("notify running Sentinel daemon: %w", err)
 			}
+			daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
 		}
-		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-			return fmt.Errorf("save active adapter: %w", err)
+		if !daemonSavedSameDir {
+			if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+				return fmt.Errorf("save active adapter: %w", err)
+			}
 		}
 		activatedState = &state
 	}
@@ -349,19 +355,44 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 		AdapterPath: strings.TrimSpace(*adapterPath),
 		ActivatedAt: time.Now().UTC(),
 	}
+	daemonSavedSameDir := false
 	if strings.TrimSpace(*sentinelHTTP) != "" {
 		token := *authToken
 		if token == "" {
 			token = cfg.AuthToken
 		}
-		if err := train.NotifyDaemonAdapter(context.Background(), *sentinelHTTP, token, state, remote); err != nil {
+		daemonDir, err := train.NotifyDaemonAdapter(context.Background(), *sentinelHTTP, token, state, remote)
+		if err != nil {
 			return err
 		}
+		daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
 	}
-	if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-		return err
+	if !daemonSavedSameDir {
+		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
+			return err
+		}
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(state)
+}
+
+func sameCleanDir(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		if evalA, err := filepath.EvalSymlinks(absA); err == nil {
+			absA = evalA
+		}
+		if evalB, err := filepath.EvalSymlinks(absB); err == nil {
+			absB = evalB
+		}
+		return filepath.Clean(absA) == filepath.Clean(absB)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }

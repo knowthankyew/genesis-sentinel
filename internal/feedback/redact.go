@@ -1,6 +1,8 @@
 package feedback
 
 import (
+	"bytes"
+	"encoding/base64"
 	"regexp"
 	"strings"
 
@@ -17,7 +19,7 @@ var (
 	// Authorization Bearer and Basic credentials (both plain headers and JSON-quoted header keys).
 	authHeaderCredRe = regexp.MustCompile(`(?i)(["']?)\b((?:Proxy-)?Authorization)(["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{4,})`)
 	bearerRe         = regexp.MustCompile(`(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
-	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{8,}={0,2})`)
+	basicTokenRe     = regexp.MustCompile(`(?i)\b(Basic\s+)([A-Za-z0-9+/]{4,}={0,2})\b`)
 
 	// Credential-bearing *_AUTH_CONFIG keys (e.g., DOCKER_AUTH_CONFIG JSON objects or strings).
 	authConfigKeyRe = regexp.MustCompile(`(?i)(["']?)\b([A-Z0-9_-]*auth[_-]?config)(["']?\s*[=:]\s*)`)
@@ -26,8 +28,8 @@ var (
 	apiKeyPrefixRe = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 
 	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
-	// escape-aware for quoted strings containing \" or \', never matching redacted placeholders).
-	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;&}\]]+)`)
+	// escape-aware for quoted strings, and bracket-aware for exact [REDACTED_*] placeholders).
+	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -139,10 +141,9 @@ func RedactText(raw string) (string, []string) {
 		return "[REDACTED_SSN]"
 	})
 	s = cardCandidateRe.ReplaceAllStringFunc(s, func(match string) string {
-		digits := stripNonDigits(match)
-		if len(digits) >= 13 && len(digits) <= 19 && passesLuhn(digits) {
+		if prefixEnd, ok := findCardLuhnMatch(match); ok {
 			addFinding("payment_card")
-			return "[REDACTED_CARD]"
+			return "[REDACTED_CARD]" + match[prefixEnd:]
 		}
 		return match
 	})
@@ -198,16 +199,52 @@ func ScanForPII(text string) (string, bool) {
 		}
 	}
 	for _, match := range cardCandidateRe.FindAllString(text, -1) {
-		digits := stripNonDigits(match)
-		if len(digits) >= 13 && len(digits) <= 19 && passesLuhn(digits) {
+		if _, ok := findCardLuhnMatch(match); ok {
 			return "Credit/Debit Card Number", true
 		}
 	}
 	return "", false
 }
 
+// findCardLuhnMatch checks whether match is a Luhn-valid 13-19 digit payment card; if an
+// extended 4-4-4-4-X match fails Luhn because a trailing space/hyphen-delimited count was
+// consumed (e.g. "4111 1111 1111 1111 2 attempts"), it falls back to checking the 16-digit
+// 4-4-4-4 prefix so valid 16-digit cards are never missed while genuine 17-19 digit cards work.
+func findCardLuhnMatch(match string) (int, bool) {
+	digits := stripNonDigits(match)
+	if len(digits) >= 13 && len(digits) <= 19 && passesLuhn(digits) {
+		return len(match), true
+	}
+	if len(digits) > 16 {
+		if idx := strings.LastIndexAny(match, " -"); idx > 0 {
+			prefix := match[:idx]
+			pDigits := stripNonDigits(prefix)
+			if len(pDigits) == 16 && passesLuhn(pDigits) {
+				return idx, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func isRedactedPlaceholder(val string) bool {
-	return val == "" || strings.HasPrefix(val, "[REDACTED") || val == "<STR>" || val == "<HEX>" || val == "<NUM>"
+	switch val {
+	case "",
+		"[REDACTED]",
+		"[REDACTED_SECRET]",
+		"[REDACTED_TOKEN]",
+		"[REDACTED_API_KEY]",
+		"[REDACTED_JWT]",
+		"[REDACTED_PRIVATE_KEY]",
+		"[REDACTED_AUTH_CONFIG]",
+		"[REDACTED_EMAIL]",
+		"[REDACTED_SSN]",
+		"[REDACTED_CARD]",
+		"<STR>", "<HEX>", "<NUM>":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasUnredactedCredKV(text string) bool {
@@ -285,11 +322,9 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 		inQuote := byte(0)
 		escaped := false
 		i := valStart
-		for i < len(s) {
+		maxEnd := min(len(s), valStart+16*1024)
+		for i < maxEnd {
 			ch := s[i]
-			if ch == '\r' || ch == '\n' {
-				break
-			}
 			if inQuote != 0 {
 				if escaped {
 					escaped = false
@@ -343,6 +378,11 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 		return i, string(q) + "[REDACTED_AUTH_CONFIG]" + string(q), true
 	default:
 		i := valStart
+		if strings.HasPrefix(s[valStart:], "[REDACTED") {
+			if closeRel := strings.IndexByte(s[valStart:], ']'); closeRel >= 0 {
+				i = valStart + closeRel + 1
+			}
+		}
 		for i < len(s) {
 			ch := s[i]
 			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == ';' || ch == '&' || ch == ',' || ch == '}' || ch == ']' {
@@ -358,27 +398,37 @@ func scanAuthConfigValue(s string, valStart int) (int, string, bool) {
 	}
 }
 
-// looksLikeEncodedBasicCred distinguishes standalone Base64 Basic credentials (mixed case,
-// digits, base64 punctuation, or '=' padding) from ordinary English prose such as "Basic authentication".
+// looksLikeEncodedBasicCred decodes candidate standalone HTTP Basic credentials (including
+// short tokens such as "YTpi" -> "a:b") and verifies printable RFC 7617 "user:password"
+// structure so ordinary English prose ("Basic Authentication failed") never false-positives.
 func looksLikeEncodedBasicCred(tok string) bool {
-	if len(tok) < 8 {
+	if len(tok) < 4 {
 		return false
 	}
-	var hasLower, hasUpper, hasDigit, hasB64Sym bool
-	for i := 0; i < len(tok); i++ {
-		c := tok[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-			hasLower = true
-		case c >= 'A' && c <= 'Z':
-			hasUpper = true
-		case c >= '0' && c <= '9':
-			hasDigit = true
-		case c == '+' || c == '/' || c == '=':
-			hasB64Sym = true
+	var (
+		decoded []byte
+		err     error
+	)
+	if len(tok)%4 == 0 {
+		decoded, err = base64.StdEncoding.DecodeString(tok)
+	} else if !strings.ContainsRune(tok, '=') {
+		decoded, err = base64.RawStdEncoding.DecodeString(tok)
+	} else {
+		return false
+	}
+	if err != nil || len(decoded) < 3 {
+		return false
+	}
+	colon := bytes.IndexByte(decoded, ':')
+	if colon < 0 || (colon == 0 && len(decoded) < 2) {
+		return false
+	}
+	for _, b := range decoded {
+		if b < 0x20 || b > 0x7e {
+			return false
 		}
 	}
-	return hasB64Sym || hasDigit || (hasLower && hasUpper)
+	return true
 }
 
 // isValidSSAParts enforces US SSA numbering rules matching ml/src/FtaaSService.Api/Services/DatasetService.cs:

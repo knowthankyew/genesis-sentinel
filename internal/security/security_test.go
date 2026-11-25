@@ -2,10 +2,13 @@ package security
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -253,5 +256,23 @@ func TestNewLoopbackHTTPClientRedirectPolicies(t *testing.T) {
 	_, err = strict.Get(srv.URL + "/to-local")
 	if err == nil || !strings.Contains(err.Error(), "blocked by security policy") {
 		t.Fatalf("expected explicit redirect block error, got err=%v", err)
+	}
+}
+
+func TestSanitizeURLErrorStripsCauseQuerySecrets(t *testing.T) {
+	rawErr := &url.Error{
+		Op:  "Post",
+		URL: "http://secretuser:secretpass@127.0.0.1:5100/api/v1/jobs?api_key=leak1",
+		Err: fmt.Errorf("failed to parse Location header %q: %w", "http://127.0.0.1:5100/next?token=leak2", context.Canceled),
+	}
+	sanitized := SanitizeURLError(rawErr)
+	msg := sanitized.Error()
+	for _, secret := range []string{"secretuser", "secretpass", "leak1", "leak2"} {
+		if strings.Contains(msg, secret) {
+			t.Fatalf("SanitizeURLError leaked %q in %q", secret, msg)
+		}
+	}
+	if !errors.Is(sanitized, context.Canceled) {
+		t.Fatalf("SanitizeURLError broke errors.Is(context.Canceled): %v", sanitized)
 	}
 }

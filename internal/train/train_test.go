@@ -89,9 +89,14 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job_abc123":
 			n := pollCount.Add(1)
 			w.Header().Set("Content-Type", "application/json")
-			if n == 1 {
+			switch n {
+			case 1:
+				// Transient 503 should be retried cleanly by WaitForJob without aborting wait.
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":"temporary overload"}`))
+			case 2:
 				_, _ = w.Write([]byte(`{"jobId":"job_abc123","jobName":"sentinel-test","status":"Running","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","progressPercent":50.0,"currentStep":6,"totalSteps":12}`))
-			} else {
+			default:
 				_, _ = w.Write([]byte(`{"jobId":"job_abc123","jobName":"sentinel-test","status":"Succeeded","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","datasetHash":"deadbeef","progressPercent":100.0,"currentStep":12,"totalSteps":12,"adapterPath":"artifacts/job_abc123/model_adapters"}`))
 			}
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job_failed":
@@ -242,27 +247,28 @@ func TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload(
 func TestNotifyDaemonAdapterRedactsEchoedCredentialsInErrorBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"rejected Authorization: Bearer leaked-daemon-secret-9999"}`))
+		// Echo both labeled Bearer token AND unlabeled opaque configured token!
+		_, _ = w.Write([]byte(`{"error":"rejected Authorization: Bearer leaked-daemon-secret-9999 and raw opaque-token-xyz987"}`))
 	}))
 	defer srv.Close()
 
-	err := NotifyDaemonAdapter(context.Background(), srv.URL+"?", "leaked-daemon-secret-9999", ActiveAdapter{
+	_, err := NotifyDaemonAdapter(context.Background(), srv.URL+"?", "opaque-token-xyz987", ActiveAdapter{
 		BaseModel:   model.ModelSmolLM2135MInstruct,
 		AdapterPath: "artifacts/job1/model_adapters",
 	}, false)
 	if err == nil {
 		t.Fatal("expected HTTP 500 error from NotifyDaemonAdapter")
 	}
-	if strings.Contains(err.Error(), "leaked-daemon-secret-9999") {
-		t.Fatalf("NotifyDaemonAdapter leaked Bearer credential in error output: %v", err)
+	if strings.Contains(err.Error(), "leaked-daemon-secret-9999") || strings.Contains(err.Error(), "opaque-token-xyz987") {
+		t.Fatalf("NotifyDaemonAdapter leaked credential in error output: %v", err)
 	}
-	if err := NotifyDaemonAdapter(context.Background(), "http://u:secretpass@127.0.0.1:notaport", "", ActiveAdapter{}, false); err == nil || strings.Contains(err.Error(), "secretpass") {
+	if _, err := NotifyDaemonAdapter(context.Background(), "http://u:secretpass@127.0.0.1:notaport", "", ActiveAdapter{}, false); err == nil || strings.Contains(err.Error(), "secretpass") {
 		t.Fatalf("NotifyDaemonAdapter leaked URL credentials on parse failure: %v", err)
 	}
 	// Wrapped transport *url.Error must strip URL username as well as password.
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := NotifyDaemonAdapter(cancelCtx, "http://secretuser:secretpass@127.0.0.1:1", "", ActiveAdapter{
+	if _, err := NotifyDaemonAdapter(cancelCtx, "http://secretuser:secretpass@127.0.0.1:1", "", ActiveAdapter{
 		BaseModel:   model.ModelSmolLM2135MInstruct,
 		AdapterPath: "artifacts/job1/model_adapters",
 	}, false); err == nil || strings.Contains(err.Error(), "secretuser") || strings.Contains(err.Error(), "secretpass") || !errors.Is(err, context.Canceled) {

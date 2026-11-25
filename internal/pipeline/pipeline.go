@@ -3,7 +3,9 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,15 +133,19 @@ type bucketAccumulator struct {
 // per-event deterministic rule accumulation, Tier 1 Laplace-LK surprisal scoring,
 // and Genesis alert emission.
 type Pipeline struct {
-	cfg          *config.Config
-	agg          *template.Aggregator
-	ruleEng      *rules.Engine
-	surprisalEng *surprisal.Engine
-	triageClient *triage.Client
-	alertJournal *feedback.AlertJournal
-	sink         emit.Sink
-	activeSource string
-	startTime    time.Time
+	cfg              *config.Config
+	agg              *template.Aggregator
+	ruleEng          *rules.Engine
+	surprisalEng     *surprisal.Engine
+	triageClient     *triage.Client
+	alertJournal     *feedback.AlertJournal
+	sink             emit.Sink
+	activeSource     string
+	instanceID       string
+	startTime        time.Time
+	triageReqTimeout time.Duration
+	triageCancelMu   sync.Mutex
+	triageCancel     context.CancelFunc
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
@@ -192,10 +198,20 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 	})
 
 	var triageClient *triage.Client
+	var reqTimeout time.Duration
 	if strings.EqualFold(cfg.TriageMode, "http") && cfg.InferenceAddr != "" {
-		reqTimeout := 20 * time.Second
-		if cfg.TriageTimeoutSec > 0 && time.Duration(cfg.TriageTimeoutSec)*time.Second < reqTimeout {
-			reqTimeout = time.Duration(cfg.TriageTimeoutSec) * time.Second
+		flushBudget := time.Duration(cfg.TriageTimeoutSec) * time.Second
+		if flushBudget <= 0 {
+			flushBudget = config.DefaultTriageTimeoutSec * time.Second
+		}
+		// Bound each individual Tier 2 request strictly so a stalled inference server trips
+		// the circuit breaker promptly instead of delaying deterministic Tier 0/1 alerts.
+		reqTimeout = 10 * time.Second
+		if flushBudget <= 15*time.Second {
+			reqTimeout = 5 * time.Second
+		}
+		if flushBudget < reqTimeout {
+			reqTimeout = flushBudget
 		}
 		if tc, err := triage.NewClient(triage.ClientOptions{
 			BaseURL:        cfg.InferenceAddr,
@@ -212,6 +228,10 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		}
 	}
 
+	var idBytes [4]byte
+	_, _ = rand.Read(idBytes[:])
+	instanceID := hex.EncodeToString(idBytes[:])
+
 	return &Pipeline{
 		cfg:                   cfg,
 		agg:                   template.NewAggregator(template.DefaultMaxClusters),
@@ -220,7 +240,9 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		triageClient:          triageClient,
 		sink:                  sink,
 		activeSource:          activeSource,
+		instanceID:            instanceID,
 		startTime:             time.Now(),
+		triageReqTimeout:      reqTimeout,
 		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
 		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
@@ -551,7 +573,15 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			flushBudget = config.DefaultTriageTimeoutSec * time.Second
 		}
 		triageCtx, cancelTriage = context.WithTimeout(context.Background(), flushBudget)
-		defer cancelTriage()
+		p.triageCancelMu.Lock()
+		p.triageCancel = cancelTriage
+		p.triageCancelMu.Unlock()
+		defer func() {
+			p.triageCancelMu.Lock()
+			p.triageCancel = nil
+			p.triageCancelMu.Unlock()
+			cancelTriage()
+		}()
 	}
 
 	for _, k := range keys {
@@ -620,7 +650,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		p.ruleHitsTotal.Add(uint64(len(qualifyingHits)))
 		seq := p.alertSeq.Add(1)
-		alertID := fmt.Sprintf("sentinel-%d-%d", nowUnix, seq)
+		alertID := fmt.Sprintf("sentinel-%d-%s-%d", nowUnix, p.instanceID, seq)
 		severity := emit.HighestSeverity(qualifyingHits)
 
 		ruleIDs := make([]string, 0, len(qualifyingHits))
@@ -752,7 +782,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		severity := mapSurprisalSeverity(sw.score.TotalNats, sw.score.ThresholdNats, cleanLevel)
 		seq := p.alertSeq.Add(1)
-		alertID := fmt.Sprintf("sentinel-%d-%d", nowUnix, seq)
+		alertID := fmt.Sprintf("sentinel-%d-%s-%d", nowUnix, p.instanceID, seq)
 		ts := normalizeAlertTimestamp(w.LastSeenUnix, nowUnix)
 		roundedEntropy := math.Round(w.SampleEntropy*10000) / 10000
 		topFeats := surprisal.TopFeatures(sw.score.FeatureContribs, 4)
@@ -820,7 +850,13 @@ func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, a
 	if client == nil || alert == nil {
 		return
 	}
-	verdict, overridden, err := client.TriageWindow(ctx, triage.PromptInput{
+	reqCtx := ctx
+	var cancelReq context.CancelFunc
+	if p.triageReqTimeout > 0 {
+		reqCtx, cancelReq = context.WithTimeout(ctx, p.triageReqTimeout)
+		defer cancelReq()
+	}
+	verdict, overridden, err := client.TriageWindow(reqCtx, triage.PromptInput{
 		Service:              alert.SourceService,
 		Level:                alert.SourceLevel,
 		TemplateID:           alert.TemplateID,
@@ -954,6 +990,14 @@ func (p *Pipeline) Stats() Stats {
 // pending hits, Tier 1 rolling surprisal baselines, and active ingest cursors
 // (.seg and /query), and deletes Sentinel-owned disk state.
 func (p *Pipeline) Burn() (BurnReport, error) {
+	// Cancel any in-flight Tier 2 HTTP call immediately so Burn never stalls waiting for a
+	// hung local inference server before acquiring burnMu.Lock().
+	p.triageCancelMu.Lock()
+	if p.triageCancel != nil {
+		p.triageCancel()
+	}
+	p.triageCancelMu.Unlock()
+
 	p.burnMu.Lock()
 	defer p.burnMu.Unlock()
 
@@ -1052,6 +1096,7 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 		"status":         "activated",
 		"base_model":     state.BaseModel,
 		"adapter_path":   state.AdapterPath,
+		"data_dir":       p.cfg.DataDir,
 		"triage_enabled": p.triageClient != nil,
 	})
 }
@@ -1153,67 +1198,81 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 			if openRootErr != nil {
 				errs = append(errs, fmt.Errorf("open root %q: %w", dataDir, openRootErr))
 			} else {
-				// 1. Known top-level Sentinel state files and atomic temp files.
-				topDir, topOpenErr := root.Open(".")
-				if topOpenErr != nil {
-					errs = append(errs, fmt.Errorf("open root dir %q: %w", dataDir, topOpenErr))
+				// 1. Known top-level Sentinel state files and atomic temp files, serialized with
+				// AlertJournal writers via the shared cross-process directory lock.
+				unlockData, lockErr := feedback.AcquireDirLock(dataDir)
+				if lockErr != nil {
+					errs = append(errs, fmt.Errorf("lock data dir %q: %w", dataDir, lockErr))
 				} else {
-					entries, readErr := topDir.ReadDir(-1)
-					_ = topDir.Close()
-					if readErr != nil {
-						errs = append(errs, fmt.Errorf("read data dir %q: %w", dataDir, readErr))
+					topDir, topOpenErr := root.Open(".")
+					if topOpenErr != nil {
+						errs = append(errs, fmt.Errorf("open root dir %q: %w", dataDir, topOpenErr))
 					} else {
-						for _, entry := range entries {
-							if entry.IsDir() {
-								continue
-							}
-							if isOwnedTopLevelFile(entry.Name()) {
-								removeOwnedInRoot(root, entry.Name())
+						entries, readErr := topDir.ReadDir(-1)
+						_ = topDir.Close()
+						if readErr != nil {
+							errs = append(errs, fmt.Errorf("read data dir %q: %w", dataDir, readErr))
+						} else {
+							for _, entry := range entries {
+								if entry.IsDir() {
+									continue
+								}
+								if isOwnedTopLevelFile(entry.Name()) {
+									removeOwnedInRoot(root, entry.Name())
+								}
 							}
 						}
 					}
+					unlockData()
 				}
 
-				// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback".
+				// 2. Known Sentinel-named feedback files inside a nested os.Root handle bound to "feedback",
+				// serialized with Store.Append/ExportFTaaS writers via the shared directory lock.
 				fbInfo, statErr := root.Lstat("feedback")
 				if statErr == nil {
 					if fbInfo.Mode()&os.ModeSymlink != 0 {
 						errs = append(errs, fmt.Errorf("refusing to follow symlink at feedback directory"))
 					} else if fbInfo.IsDir() {
 						defaultFeedbackStat = fbInfo
-						fbRoot, fbOpenRootErr := root.OpenRoot("feedback")
-						if fbOpenRootErr != nil {
-							errs = append(errs, fmt.Errorf("open feedback root: %w", fbOpenRootErr))
+						unlockFB, fbLockErr := feedback.AcquireDirLock(filepath.Join(dataDir, "feedback"))
+						if fbLockErr != nil {
+							errs = append(errs, fmt.Errorf("lock feedback dir: %w", fbLockErr))
 						} else {
-							fbStat, fbStatErr := fbRoot.Stat(".")
-							if fbStatErr != nil {
-								errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
-								_ = fbRoot.Close()
-							} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
-								errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
-								_ = fbRoot.Close()
+							fbRoot, fbOpenRootErr := root.OpenRoot("feedback")
+							if fbOpenRootErr != nil {
+								errs = append(errs, fmt.Errorf("open feedback root: %w", fbOpenRootErr))
 							} else {
-								fbDir, openErr := fbRoot.Open(".")
-								if openErr != nil {
-									errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
+								fbStat, fbStatErr := fbRoot.Stat(".")
+								if fbStatErr != nil {
+									errs = append(errs, fmt.Errorf("stat opened feedback dir: %w", fbStatErr))
+									_ = fbRoot.Close()
+								} else if !fbStat.IsDir() || !os.SameFile(fbInfo, fbStat) {
+									errs = append(errs, fmt.Errorf("refusing feedback cleanup: feedback directory identity changed between Lstat and OpenRoot"))
+									_ = fbRoot.Close()
 								} else {
-									fbEntries, readErr := fbDir.ReadDir(-1)
-									_ = fbDir.Close()
-									if readErr != nil {
-										errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+									fbDir, openErr := fbRoot.Open(".")
+									if openErr != nil {
+										errs = append(errs, fmt.Errorf("open feedback dir: %w", openErr))
 									} else {
-										for _, e := range fbEntries {
-											if e.IsDir() {
-												continue
-											}
-											if isOwnedFeedbackFile(e.Name()) {
-												removeOwnedInRoot(fbRoot, e.Name())
+										fbEntries, readErr := fbDir.ReadDir(-1)
+										_ = fbDir.Close()
+										if readErr != nil {
+											errs = append(errs, fmt.Errorf("read feedback dir: %w", readErr))
+										} else {
+											for _, e := range fbEntries {
+												if e.IsDir() {
+													continue
+												}
+												if feedback.IsOwnedFeedbackFilename(e.Name()) {
+													removeOwnedInRoot(fbRoot, e.Name())
+												}
 											}
 										}
 									}
+									_ = fbRoot.Close()
 								}
-								_ = fbRoot.Close()
 							}
+							unlockFB()
 						}
 					}
 				} else if !os.IsNotExist(statErr) {
@@ -1225,7 +1284,7 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 	}
 
 	// 3. If a separate custom feedbackDir was configured outside dataDir/feedback, purge ONLY
-	// Sentinel-named feedback files there via an os.Root handle as well.
+	// Sentinel-named feedback files there via an os.Root handle and shared directory lock.
 	if trimmedFB := strings.TrimSpace(feedbackDir); trimmedFB != "" {
 		cleanDefault := ""
 		if strings.TrimSpace(dataDir) != "" {
@@ -1237,37 +1296,43 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 				if customInfo.Mode()&os.ModeSymlink != 0 {
 					errs = append(errs, fmt.Errorf("refusing to follow symlink at custom feedback directory %q", trimmedFB))
 				} else if customInfo.IsDir() && (defaultFeedbackStat == nil || !os.SameFile(defaultFeedbackStat, customInfo)) {
-					customRoot, openErr := os.OpenRoot(trimmedFB)
-					if openErr != nil {
-						errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", trimmedFB, openErr))
+					unlockCustom, cLockErr := feedback.AcquireDirLock(trimmedFB)
+					if cLockErr != nil {
+						errs = append(errs, fmt.Errorf("lock custom feedback dir %q: %w", trimmedFB, cLockErr))
 					} else {
-						cStat, cStatErr := customRoot.Stat(".")
-						if cStatErr != nil {
-							errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", trimmedFB, cStatErr))
-						} else if !cStat.IsDir() || !os.SameFile(customInfo, cStat) {
-							errs = append(errs, fmt.Errorf("refusing custom feedback cleanup: directory identity changed between Lstat and OpenRoot"))
+						customRoot, openErr := os.OpenRoot(trimmedFB)
+						if openErr != nil {
+							errs = append(errs, fmt.Errorf("open custom feedback root %q: %w", trimmedFB, openErr))
 						} else {
-							cDir, dOpenErr := customRoot.Open(".")
-							if dOpenErr != nil {
-								errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", trimmedFB, dOpenErr))
+							cStat, cStatErr := customRoot.Stat(".")
+							if cStatErr != nil {
+								errs = append(errs, fmt.Errorf("stat opened custom feedback dir %q: %w", trimmedFB, cStatErr))
+							} else if !cStat.IsDir() || !os.SameFile(customInfo, cStat) {
+								errs = append(errs, fmt.Errorf("refusing custom feedback cleanup: directory identity changed between Lstat and OpenRoot"))
 							} else {
-								cEntries, readErr := cDir.ReadDir(-1)
-								_ = cDir.Close()
-								if readErr != nil {
-									errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", trimmedFB, readErr))
+								cDir, dOpenErr := customRoot.Open(".")
+								if dOpenErr != nil {
+									errs = append(errs, fmt.Errorf("open custom feedback dir %q: %w", trimmedFB, dOpenErr))
 								} else {
-									for _, e := range cEntries {
-										if e.IsDir() {
-											continue
-										}
-										if isOwnedFeedbackFile(e.Name()) {
-											removeOwnedInRoot(customRoot, e.Name())
+									cEntries, readErr := cDir.ReadDir(-1)
+									_ = cDir.Close()
+									if readErr != nil {
+										errs = append(errs, fmt.Errorf("read custom feedback dir %q: %w", trimmedFB, readErr))
+									} else {
+										for _, e := range cEntries {
+											if e.IsDir() {
+												continue
+											}
+											if feedback.IsOwnedFeedbackFilename(e.Name()) {
+												removeOwnedInRoot(customRoot, e.Name())
+											}
 										}
 									}
 								}
 							}
+							_ = customRoot.Close()
 						}
-						_ = customRoot.Close()
+						unlockCustom()
 					}
 				}
 			} else if !os.IsNotExist(lstatErr) {
@@ -1299,19 +1364,6 @@ func isOwnedTopLevelFile(name string) bool {
 		(strings.HasPrefix(name, ".baseline-") && strings.HasSuffix(name, ".tmp")) ||
 		(strings.HasPrefix(name, ".alerts-") && strings.HasSuffix(name, ".tmp")) ||
 		(strings.HasPrefix(name, ".active-adapter-") && strings.HasSuffix(name, ".tmp"))
-}
-
-// isOwnedFeedbackFile enforces an explicit Sentinel filename contract inside dataDir/feedback/
-// so unrelated user files (e.g. feedback/import.jsonl) are never deleted by `sentinel burn`.
-func isOwnedFeedbackFile(name string) bool {
-	if name == "sentinel-feedback.jsonl" || name == "sentinel-feedback.jsonl.tmp" {
-		return true
-	}
-	if strings.HasPrefix(name, "sentinel-feedback-") &&
-		(strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.tmp")) {
-		return true
-	}
-	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
 }
 
 // normalizeAlertTimestamp enforces the Unix-seconds alert timestamp contract expected by

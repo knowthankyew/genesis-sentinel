@@ -1183,14 +1183,22 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 		t.Fatalf("expected 400 for trailing JSON data in HandleAdapter, got %d", trailRec.Code)
 	}
 
-	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir AND still cleans custom FeedbackDir when DataDir fails.
+	// 5. BurnLocalStateWithFeedbackDir supports empty dataDir, preserves invalid-slug filenames
+	// like "sentinel-feedback-team notes.jsonl", AND still cleans custom FeedbackDir when DataDir fails.
 	fbOnlyDir := t.TempDir()
 	fbOnlyFile := filepath.Join(fbOnlyDir, "sentinel-feedback.jsonl")
+	invalidSlugFile := filepath.Join(fbOnlyDir, "sentinel-feedback-team notes.jsonl")
 	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
 		t.Fatalf("write fbOnlyFile: %v", err)
 	}
+	if err := os.WriteFile(invalidSlugFile, []byte(`{"user":"keep"}`+"\n"), 0600); err != nil {
+		t.Fatalf("write invalidSlugFile: %v", err)
+	}
 	if rep, err := BurnLocalStateWithFeedbackDir("", fbOnlyDir); err != nil || rep.FilesRemoved != 1 {
 		t.Fatalf("BurnLocalStateWithFeedbackDir('', fbOnlyDir) failed: rep=%+v err=%v", rep, err)
+	}
+	if _, err := os.Stat(invalidSlugFile); err != nil {
+		t.Fatalf("non-owned filename with space was removed by burn: %v", err)
 	}
 
 	if err := os.WriteFile(fbOnlyFile, []byte(`{"prompt":"x","completion":"[BENIGN-NOISE]"}`+"\n"), 0600); err != nil {
@@ -1202,5 +1210,17 @@ func TestHandleAdapterRollbackOnPersistenceFailureAndConcurrentSerialization(t *
 	}
 	if _, err := os.Stat(fbOnlyFile); !os.IsNotExist(err) {
 		t.Fatal("custom feedback file survived partial burn")
+	}
+
+	// 6. Two fresh pipelines emitting in the same Unix second generate distinct AlertIDs.
+	p1 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
+	p2 := New(config.DefaultConfig(), ruleEng, emit.NopSink{}, "file")
+	ev := model.LogEvent{ID: 1, Timestamp: 1763997000, Service: "nginx", Level: "WARN", Message: "GET /../../../../etc/passwd HTTP/1.1 403"}
+	p1.IngestEvent(ev)
+	p2.IngestEvent(ev)
+	a1, _ := p1.FlushWindow()
+	a2, _ := p2.FlushWindow()
+	if len(a1) != 1 || len(a2) != 1 || a1[0].AlertID == a2[0].AlertID {
+		t.Fatalf("expected distinct per-pipeline AlertIDs, got a1=%q a2=%q", a1[0].AlertID, a2[0].AlertID)
 	}
 }

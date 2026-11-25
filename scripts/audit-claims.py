@@ -319,8 +319,8 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
                 "TestValidateBaseModel|TestDefaultConfigValidates|TestConfigRejectsBitNetAndNonLoopback|"
                 "TestExecuteConfigRedactsTokens|TestExecuteDataSubcommands|"
                 "TestBurnLocalStateRejectsFeedbackSymlinkEscape|TestPipelineCountsOnlySuccessfulSinkEmissions|"
-                "TestClientValidationRejectsBitNetOffLoopbackAndTraversal|TestParseCompletionFailClosedAndInjectionOverride|"
-                "TestRedactTextAndScanForPII|TestFTaaSClientRejectsBitNetNonLoopbackAndUnredactedPII)$"
+                "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials|TestParseCompletionFailClosedAndInjectionOverride|"
+                "TestRedactTextAndScanForPII|TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload)$"
             ),
         ],
         "Go Security, Model Governance, Redaction & Burn Invariant Tests",

@@ -27,6 +27,13 @@ func getPathMutex(cleanPath string) *sync.Mutex {
 	return m
 }
 
+// AcquireDirLock acquires the same cross-process and in-process directory lock used by
+// Store and AlertJournal so destructive operations such as BurnLocalState serialize cleanly
+// against concurrent appends and journal commits.
+func AcquireDirLock(dir string) (func(), error) {
+	return acquireFileLock(filepath.Join(dir, ".sentinel-dir-lock-anchor"), false)
+}
+
 // acquireFileLock serializes access to targetPath across both in-process Store/Journal
 // instances and separate OS processes via an in-process per-directory mutex combined with an
 // advisory flock on the parent directory descriptor (leaving zero stray lock files on disk;

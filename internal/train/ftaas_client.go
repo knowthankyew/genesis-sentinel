@@ -232,7 +232,7 @@ func (c *FTaaSClient) AuditDataset(
 		return DatasetAuditResponse{}, fmt.Errorf("POST %s/api/v1/jobs/audit: %w", c.redactedURL, err)
 	}
 	if statusCode != http.StatusOK {
-		return DatasetAuditResponse{}, fmt.Errorf("FTaaS /api/v1/jobs/audit returned HTTP %d: %s", statusCode, compactErrBody(respBody))
+		return DatasetAuditResponse{}, fmt.Errorf("FTaaS /api/v1/jobs/audit returned HTTP %d: %s", statusCode, compactErrBody(respBody, c.apiKey))
 	}
 	var out DatasetAuditResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -294,7 +294,7 @@ func (c *FTaaSClient) SubmitJob(ctx context.Context, req SubmitRequest) (SubmitR
 		return SubmitResponse{}, fmt.Errorf("POST %s/api/v1/jobs (jobName=%q) failed (run `sentinel train list` to verify whether FTaaS already queued this job before retrying): %w", c.redactedURL, jobName, err)
 	}
 	if statusCode != http.StatusAccepted && statusCode != http.StatusOK {
-		return SubmitResponse{}, fmt.Errorf("FTaaS /api/v1/jobs returned HTTP %d: %s", statusCode, compactErrBody(respBody))
+		return SubmitResponse{}, fmt.Errorf("FTaaS /api/v1/jobs returned HTTP %d: %s", statusCode, compactErrBody(respBody, c.apiKey))
 	}
 
 	var out SubmitResponse
@@ -327,7 +327,7 @@ func (c *FTaaSClient) GetJob(ctx context.Context, jobID string) (JobDetail, erro
 		return JobDetail{}, fmt.Errorf("GET %s/api/v1/jobs/%s: %w", c.redactedURL, jobID, err)
 	}
 	if statusCode != http.StatusOK {
-		return JobDetail{}, fmt.Errorf("FTaaS GET /api/v1/jobs/%s returned HTTP %d: %s", jobID, statusCode, compactErrBody(respBody))
+		return JobDetail{}, fmt.Errorf("FTaaS GET /api/v1/jobs/%s returned HTTP %d: %s", jobID, statusCode, compactErrBody(respBody, c.apiKey))
 	}
 	var detail JobDetail
 	if err := json.Unmarshal(respBody, &detail); err != nil {
@@ -361,7 +361,7 @@ func (c *FTaaSClient) ListJobs(ctx context.Context, limit int) ([]JobDetail, err
 		return nil, fmt.Errorf("GET %s/api/v1/jobs: %w", c.redactedURL, err)
 	}
 	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("FTaaS GET /api/v1/jobs returned HTTP %d: %s", statusCode, compactErrBody(respBody))
+		return nil, fmt.Errorf("FTaaS GET /api/v1/jobs returned HTTP %d: %s", statusCode, compactErrBody(respBody, c.apiKey))
 	}
 	var jobs []JobDetail
 	if err := json.Unmarshal(respBody, &jobs); err != nil {
@@ -387,11 +387,30 @@ func (c *FTaaSClient) WaitForJob(
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	const maxConsecutivePollErrors = 3
+	consecutiveErrs := 0
+	var lastDetail JobDetail
+
 	for {
 		detail, err := c.GetJob(ctx, jobID)
 		if err != nil {
-			return JobDetail{}, err
+			if ctx.Err() != nil {
+				return lastDetail, fmt.Errorf("poll FTaaS job %s aborted (check status via `sentinel train status --job-id %s`): %w", jobID, jobID, err)
+			}
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutivePollErrors {
+				return lastDetail, fmt.Errorf("poll FTaaS job %s failed after %d attempts (job may still be running; check via `sentinel train status --job-id %s`): %w",
+					jobID, consecutiveErrs, jobID, err)
+			}
+			select {
+			case <-ctx.Done():
+				return lastDetail, ctx.Err()
+			case <-ticker.C:
+				continue
+			}
 		}
+		consecutiveErrs = 0
+		lastDetail = detail
 		if onProgress != nil {
 			onProgress(detail)
 		}
@@ -403,7 +422,7 @@ func (c *FTaaSClient) WaitForJob(
 			if msg == "" {
 				msg = "training job terminated with status " + detail.Status
 			}
-			return detail, fmt.Errorf("FTaaS job %s %s: %s", jobID, detail.Status, compactErrBody([]byte(msg)))
+			return detail, fmt.Errorf("FTaaS job %s %s: %s", jobID, detail.Status, compactErrBody([]byte(msg), c.apiKey))
 		}
 		select {
 		case <-ctx.Done():
@@ -459,10 +478,16 @@ func buildMultipartUploadFromBytes(fileName string, content []byte, fields map[s
 	return &buf, mw.FormDataContentType(), nil
 }
 
-func compactErrBody(b []byte) string {
+func compactErrBody(b []byte, secrets ...string) string {
 	s := strings.TrimSpace(string(b))
 	if len(s) > 4096 {
 		s = s[:4096]
+	}
+	// Scrub any caller-configured opaque API keys/tokens verbatim even if echoed without labels.
+	for _, sec := range secrets {
+		if len(sec) >= 4 {
+			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
+		}
 	}
 	// Redact any echoed Authorization credentials, JWTs, API keys, or PII before error output.
 	s, _ = feedback.RedactText(s)

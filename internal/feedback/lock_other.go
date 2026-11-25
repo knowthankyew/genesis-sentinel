@@ -27,6 +27,12 @@ func getPathMutex(cleanKey string) *sync.Mutex {
 	return m
 }
 
+// AcquireDirLock acquires the same in-process directory lock used by Store and AlertJournal
+// so destructive operations such as BurnLocalState serialize cleanly against concurrent writes.
+func AcquireDirLock(dir string) (func(), error) {
+	return acquireFileLock(filepath.Join(dir, ".sentinel-dir-lock-anchor"), false)
+}
+
 // acquireFileLock serializes access across all in-process Store/Journal instances targeting
 // the same parent directory (normalized case-insensitively on Windows so equivalent filenames
 // such as sentinel-feedback-Team.jsonl and sentinel-feedback-team.jsonl share one mutex).

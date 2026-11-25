@@ -7,19 +7,20 @@ import (
 	"os"
 )
 
-func openRegularFileNonBlocking(path string) (*os.File, os.FileInfo, error) {
+// OpenRegularFileNonBlocking opens path and enforces a descriptor-based regular-file check.
+func OpenRegularFileNonBlocking(path string) (*os.File, os.FileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open dataset %q: %w", path, err)
+		return nil, nil, err
 	}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, nil, fmt.Errorf("stat dataset %q: %w", path, err)
+		return nil, nil, err
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, nil, fmt.Errorf("dataset %q must be a regular file", path)
+		return nil, nil, fmt.Errorf("%q must be a regular file", path)
 	}
 	return f, fi, nil
 }

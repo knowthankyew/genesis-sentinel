@@ -59,8 +59,8 @@ func (j *AlertJournal) Path() string {
 	return j.path
 }
 
-// Record appends newly emitted alerts into the bounded local journal using an atomic rewrite
-// when trimming oldest records so partial writes never corrupt alerts.jsonl.
+// Record appends newly emitted alerts into the bounded local journal using a temp-file
+// rewrite (atomic rename on POSIX/Unix filesystems) when trimming oldest records.
 // Existing I/O errors are propagated without overwriting or resetting the journal.
 func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	if j == nil || strings.TrimSpace(j.path) == "" || len(alerts) == 0 {
@@ -77,7 +77,8 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 
 	incoming := make([]emit.Alert, len(alerts))
 	for i, a := range alerts {
-		if strings.TrimSpace(a.AlertID) == "" {
+		a.AlertID = strings.TrimSpace(a.AlertID)
+		if a.AlertID == "" {
 			return fmt.Errorf("alert journal refuses alert %d with empty alert_id", i+1)
 		}
 		if j.requireRedaction {
@@ -99,12 +100,15 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 }
 
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
+	a.TraceID, _ = RedactText(a.TraceID)
 	a.SourceService, _ = RedactText(a.SourceService)
 	a.SourceLevel, _ = RedactText(a.SourceLevel)
 	a.Message, _ = RedactText(a.Message)
 	a.Template, _ = RedactText(a.Template)
 	a.SanitizedSample, _ = RedactText(a.SanitizedSample)
 	a.TriageExplanation, _ = RedactText(a.TriageExplanation)
+	a.TriageModel, _ = RedactText(a.TriageModel)
+	a.TriageAdapter, _ = RedactText(a.TriageAdapter)
 	if len(a.RuleIDs) > 0 {
 		out := make([]string, len(a.RuleIDs))
 		for i, r := range a.RuleIDs {
@@ -129,10 +133,19 @@ func redactAlertForPersistence(a emit.Alert) emit.Alert {
 	if len(a.TopSurprisalFeatures) > 0 {
 		out := make(map[string]float64, len(a.TopSurprisalFeatures))
 		for k, v := range a.TopSurprisalFeatures {
-			rk, _ := RedactText(k)
-			out[rk] = v
+			rk, findings := RedactText(k)
+			// Omit feature keys that required redaction so distinct redacted keys never
+			// collide nondeterministically on a shared placeholder.
+			if len(findings) > 0 || rk != k {
+				continue
+			}
+			out[k] = v
 		}
-		a.TopSurprisalFeatures = out
+		if len(out) == 0 {
+			a.TopSurprisalFeatures = nil
+		} else {
+			a.TopSurprisalFeatures = out
+		}
 	}
 	return a
 }
@@ -204,25 +217,17 @@ func (j *AlertJournal) effectiveMaxRecordBytes() int {
 }
 
 func (j *AlertJournal) readAllLocked() ([]emit.Alert, error) {
-	fi, err := os.Stat(j.path)
+	f, fi, err := OpenRegularFileNonBlocking(j.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("alert journal %w", err)
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("alert journal %q must be a regular file", j.path)
-	}
+	defer func() { _ = f.Close() }()
 	if fi.Size() > j.maxBytes*2 {
 		return nil, fmt.Errorf("alert journal %q exceeds safety cap", j.path)
 	}
-
-	f, err := os.Open(j.path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
 
 	// Size scanner token limit strictly above effectiveMaxRecordBytes (and maxBytes) so every
 	// valid written record can always be read back without bufio.ErrTooLong.

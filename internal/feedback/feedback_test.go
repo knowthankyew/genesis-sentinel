@@ -31,20 +31,44 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		t.Fatalf("expected ScanForPII to detect sensitive data, got found=%v cat=%q", found, cat)
 	}
 
-	// Verify ScanForPII independently catches Bearer, Basic, quoted Authorization, DOCKER_AUTH_CONFIG,
-	// credential assignments, emails, and 4-6-5 Amex cards.
+	// Verify ScanForPII independently catches Bearer, Basic (including short standalone Basic YTpi),
+	// quoted Authorization, multi-line DOCKER_AUTH_CONFIG, partial [REDACTED_SECRET] bypass,
+	// boundary card ("4111 1111 1111 1111 2 attempts"), credential assignments, emails, and 4-6-5 Amex cards.
 	for _, sample := range []string{
 		"Authorization: Bearer opaqueToken123456",
 		"Authorization: Basic dXNlcjpwYXNz",
+		"Basic YTpi",
 		`{"Authorization": "Basic YTpi"}`,
 		`DOCKER_AUTH_CONFIG={"auths":{"reg.local":{"auth":"cmVnOnNlY3JldA=="}}}`,
+		"DOCKER_AUTH_CONFIG={\n  \"auths\": {\n    \"reg.local\": {\"auth\": \"cmVnOnNlY3JldA==\"}\n  }\n}",
 		`password=myplaintextpw`,
+		`password=[REDACTED_SECRET]leaked_suffix`,
+		`{"password":"[REDACTED_SECRET]leaked_suffix"}`,
 		`contact alice@example.com`,
 		"card=3782-822463-10005",
+		"card=4111 1111 1111 1111 2 attempts",
 	} {
 		if _, found := ScanForPII(sample); !found {
 			t.Fatalf("expected ScanForPII to reject %q", sample)
 		}
+	}
+
+	// Verify boundary card redacts the 16-digit card while keeping trailing " 2 attempts" intact.
+	cardBoundary, _ := RedactText("card=4111 1111 1111 1111 2 attempts")
+	if cardBoundary != "card=[REDACTED_CARD] 2 attempts" {
+		t.Fatalf("unexpected card boundary redaction: got %q", cardBoundary)
+	}
+	// Verify multi-line DOCKER_AUTH_CONFIG and partial [REDACTED_SECRET]leaked_suffix are completely scrubbed.
+	mlDocker, _ := RedactText("DOCKER_AUTH_CONFIG={\n  \"auths\": {\"reg\": {\"auth\": \"cmVnOnNlY3JldA==\"}}\n}")
+	if strings.Contains(mlDocker, "cmVnOnNlY3JldA==") || strings.Contains(mlDocker, "auths") {
+		t.Fatalf("multi-line DOCKER_AUTH_CONFIG leaked: %q", mlDocker)
+	}
+	partialBypass, _ := RedactText(`password=[REDACTED_SECRET]leaked_suffix {"password":"[REDACTED_SECRET]leaked_suffix"}`)
+	if strings.Contains(partialBypass, "leaked_suffix") {
+		t.Fatalf("partial redaction marker bypass survived: %q", partialBypass)
+	}
+	if cat, found := ScanForPII(partialBypass); found {
+		t.Fatalf("expected cleanly re-scrubbed output to pass ScanForPII, got %q in %q", cat, partialBypass)
 	}
 
 	scrubbed, findings := RedactText(raw)
@@ -76,8 +100,8 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		t.Fatalf("expected scrubbed text (including [REDACTED_TOKEN] placeholders) to pass ScanForPII cleanly, got %q in %q", cat, scrubbed)
 	}
 
-	// Non-SSA SSN areas, non-Luhn 16-digit IDs, and ordinary English ("Basic authentication") must NOT false-positive.
-	benign := "order_id=4111111111111112 ref=000-12-3456 ref2=666-12-3456 ref3=901-12-3456 Basic authentication failed"
+	// Non-SSA SSN areas, non-Luhn 16-digit IDs, and ordinary English ("Basic authentication" / "Basic Authentication") must NOT false-positive.
+	benign := "order_id=4111111111111112 ref=000-12-3456 ref2=666-12-3456 ref3=901-12-3456 Basic authentication failed; Basic Authentication failed"
 	if cat, found := ScanForPII(benign); found {
 		t.Fatalf("expected benign text not to trigger PII scanner, got %q", cat)
 	}
@@ -137,6 +161,13 @@ func TestGenerateSeedDatasetBalancedDisjointAndPIIFree(t *testing.T) {
 				t.Fatalf("expected %d val records for class %s, got %d", tc.valN, cls, valCounts[cls])
 			}
 		}
+	}
+
+	// Verify deterministic seed generation produces identical records (including ReviewedAt) across calls.
+	a := GenerateSeedDataset(2, 99)
+	b := GenerateSeedDataset(2, 99)
+	if len(a) != len(b) || a[0].Prompt != b[0].Prompt || !a[0].ReviewedAt.Equal(b[0].ReviewedAt) {
+		t.Fatalf("GenerateSeedDataset is not deterministic across calls: a[0]=%+v b[0]=%+v", a[0], b[0])
 	}
 }
 
@@ -227,11 +258,13 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 		t.Fatalf("expected 6000-character (12000-byte) prompt below 10000-char limit to pass, got %v", err)
 	}
 
-	// Verify ValidateJSONLFile rejects extra JSON fields, duplicate keys, null prompt, emails, and credential assignments.
+	// Verify ValidateJSONLFile rejects schema violations using PII-free fixtures (extra field,
+	// duplicate keys, null prompt, non-JSON NBSP whitespace) plus email & credential KV PII.
 	for name, content := range map[string]string{
-		"extra-field.jsonl": `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"\u0031\u0032\u0033-45-6789"}` + "\n",
-		"dup-key.jsonl":     `{"prompt":"user 123-45-6789","prompt":"clean prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
+		"extra-field.jsonl": `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"harmless metadata"}` + "\n",
+		"dup-key.jsonl":     `{"prompt":"first clean prompt","prompt":"second clean prompt","completion":"[BENIGN-NOISE]"}` + "\n",
 		"null-prompt.jsonl": `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
+		"nbsp-prefix.jsonl": "\u00a0" + `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
 		"email-pii.jsonl":   `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",
 		"cred-kv.jsonl":     `{"prompt":"login password=unredactedpw failed","completion":"[AUTH-BRUTEFORCE]"}` + "\n",
 	} {
@@ -242,6 +275,11 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 		if _, err := ValidateJSONLFile(p, true); err == nil {
 			t.Fatalf("expected ValidateJSONLFile to reject %s", name)
 		}
+	}
+
+	// Verify WriteFTaaSDataset also refuses to overwrite the curated primary queue.
+	if _, err := WriteFTaaSDataset(filepath.Join(dir, DefaultFeedbackFilename), GenerateSeedDataset(1, 1), true); err == nil {
+		t.Fatal("expected WriteFTaaSDataset to reject overwriting sentinel-feedback.jsonl")
 	}
 
 	// Reject arbitrary PII/email in FeedbackRecord.Label during PrepareRecord.
@@ -328,12 +366,19 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 
 	for i := 1; i <= 5; i++ {
 		if err := j.Record(emit.Alert{
-			AlertID:           fmt.Sprintf("sentinel-100-%d", i),
+			AlertID:           fmt.Sprintf("  sentinel-100-%d  ", i),
+			TraceID:           "trace-user@example.com",
 			SourceService:     "svc-owner@example.com",
 			Severity:          "HIGH",
 			Message:           "user=alice@example.com ssn=123-45-6789 Authorization: Bearer secretToken12345",
 			SanitizedSample:   "Authorization: Basic dXNlcjpwYXNz",
 			TriageExplanation: "Echoed Bearer secretToken12345 in explanation",
+			TriageAdapter:     "artifacts/password=adaptersecret/model",
+			TopSurprisalFeatures: map[string]float64{
+				"entropy":       3.2,
+				"a@example.com": 1.1,
+				"b@example.com": 2.2,
+			},
 		}); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
 		}
@@ -348,14 +393,17 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	}
 	got, found, err := j.FindByID("sentinel-100-5")
 	if err != nil || !found || got.AlertID != "sentinel-100-5" {
-		t.Fatalf("expected newest alert sentinel-100-5, got=%+v found=%v err=%v", got, found, err)
+		t.Fatalf("expected newest trimmed alert sentinel-100-5, got=%+v found=%v err=%v", got, found, err)
 	}
-	// Verify PII/secrets (including SourceService email) were scrubbed before persistence in alerts.jsonl.
+	if len(got.TopSurprisalFeatures) != 1 || got.TopSurprisalFeatures["entropy"] != 3.2 {
+		t.Fatalf("expected redacted feature keys to be omitted deterministically while preserving clean keys, got %+v", got.TopSurprisalFeatures)
+	}
+	// Verify PII/secrets (including SourceService, TraceID, TriageAdapter, feature keys) were scrubbed before persistence in alerts.jsonl.
 	rawJournal, err := os.ReadFile(j.Path())
 	if err != nil {
 		t.Fatalf("read alerts.jsonl: %v", err)
 	}
-	for _, secret := range []string{"svc-owner@example.com", "alice@example.com", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
+	for _, secret := range []string{"trace-user@example.com", "svc-owner@example.com", "alice@example.com", "a@example.com", "b@example.com", "adaptersecret", "123-45-6789", "secretToken12345", "dXNlcjpwYXNz"} {
 		if strings.Contains(string(rawJournal), secret) {
 			t.Fatalf("secret %q leaked into alerts.jsonl: %s", secret, string(rawJournal))
 		}

@@ -433,7 +433,7 @@ func (c *Client) TriageWindow(ctx context.Context, in PromptInput) (model.Triage
 		// an unhealthy or mismatched local inference server on every alert window.
 		c.recordFailure(circuitGen, resp.StatusCode >= 500 || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity)
 		return model.TriageVerdict{}, false, fmt.Errorf("inference endpoint returned HTTP %d: %s",
-			resp.StatusCode, redactErrSnippet(string(respBody)))
+			resp.StatusCode, redactErrSnippet(string(respBody), c.apiKey))
 	}
 
 	var genResp generateResponse
@@ -498,10 +498,20 @@ var (
 	diagCredKVRe   = regexp.MustCompile(`(?i)(["']?)(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}]+)`)
 )
 
-func redactErrSnippet(raw string) string {
-	s := sanitizeSingleLine(raw, 240)
+func redactErrSnippet(raw string, secrets ...string) string {
+	// Sanitize and redact secrets/JWTs across the bounded response BEFORE truncating to 240 bytes
+	// so long JWTs are never sliced mid-token before diagJWTRe can match them.
+	s := sanitizeSingleLine(raw, 4096)
+	for _, sec := range secrets {
+		if len(sec) >= 4 {
+			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
+		}
+	}
 	s = diagJWTRe.ReplaceAllString(s, "[REDACTED_JWT]")
 	s = diagAuthCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
 	s = diagCredKVRe.ReplaceAllString(s, "${1}${2}${3}[REDACTED_SECRET]")
+	if len(s) > 240 {
+		s = truncateUTF8(s, 240) + "..."
+	}
 	return s
 }

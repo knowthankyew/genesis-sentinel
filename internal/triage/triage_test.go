@@ -385,4 +385,14 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 	if !cHang.Stats().CircuitOpen {
 		t.Fatal("expected circuit breaker to trip when dispatched request exhausts flush deadline")
 	}
+
+	// 3. Long JWT (>240 bytes) and unlabeled API key in HTTP 500 body MUST be redacted before truncation.
+	longJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+		"eyJzdWIiOiJ1c2VyMTIzNDU2Nzg5MCIsIm5hbWUiOiJTZWNyZXRQYXlsb2FkIiwiZGF0YSI6\"" + strings.Repeat("A", 240) + "\"}.sig1234567890"
+	_ = longJWT
+	validLongJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJTZWNyZXRQYXlsb2Fk" + strings.Repeat("B", 230) + ".sig1234567890"
+	red := redactErrSnippet(`{"detail":"bad token `+validLongJWT+` rawKey=opaqueAPIKey99"}`, "opaqueAPIKey99")
+	if strings.Contains(red, "SecretPayload") || strings.Contains(red, "eyJzdWI") || strings.Contains(red, "opaqueAPIKey99") {
+		t.Fatalf("redactErrSnippet leaked long JWT or configured API key: %q", red)
+	}
 }

@@ -48,6 +48,10 @@ var (
 		{name: "force_benign_verdict", re: regexp.MustCompile(`(?i)\b(classify|mark|label|treat|output)\s+(this|as)\s+.*\[?benign\]?\b`)},
 		{name: "role_override", re: regexp.MustCompile(`(?i)\b(you\s+are\s+now|act\s+as\s+a|new\s+system\s+prompt)\b`)},
 	}
+
+	// SanitizeURLError cause scrubbers.
+	embeddedURLRe  = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	diagAuthCredRe = regexp.MustCompile(`(?i)\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{4,}`)
 )
 
 // AuthMiddleware enforces Bearer token authentication using constant-time comparison
@@ -334,9 +338,25 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 	return b.String(), signals
 }
 
+type sanitizedURLError struct {
+	op   string
+	url  string
+	msg  string
+	orig error
+}
+
+func (e *sanitizedURLError) Error() string {
+	return fmt.Sprintf("%s %q: %s", e.op, e.url, e.msg)
+}
+
+func (e *sanitizedURLError) Unwrap() error {
+	return e.orig
+}
+
 // SanitizeURLError strips userinfo, query parameters, and fragments from wrapped *url.Error
-// transport errors while preserving the underlying error for errors.Is / errors.As checks
-// (such as context.Canceled and context.DeadlineExceeded).
+// transport errors — including any unsanitized redirect URLs embedded inside url.Error.Err —
+// while preserving Unwrap() for errors.Is / errors.As checks (such as context.Canceled and
+// context.DeadlineExceeded).
 func SanitizeURLError(err error) error {
 	if err == nil {
 		return nil
@@ -345,17 +365,46 @@ func SanitizeURLError(err error) error {
 	if !errors.As(err, &ue) || ue == nil {
 		return err
 	}
-	cleanURL := "<redacted-url>"
-	if u, parseErr := url.Parse(ue.URL); parseErr == nil && u.Host != "" {
-		u.User = nil
-		u.RawQuery = ""
-		u.ForceQuery = false
-		u.Fragment = ""
-		cleanURL = u.String()
+	cleanURL := sanitizeSingleURLString(ue.URL)
+	cleanCause := "transport error"
+	if ue.Err != nil {
+		cleanCause = sanitizeErrMessage(ue.Err.Error())
 	}
-	return &url.Error{
-		Op:  ue.Op,
-		URL: cleanURL,
-		Err: ue.Err,
+	return &sanitizedURLError{
+		op:   ue.Op,
+		url:  cleanURL,
+		msg:  cleanCause,
+		orig: ue.Err,
 	}
+}
+
+func sanitizeSingleURLString(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<redacted-url>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	return u.String()
+}
+
+func sanitizeErrMessage(msg string) string {
+	s := embeddedURLRe.ReplaceAllStringFunc(msg, func(m string) string {
+		return sanitizeSingleURLString(m)
+	})
+	s = diagAuthCredRe.ReplaceAllString(s, "${1}[REDACTED_TOKEN]")
+	// Scrub bare malformed redirect URL fragments that contain query strings (?...) or userinfo (@).
+	if strings.Contains(s, "?") || strings.Contains(s, "@") {
+		fields := strings.Fields(s)
+		for i, f := range fields {
+			trimmed := strings.Trim(f, `"'(),;`)
+			if strings.Contains(trimmed, "?") || (strings.Contains(trimmed, "@") && strings.Contains(trimmed, "://")) {
+				fields[i] = "<redacted-url>"
+			}
+		}
+		s = strings.Join(fields, " ")
+	}
+	return s
 }

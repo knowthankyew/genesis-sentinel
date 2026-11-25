@@ -449,6 +449,8 @@ func GenerateSeedSplit(trainPerClass, valPerClass int, seed uint64) ([]model.Fee
 	return train, val
 }
 
+var deterministicSeedTimestamp = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
 func generateSeedSubset(perClass int, seed uint64, indexOffset int, selectScenarios func([]seedScenario) []seedScenario) []model.FeedbackRecord {
 	if perClass <= 0 {
 		return nil
@@ -456,7 +458,7 @@ func generateSeedSubset(perClass int, seed uint64, indexOffset int, selectScenar
 	rng := rand.New(rand.NewSource(int64(seed)))
 	specs := starterClassSpecs()
 	records := make([]model.FeedbackRecord, 0, perClass*len(specs))
-	now := time.Now().UTC()
+	now := deterministicSeedTimestamp
 
 	for _, spec := range specs {
 		chosen := selectScenarios(spec.scenarios)

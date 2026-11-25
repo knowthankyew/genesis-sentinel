@@ -13,10 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/knowthankyew/genesis-sentinel/internal/feedback"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
 	"github.com/knowthankyew/genesis-sentinel/internal/triage"
 )
+
+const maxActiveAdapterBytes = 64 * 1024
 
 // ActiveAdapterFilename persists the operator-activated LoRA adapter reference under DataDir
 // and is wiped cleanly by `sentinel burn`.
@@ -93,19 +96,31 @@ func SaveActiveAdapter(dataDir string, state ActiveAdapter) error {
 	return nil
 }
 
-// LoadActiveAdapter loads and re-validates active-adapter.json from dataDir.
+// LoadActiveAdapter loads and re-validates active-adapter.json from dataDir using a
+// nonblocking regular-file open so a FIFO cannot block startup.
 // Returns (zero, false, nil) when the file does not exist.
 func LoadActiveAdapter(dataDir string) (ActiveAdapter, bool, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return ActiveAdapter{}, false, nil
 	}
 	path := filepath.Join(dataDir, ActiveAdapterFilename)
-	data, err := os.ReadFile(path)
+	f, fi, err := feedback.OpenRegularFileNonBlocking(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ActiveAdapter{}, false, nil
 		}
-		return ActiveAdapter{}, false, err
+		return ActiveAdapter{}, true, fmt.Errorf("open active adapter %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if fi.Size() > maxActiveAdapterBytes {
+		return ActiveAdapter{}, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxActiveAdapterBytes+1))
+	if err != nil {
+		return ActiveAdapter{}, true, fmt.Errorf("read %q: %w", path, err)
+	}
+	if len(data) > maxActiveAdapterBytes {
+		return ActiveAdapter{}, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
 	}
 	var state ActiveAdapter
 	if err := json.Unmarshal(data, &state); err != nil {
@@ -126,27 +141,28 @@ func LoadActiveAdapter(dataDir string) (ActiveAdapter, bool, error) {
 }
 
 // NotifyDaemonAdapter hot-reloads the active LoRA adapter on a running `sentinel watch`
-// sidecar via POST /adapter over loopback HTTP.
-func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, state ActiveAdapter, allowRemote bool) error {
+// sidecar via POST /adapter over loopback HTTP and returns the daemon's reported data_dir
+// (when provided) so callers can avoid redundant unserialized local manifest writes.
+func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, state ActiveAdapter, allowRemote bool) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	target := strings.TrimSpace(sentinelHTTP)
 	if target == "" {
-		return fmt.Errorf("sentinel HTTP address is empty")
+		return "", fmt.Errorf("sentinel HTTP address is empty")
 	}
 	if !strings.Contains(target, "://") {
 		target = "http://" + target
 	}
 	u, err := url.Parse(target)
 	if err != nil || u.Host == "" {
-		return fmt.Errorf("invalid Sentinel HTTP URL: failed to parse host")
+		return "", fmt.Errorf("invalid Sentinel HTTP URL: failed to parse host")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported Sentinel HTTP URL scheme %q (expected http or https)", u.Scheme)
+		return "", fmt.Errorf("unsupported Sentinel HTTP URL scheme %q (expected http or https)", u.Scheme)
 	}
 	if !allowRemote && !security.IsLoopbackEndpoint(target) {
-		return fmt.Errorf("refusing non-loopback Sentinel endpoint %q without allow_remote_endpoints=true", u.Host)
+		return "", fmt.Errorf("refusing non-loopback Sentinel endpoint %q without allow_remote_endpoints=true", u.Host)
 	}
 	u.RawQuery = ""
 	u.ForceQuery = false
@@ -162,11 +178,11 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 		"adapter_path": state.AdapterPath,
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullTarget+"/adapter", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if authToken != "" {
@@ -176,13 +192,17 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	client := security.NewLoopbackHTTPClient(5*time.Second, allowRemote, true)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s/adapter: %w", redactedTarget, security.SanitizeURLError(err))
+		return "", fmt.Errorf("POST %s/adapter: %w", redactedTarget, security.SanitizeURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST %s/adapter returned HTTP %d: %s", redactedTarget, resp.StatusCode, compactErrBody(respBody))
+		return "", fmt.Errorf("POST %s/adapter returned HTTP %d: %s", redactedTarget, resp.StatusCode, compactErrBody(respBody, authToken))
 	}
-	return nil
+	var ack struct {
+		DataDir string `json:"data_dir"`
+	}
+	_ = json.Unmarshal(respBody, &ack)
+	return strings.TrimSpace(ack.DataDir), nil
 }

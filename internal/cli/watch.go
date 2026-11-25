@@ -89,6 +89,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	adapterPathExplicit := false
+	baseModelExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "genesis-data-dir":
@@ -119,18 +121,21 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			cfg.InferenceAddr = inferenceHTTP
 		case "base-model":
 			cfg.BaseModel = baseModel
+			baseModelExplicit = true
 		case "adapter-path":
 			cfg.AdapterPath = adapterPath
+			adapterPathExplicit = true
 		case "triage-timeout":
 			cfg.TriageTimeoutSec = triageTimeout
 		}
 	})
 
-	// Auto-load persisted active LoRA adapter manifest if no explicit adapter_path was configured.
-	if cfg.AdapterPath == "" && cfg.DataDir != "" {
+	// Auto-load persisted active LoRA adapter manifest only when --adapter-path was omitted
+	// and no adapter_path is configured (explicit `--adapter-path=` disables auto-load).
+	if !adapterPathExplicit && cfg.AdapterPath == "" && cfg.DataDir != "" {
 		if active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir); loadErr == nil && exists {
 			cfg.AdapterPath = active.AdapterPath
-			if baseModel == "" && active.BaseModel != "" {
+			if !baseModelExplicit && active.BaseModel != "" {
 				cfg.BaseModel = active.BaseModel
 			}
 		}

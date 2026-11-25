@@ -122,6 +122,26 @@ func (s *Store) PathFor(filename string) (string, error) {
 	return filepath.Join(s.dir, filename), nil
 }
 
+// IsOwnedFeedbackFilename reports whether name matches Sentinel's owned feedback queue
+// or writer temporary filename grammar (exact safeSlugRe slugs; never unrelated user files
+// such as "sentinel-feedback-team notes.jsonl").
+func IsOwnedFeedbackFilename(name string) bool {
+	if name == DefaultFeedbackFilename || name == DefaultFeedbackFilename+".tmp" {
+		return true
+	}
+	if strings.HasPrefix(name, "sentinel-feedback-") {
+		if strings.HasSuffix(name, ".jsonl") {
+			mid := strings.TrimSuffix(strings.TrimPrefix(name, "sentinel-feedback-"), ".jsonl")
+			return safeSlugRe.MatchString(mid)
+		}
+		if strings.HasSuffix(name, ".jsonl.tmp") {
+			mid := strings.TrimSuffix(strings.TrimPrefix(name, "sentinel-feedback-"), ".jsonl.tmp")
+			return safeSlugRe.MatchString(mid)
+		}
+	}
+	return strings.HasPrefix(name, ".sentinel-feedback-") && strings.HasSuffix(name, ".tmp")
+}
+
 func isSentinelFeedbackFilename(name string) bool {
 	if name == DefaultFeedbackFilename {
 		return true
@@ -437,6 +457,12 @@ func (s *Store) ExportFTaaS(sourceFilename, outPath string, includeSeedPerClass 
 	}
 	defer unlockOut()
 
+	// Recheck curated queue ownership while holding the output directory lock so a concurrent
+	// Store.Append cannot create a curated queue at outPath between precheck and rename.
+	if s.isExistingCuratedQueue(outPath) {
+		return ExportSummary{}, fmt.Errorf("refusing to export FTaaS dataset over existing curated feedback queue %q (choose a separate output path)", outPath)
+	}
+
 	sum, err := writeRecordsAtomic(outPath, cleaned, true, s.maxRecords, s.maxFileBytes)
 	if err != nil {
 		return ExportSummary{}, err
@@ -445,8 +471,12 @@ func (s *Store) ExportFTaaS(sourceFilename, outPath string, includeSeedPerClass 
 	return sum, nil
 }
 
-// WriteFTaaSDataset writes a slice of FeedbackRecords directly to outPath in normalized FTaaS JSONL format.
+// WriteFTaaSDataset writes a slice of FeedbackRecords directly to outPath in normalized FTaaS JSONL format,
+// refusing to overwrite the primary curated queue or any existing curated queue file.
 func WriteFTaaSDataset(outPath string, records []model.FeedbackRecord, requireRedaction bool) (ExportSummary, error) {
+	if strings.TrimSpace(outPath) == "" {
+		return ExportSummary{}, fmt.Errorf("dataset output path is required")
+	}
 	if len(records) == 0 {
 		return ExportSummary{}, fmt.Errorf("cannot write empty FTaaS dataset")
 	}
@@ -464,6 +494,17 @@ func WriteFTaaSDataset(outPath string, records []model.FeedbackRecord, requireRe
 		classCounts[lbl]++
 		cleaned = append(cleaned, pr)
 	}
+
+	unlockOut, err := acquireFileLock(outPath, true)
+	if err != nil {
+		return ExportSummary{}, err
+	}
+	defer unlockOut()
+
+	if filepath.Base(outPath) == DefaultFeedbackFilename || isExistingCuratedQueueFile(outPath) {
+		return ExportSummary{}, fmt.Errorf("refusing to overwrite curated feedback queue %q with FTaaS export dataset", outPath)
+	}
+
 	sum, err := writeRecordsAtomic(outPath, cleaned, true, config.DefaultMaxTrainingRecords, config.DefaultMaxTrainingFileBytes)
 	if err != nil {
 		return ExportSummary{}, err
@@ -477,9 +518,9 @@ func WriteFTaaSDataset(outPath string, records []model.FeedbackRecord, requireRe
 // 3..10,000 / 1..10,000 decoded characters, positive finite weight, and fail-closed PII/secret
 // scanning of both raw JSON lines and decoded fields when requirePIIScan is true).
 func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, error) {
-	f, fi, err := openRegularFileNonBlocking(path)
+	f, fi, err := OpenRegularFileNonBlocking(path)
 	if err != nil {
-		return ValidationSummary{}, err
+		return ValidationSummary{}, fmt.Errorf("dataset %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -499,9 +540,9 @@ func ValidateJSONLFile(path string, requirePIIScan bool) (ValidationSummary, err
 // returns both the validated snapshot bytes and ValidationSummary so upload callers cannot
 // suffer TOCTOU substitution between validation and multipart upload.
 func ReadAndValidateJSONLFile(path string, requirePIIScan bool) ([]byte, ValidationSummary, error) {
-	f, fi, err := openRegularFileNonBlocking(path)
+	f, fi, err := OpenRegularFileNonBlocking(path)
 	if err != nil {
-		return nil, ValidationSummary{}, err
+		return nil, ValidationSummary{}, fmt.Errorf("dataset %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -557,7 +598,9 @@ func validateJSONLStream(r io.Reader, path string, requirePIIScan bool) (Validat
 			return ValidationSummary{}, fmt.Errorf("dataset %q grew past FTaaS ceiling of %d bytes during read",
 				path, config.DefaultMaxTrainingFileBytes)
 		}
-		line := strings.TrimSpace(scanner.Text())
+		// Trim only RFC 8259 JSON whitespace so non-JSON spaces (e.g. U+00A0 NBSP) fail
+		// validation rather than passing locally and breaking strict JSON parsers on upload.
+		line := trimJSONWhitespace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -695,6 +738,10 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 	return prompt, completion, nil
 }
 
+func trimJSONWhitespace(s string) string {
+	return strings.Trim(s, " \t\r\n")
+}
+
 func (s *Store) isExistingCuratedQueue(outPath string) bool {
 	if strings.TrimSpace(s.dir) == "" {
 		return false
@@ -707,7 +754,11 @@ func (s *Store) isExistingCuratedQueue(outPath string) bool {
 	if !isSentinelFeedbackFilename(filepath.Base(outPath)) {
 		return false
 	}
-	f, _, err := openRegularFileNonBlocking(outPath)
+	return isExistingCuratedQueueFile(outPath)
+}
+
+func isExistingCuratedQueueFile(outPath string) bool {
+	f, _, err := OpenRegularFileNonBlocking(outPath)
 	if err != nil {
 		return false
 	}
@@ -716,7 +767,7 @@ func (s *Store) isExistingCuratedQueue(outPath string) bool {
 	sc := bufio.NewScanner(io.LimitReader(f, MaxFeedbackRecordBytes+64*1024))
 	sc.Buffer(make([]byte, 32*1024), MaxFeedbackRecordBytes+64*1024)
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+		line := trimJSONWhitespace(sc.Text())
 		if line == "" {
 			continue
 		}
