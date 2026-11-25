@@ -227,7 +227,6 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	u.RawQuery = ""
 	u.ForceQuery = false
 	u.Fragment = ""
-	u.Path = strings.TrimRight(u.Path, "/")
 	fullBase := strings.TrimRight(u.String(), "/")
 	redactedU := *u
 	redactedU.User = nil
@@ -547,21 +546,35 @@ var (
 )
 
 func redactErrSnippet(raw string, secrets ...string) string {
-	// If any configured secret is nonempty but shorter than 4 bytes, omit the untrusted error
-	// body entirely so short keys can never leak without mangling diagnostic prose.
+	hasSecret := false
 	for _, sec := range secrets {
-		if len(sec) > 0 && len(sec) < 4 {
-			return "[response body omitted: short API key configured]"
+		if len(sec) > 0 {
+			hasSecret = true
+			if len(sec) < 4 {
+				return "[response body omitted: short API key configured]"
+			}
+		}
+	}
+	// When secrets are configured and the response is JSON, decode string literals before
+	// scrubbing so alternate JSON escaping (e.g. HTML escaping disabled vs enabled or \uXXXX)
+	// can never bypass configured secret replacement.
+	work := raw
+	if hasSecret {
+		if decoded, ok := scrubDecodedJSONBody([]byte(raw), secrets); ok {
+			work = decoded
 		}
 	}
 	// Sanitize and redact secrets/JWTs across the ENTIRE bounded response (capped at 256 KiB
 	// by the reader) BEFORE truncating to 240 bytes so even oversized JWTs are never sliced.
-	s := sanitizeSingleLine(raw, 0)
+	s := sanitizeSingleLine(work, 0)
 	for _, sec := range secrets {
 		if len(sec) >= 4 {
 			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
-			if esc := jsonEscapedInner(sec); esc != "" && esc != sec {
+			if esc := jsonEscapedInner(sec, true); esc != "" && esc != sec {
 				s = strings.ReplaceAll(s, esc, "[REDACTED_SECRET]")
+			}
+			if escNoHTML := jsonEscapedInner(sec, false); escNoHTML != "" && escNoHTML != sec {
+				s = strings.ReplaceAll(s, escNoHTML, "[REDACTED_SECRET]")
 			}
 		}
 	}
@@ -574,9 +587,60 @@ func redactErrSnippet(raw string, secrets ...string) string {
 	return s
 }
 
-func jsonEscapedInner(s string) string {
-	b, err := json.Marshal(s)
-	if err != nil || len(b) < 2 {
+func scrubDecodedJSONBody(raw []byte, secrets []string) (string, bool) {
+	var parsed any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", false
+	}
+	scrubbed := scrubJSONValue(parsed, secrets)
+	b, err := json.Marshal(scrubbed)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+func scrubJSONValue(v any, secrets []string) any {
+	switch val := v.(type) {
+	case string:
+		out := val
+		for _, sec := range secrets {
+			if len(sec) >= 4 {
+				out = strings.ReplaceAll(out, sec, "[REDACTED_SECRET]")
+			}
+		}
+		return out
+	case []any:
+		for i := range val {
+			val[i] = scrubJSONValue(val[i], secrets)
+		}
+		return val
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, elem := range val {
+			nk := k
+			for _, sec := range secrets {
+				if len(sec) >= 4 {
+					nk = strings.ReplaceAll(nk, sec, "[REDACTED_SECRET]")
+				}
+			}
+			out[nk] = scrubJSONValue(elem, secrets)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func jsonEscapedInner(s string, escapeHTML bool) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(escapeHTML)
+	if err := enc.Encode(s); err != nil {
+		return ""
+	}
+	b := bytes.TrimSpace(buf.Bytes())
+	if len(b) < 2 {
 		return ""
 	}
 	return string(b[1 : len(b)-1])

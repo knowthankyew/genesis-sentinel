@@ -514,6 +514,7 @@ func TestExecutePhase3FeedbackTrainAndTier2ScanEndToEnd(t *testing.T) {
 	out.Reset()
 	errBuf.Reset()
 	t.Setenv("SENTINEL_DATA_DIR", dataDir)
+	t.Setenv("SENTINEL_FEEDBACK_DIR", "")
 	if err := ExecuteWithOutput([]string{"burn", "-y"}, &out, &errBuf); err != nil {
 		t.Fatalf("burn -y failed: %v (stderr=%s)", err, errBuf.String())
 	}

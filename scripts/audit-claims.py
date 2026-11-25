@@ -301,26 +301,42 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
 
     # 2. Security, Model Governance (BitNet excluded), Config Redaction, Tier 2/Feedback & Burn Invariant Go Tests
     expected_invariant_tests = [
-        "TestIsLoopbackEndpoint",
-        "TestIsBindingAllInterfaces",
-        "TestAuthMiddleware",
-        "TestSanitizeUntrustedLogText",
-        "TestNewLoopbackHTTPClientRedirectPolicies",
-        "TestValidateBaseModel",
-        "TestDefaultConfigValidates",
-        "TestConfigRejectsBitNetAndNonLoopback",
-        "TestExecuteConfigRedactsTokens",
-        "TestExecuteDataSubcommands",
-        "TestBurnLocalStateRejectsFeedbackSymlinkEscape",
-        "TestPipelineCountsOnlySuccessfulSinkEmissions",
-        "TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate",
-        "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials",
-        "TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline",
-        "TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset",
-        "TestParseCompletionFailClosedAndInjectionOverride",
-        "TestRedactTextAndScanForPII",
-        "TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload",
+        ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestIsLoopbackEndpoint"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestIsBindingAllInterfaces"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestAuthMiddleware"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestSanitizeUntrustedLogText"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestNewLoopbackHTTPClientRedirectPolicies"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/model", "TestValidateBaseModel"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestDefaultConfigValidates"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestConfigRejectsBitNetAndNonLoopback"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/cli", "TestExecuteConfigRedactsTokens"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/cli", "TestExecuteDataSubcommands"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/pipeline", "TestBurnLocalStateRejectsFeedbackSymlinkEscape"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/pipeline", "TestPipelineCountsOnlySuccessfulSinkEmissions"),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/triage",
+            "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/triage",
+            "TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/triage",
+            "TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset",
+        ),
+        ("github.com/knowthankyew/genesis-sentinel/internal/triage", "TestParseCompletionFailClosedAndInjectionOverride"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/feedback", "TestRedactTextAndScanForPII"),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/train",
+            "TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload",
+        ),
     ]
+    test_names = sorted({t for _, t in expected_invariant_tests})
     ok_inv, inv_out = run_check(
         [
             "go",
@@ -335,13 +351,13 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/feedback",
             "./internal/train",
             "-run",
-            "^(" + "|".join(expected_invariant_tests) + ")$",
+            "^(" + "|".join(test_names) + ")$",
         ],
         "Go Security, Model Governance, Redaction & Burn Invariant Tests",
         errors,
     )
     if ok_inv:
-        passed_tests: set[str] = set()
+        passed_pairs: set[tuple[str, str]] = set()
         for line in inv_out.splitlines():
             line = line.strip()
             if not line.startswith("{"):
@@ -350,9 +366,13 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if ev.get("Action") == "pass" and isinstance(ev.get("Test"), str):
-                passed_tests.add(ev["Test"])
-        missing_tests = [t for t in expected_invariant_tests if t not in passed_tests]
+            if (
+                ev.get("Action") == "pass"
+                and isinstance(ev.get("Package"), str)
+                and isinstance(ev.get("Test"), str)
+            ):
+                passed_pairs.add((ev["Package"], ev["Test"]))
+        missing_tests = [f"{pkg}::{t}" for pkg, t in expected_invariant_tests if (pkg, t) not in passed_pairs]
         if missing_tests:
             errors.append(
                 f"Invariant Go test audit missed expected tests (renamed or skipped?): {', '.join(missing_tests)}"

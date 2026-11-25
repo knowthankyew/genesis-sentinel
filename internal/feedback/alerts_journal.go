@@ -136,6 +136,63 @@ func (j *AlertJournal) Record(alerts ...emit.Alert) error {
 	return errors.Join(oversizedErrs...)
 }
 
+// UpdateIfPresent replaces an existing alert record matching alert.AlertID in-place without
+// appending or evicting newer alerts when the original alert has already aged out or been burned.
+func (j *AlertJournal) UpdateIfPresent(alert emit.Alert) error {
+	if j == nil || strings.TrimSpace(j.path) == "" {
+		return nil
+	}
+	alert.AlertID = strings.TrimSpace(alert.AlertID)
+	if alert.AlertID == "" {
+		return fmt.Errorf("alert journal refuses update with empty alert_id")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	unlock, err := acquireFileLock(j.path, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	existing, err := j.readAllLocked()
+	if err != nil {
+		return fmt.Errorf("read alert journal %q: %w", j.path, err)
+	}
+	targetIdx := -1
+	for i := len(existing) - 1; i >= 0; i-- {
+		if existing[i].AlertID == alert.AlertID {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx < 0 {
+		return nil
+	}
+
+	if j.requireRedaction {
+		alert = redactAlertForPersistence(alert)
+	}
+	recCap := j.effectiveMaxRecordBytes()
+	raw, mErr := json.Marshal(alert)
+	if mErr != nil {
+		return fmt.Errorf("marshal alert %q: %w", alert.AlertID, mErr)
+	}
+	if len(raw)+1 > recCap || int64(len(raw)+1) > j.maxBytes {
+		return fmt.Errorf("alert %q serialized size (%d bytes) exceeds journal limit (%d bytes)", alert.AlertID, len(raw)+1, recCap)
+	}
+
+	updated := make([]emit.Alert, len(existing))
+	for i, a := range existing {
+		if j.requireRedaction {
+			a = redactAlertForPersistence(a)
+		}
+		updated[i] = a
+	}
+	updated[targetIdx] = alert
+	return j.writeAtomicLocked(updated)
+}
+
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
 	a.Service, _ = RedactText(a.Service)
 	a.TraceID, _ = RedactText(a.TraceID)
@@ -321,7 +378,9 @@ func (j *AlertJournal) writeAtomicLocked(alerts []emit.Alert) error {
 		}
 		b = append(b, '\n')
 		if len(b) > recCap || int64(len(b)) > j.maxBytes {
-			return fmt.Errorf("alert %q serialized size (%d bytes) exceeds journal limit (%d bytes)", a.AlertID, len(b), recCap)
+			// A previously stored legacy row may expand past recCap if redaction is enabled
+			// later; skip that retained row instead of permanently blocking new alert writes.
+			continue
 		}
 		if totalBytes+int64(len(b)) > j.maxBytes {
 			break

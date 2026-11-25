@@ -229,5 +229,5 @@ func NotifyDaemonAdapter(ctx context.Context, sentinelHTTP, authToken string, st
 	if err := json.Unmarshal(respBody, &ack); err != nil || ack.Status != "activated" {
 		return "", fmt.Errorf("POST %s/adapter returned incomplete or invalid activation acknowledgement (daemon may already have applied the adapter)", redactedTarget)
 	}
-	return strings.TrimSpace(ack.DataDir), nil
+	return ack.DataDir, nil
 }

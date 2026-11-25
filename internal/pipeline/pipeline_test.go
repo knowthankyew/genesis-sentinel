@@ -1504,6 +1504,7 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 		// guard discards completed pre-Burn results without leaking to sink or alerts.jsonl.
 		beforePubReached := make(chan struct{})
 		releasePub := make(chan struct{})
+		taskDone := make(chan struct{})
 		var closeOnce sync.Once
 		relPub := func() { closeOnce.Do(func() { close(releasePub) }) }
 
@@ -1531,8 +1532,17 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 			}
 			<-releasePub
 		}
+		pipe.afterAsyncTaskFn = func() {
+			select {
+			case <-taskDone:
+			default:
+				close(taskDone)
+			}
+		}
 		pipe.EnableAsyncTriage(4)
+		// Register relPub AFTER pipe.Close so LIFO defers always unblock the worker before Close waits.
 		defer pipe.Close()
+		defer relPub()
 		pipe.AttachAlertJournal(feedback.NewAlertJournal(dataDir))
 
 		pipe.IngestEvent(model.LogEvent{
@@ -1558,8 +1568,14 @@ func TestAsyncTier2BurnHotSwapAndQueueBackpressure(t *testing.T) {
 		if _, burnErr := pipe.Burn(); burnErr != nil {
 			t.Fatalf("Burn failed: %v", burnErr)
 		}
+		// Release the gated verdict while the pipeline is STILL OPEN and wait for the task to finish
+		// so we prove the burnEpoch check itself (not asyncClosed) discarded the pre-Burn result.
 		relPub()
-		pipe.Close() // deterministically wait for the async worker to finish the gated task
+		select {
+		case <-taskDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("gated pre-Burn async task did not finish after release")
+		}
 
 		select {
 		case leaked := <-sink.ch:

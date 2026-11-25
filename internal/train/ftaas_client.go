@@ -174,7 +174,6 @@ func NewFTaaSClient(rawURL, apiKey string, timeout time.Duration, allowRemote bo
 	u.RawQuery = ""
 	u.ForceQuery = false
 	u.Fragment = ""
-	u.Path = strings.TrimRight(u.Path, "/")
 	fullBase := strings.TrimRight(u.String(), "/")
 	redactedU := *u
 	redactedU.User = nil
@@ -417,7 +416,7 @@ func (c *FTaaSClient) WaitForJob(
 		switch strings.ToLower(strings.TrimSpace(detail.Status)) {
 		case "succeeded", "completed":
 			return detail, nil
-		case "failed", "cancelled", "canceled", "error", "aborted", "timed_out", "timeout":
+		case "failed", "cancelled", "canceled", "error", "aborted", "timed_out", "timedout", "timeout":
 			msg := strings.TrimSpace(detail.ErrorMessage)
 			if msg == "" {
 				msg = "training job terminated with status " + detail.Status
@@ -493,21 +492,42 @@ func sanitizeMultipartFilename(name string) string {
 }
 
 func compactErrBody(b []byte, secrets ...string) string {
+	hasSecret := false
 	for _, sec := range secrets {
-		if len(sec) > 0 && len(sec) < 4 {
-			return "[response body omitted: short API key configured]"
+		if len(sec) > 0 {
+			hasSecret = true
+			if len(sec) < 4 {
+				return "[response body omitted: short API key configured]"
+			}
 		}
 	}
 	// Scrub any caller-configured opaque API keys/tokens across the ENTIRE bounded response
-	// (already capped by doBounded) BEFORE truncating the display excerpt, including JSON-escaped forms.
+	// BEFORE truncating the display excerpt, decoding JSON strings first when JSON is returned
+	// so HTML-escaped and non-HTML-escaped spellings can never bypass redaction.
 	s := strings.TrimSpace(string(b))
+	if hasSecret {
+		var parsed any
+		if err := json.Unmarshal(b, &parsed); err == nil {
+			if out, mErr := json.Marshal(scrubJSONSecrets(parsed, secrets)); mErr == nil {
+				s = string(out)
+			}
+		}
+	}
 	for _, sec := range secrets {
 		if len(sec) >= 4 {
 			s = strings.ReplaceAll(s, sec, "[REDACTED_SECRET]")
-			if esc, err := json.Marshal(sec); err == nil && len(esc) >= 2 {
-				inner := string(esc[1 : len(esc)-1])
-				if inner != "" && inner != sec {
-					s = strings.ReplaceAll(s, inner, "[REDACTED_SECRET]")
+			for _, escHTML := range []bool{true, false} {
+				var buf bytes.Buffer
+				enc := json.NewEncoder(&buf)
+				enc.SetEscapeHTML(escHTML)
+				if err := enc.Encode(sec); err == nil {
+					eb := bytes.TrimSpace(buf.Bytes())
+					if len(eb) >= 2 {
+						inner := string(eb[1 : len(eb)-1])
+						if inner != "" && inner != sec {
+							s = strings.ReplaceAll(s, inner, "[REDACTED_SECRET]")
+						}
+					}
 				}
 			}
 		}
@@ -524,4 +544,36 @@ func compactErrBody(b []byte, secrets ...string) string {
 		s = s[:300] + "..."
 	}
 	return s
+}
+
+func scrubJSONSecrets(v any, secrets []string) any {
+	switch val := v.(type) {
+	case string:
+		out := val
+		for _, sec := range secrets {
+			if len(sec) >= 4 {
+				out = strings.ReplaceAll(out, sec, "[REDACTED_SECRET]")
+			}
+		}
+		return out
+	case []any:
+		for i := range val {
+			val[i] = scrubJSONSecrets(val[i], secrets)
+		}
+		return val
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, elem := range val {
+			nk := k
+			for _, sec := range secrets {
+				if len(sec) >= 4 {
+					nk = strings.ReplaceAll(nk, sec, "[REDACTED_SECRET]")
+				}
+			}
+			out[nk] = scrubJSONSecrets(elem, secrets)
+		}
+		return out
+	default:
+		return v
+	}
 }

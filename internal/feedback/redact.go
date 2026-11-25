@@ -35,9 +35,11 @@ var (
 	// Common cloud, VCS, and AI API key prefixes.
 	apiKeyPrefixRe = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 
-	// Credential key=value or key: value assignments (both unquoted and JSON-quoted keys,
-	// escape-aware for complete and unterminated quoted strings, and bracket-aware for exact [REDACTED_*] placeholders).
-	credKVRe = regexp.MustCompile(`(?i)(["']?)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)(["']?\s*[=:]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|"(?:\\.|[^"\\\r\n])*|'(?:\\.|[^'\\\r\n])*|\[REDACTED(?:_[A-Z_]+)?\][^\s,;&}\]]*|[^\s,;&}\]]+)`)
+	// Credential key=value or key: value assignment prefixes (both bare keys such as password=
+	// and prefixed env/config keys such as DB_PASSWORD=, REDIS_AUTH_TOKEN=, API_SECRET=).
+	// Values are consumed by the quote-aware scanner below so adjacent quoted segments and
+	// unterminated quotes are fully masked.
+	credKVKeyRe = regexp.MustCompile(`(?i)(["']?)\b((?:[A-Za-z0-9_-]+[_-])?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key))(["']?\s*[=:]\s*)`)
 
 	// Email addresses.
 	emailRe = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -120,25 +122,10 @@ func RedactText(raw string) (string, []string) {
 		s = apiKeyPrefixRe.ReplaceAllString(s, "[REDACTED_API_KEY]")
 		addFinding("api_key")
 	}
-	s = credKVRe.ReplaceAllStringFunc(s, func(match string) string {
-		sub := credKVRe.FindStringSubmatch(match)
-		if len(sub) < 5 {
-			return match
-		}
-		rawVal := sub[4]
-		val := strings.Trim(rawVal, `"'`)
-		if isRedactedPlaceholder(val) {
-			return match
-		}
+	if next, changed := redactCredKVValues(s); changed {
+		s = next
 		addFinding("credential_value")
-		if len(rawVal) >= 1 && rawVal[0] == '"' {
-			return sub[1] + sub[2] + sub[3] + `"[REDACTED_SECRET]"`
-		}
-		if len(rawVal) >= 1 && rawVal[0] == '\'' {
-			return sub[1] + sub[2] + sub[3] + `'[REDACTED_SECRET]'`
-		}
-		return sub[1] + sub[2] + sub[3] + "[REDACTED_SECRET]"
-	})
+	}
 	if emailRe.MatchString(s) {
 		s = emailRe.ReplaceAllString(s, "[REDACTED_EMAIL]")
 		addFinding("email")
@@ -266,19 +253,23 @@ func redactURLCredentials(s string) (string, bool) {
 		authEnd := authStart
 		for authEnd < len(s) {
 			ch := s[authEnd]
-			if ch <= ' ' || ch == '/' || ch == '?' || ch == '#' || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == ',' || ch == ';' || ch == ')' || ch == ']' || ch == '}' {
+			// Preserve valid RFC 3986 userinfo punctuation (such as ';' and ',') during
+			// authority scanning so passwords containing ';' or ',' still reach the last '@'.
+			if ch <= ' ' || ch == '/' || ch == '?' || ch == '#' || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == ')' || ch == ']' || ch == '}' {
 				break
 			}
 			authEnd++
 		}
 		authority := s[authStart:authEnd]
 		if atIdx := strings.LastIndexByte(authority, '@'); atIdx > 0 && atIdx < len(authority)-1 {
+			hostPart := strings.TrimRight(authority[atIdx+1:], ",;")
+			trailingPunct := len(authority[atIdx+1:]) - len(hostPart)
 			userinfo := authority[:atIdx]
-			if strings.ContainsRune(userinfo, ':') && !isRedactedPlaceholder(userinfo) {
+			if len(hostPart) > 0 && strings.ContainsRune(userinfo, ':') && !isRedactedPlaceholder(userinfo) {
 				b.WriteString(s[pos:authStart])
 				b.WriteString("[REDACTED_SECRET]@")
-				b.WriteString(authority[atIdx+1:])
-				pos = authEnd
+				b.WriteString(hostPart)
+				pos = authEnd - trailingPunct
 				changed = true
 				continue
 			}
@@ -398,17 +389,132 @@ func isRedactedPlaceholder(val string) bool {
 	}
 }
 
-func hasUnredactedCredKV(text string) bool {
-	for _, sub := range credKVRe.FindAllStringSubmatch(text, -1) {
-		if len(sub) < 5 {
-			continue
+func redactCredKVValues(s string) (string, bool) {
+	var b strings.Builder
+	pos := 0
+	changed := false
+	for pos < len(s) {
+		loc := credKVKeyRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			b.WriteString(s[pos:])
+			break
 		}
-		val := strings.Trim(sub[4], `"'`)
-		if !isRedactedPlaceholder(val) {
+		valStart := pos + loc[1]
+		b.WriteString(s[pos:valStart])
+		valEnd, replacement, redacted := scanCredKVValue(s, valStart)
+		if redacted {
+			b.WriteString(replacement)
+			changed = true
+		} else {
+			b.WriteString(s[valStart:valEnd])
+		}
+		if valEnd <= pos {
+			pos = valStart + 1
+		} else {
+			pos = valEnd
+		}
+	}
+	if !changed {
+		return s, false
+	}
+	return b.String(), true
+}
+
+func hasUnredactedCredKV(text string) bool {
+	pos := 0
+	for pos < len(text) {
+		loc := credKVKeyRe.FindStringIndex(text[pos:])
+		if loc == nil {
+			return false
+		}
+		valStart := pos + loc[1]
+		valEnd, _, redacted := scanCredKVValue(text, valStart)
+		if redacted {
 			return true
+		}
+		if valEnd <= pos {
+			pos = valStart + 1
+		} else {
+			pos = valEnd
 		}
 	}
 	return false
+}
+
+// scanCredKVValue consumes a full quote-aware credential assignment word (including adjacent
+// quoted sections such as password="a"'b' and unterminated quotes running to EOL), stopping
+// at the first unquoted field delimiter while preserving exact [REDACTED_*] placeholders.
+func scanCredKVValue(s string, valStart int) (int, string, bool) {
+	if valStart >= len(s) {
+		return valStart, "", false
+	}
+	i := valStart
+	inQuote := byte(0)
+	escaped := false
+	for i < len(s) {
+		ch := s[i]
+		if inQuote != 0 {
+			if ch == '\r' || ch == '\n' {
+				break
+			}
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == inQuote {
+				inQuote = 0
+			}
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inQuote = ch
+			i++
+			continue
+		}
+		if ch == '[' && strings.HasPrefix(s[i:], "[REDACTED") {
+			limit := min(len(s), i+32)
+			closed := -1
+			for j := i + len("[REDACTED"); j < limit; j++ {
+				c := s[j]
+				if c == ']' {
+					closed = j + 1
+					break
+				}
+				if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' || c == '&' || c == ',' || c == '}' {
+					break
+				}
+			}
+			if closed > 0 {
+				i = closed
+				continue
+			}
+		}
+		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == ';' || ch == '&' || ch == ',' || ch == '}' || ch == ']' {
+			break
+		}
+		i++
+	}
+	rawVal := s[valStart:i]
+	if rawVal == "" {
+		return i, "", false
+	}
+	if isRedactedPlaceholder(rawVal) {
+		return i, rawVal, false
+	}
+	if len(rawVal) >= 2 && (rawVal[0] == '"' || rawVal[0] == '\'') && rawVal[len(rawVal)-1] == rawVal[0] {
+		inner := rawVal[1 : len(rawVal)-1]
+		if !strings.ContainsRune(inner, rune(rawVal[0])) && isRedactedPlaceholder(inner) {
+			return i, rawVal, false
+		}
+	}
+	if rawVal[0] == '"' {
+		return i, `"[REDACTED_SECRET]"`, true
+	}
+	if rawVal[0] == '\'' {
+		return i, `'[REDACTED_SECRET]'`, true
+	}
+	return i, "[REDACTED_SECRET]", true
 }
 
 // redactAuthConfigValues replaces credential-bearing *_AUTH_CONFIG values (such as

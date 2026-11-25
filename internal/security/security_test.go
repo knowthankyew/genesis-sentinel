@@ -280,24 +280,39 @@ func TestSanitizeURLErrorStripsCauseQuerySecrets(t *testing.T) {
 		t.Fatalf("SanitizeURLError broke errors.As(*url.Error): %T %v", sanitized, sanitized)
 	}
 
-	// Whitespace inside an unescaped query value in an embedded URL must not leak trailing secret tokens.
+	// Whitespace inside an unescaped query value in an embedded URL (without "redirect" wording)
+	// must exercise the general embedded-URL guard and not leak trailing secret tokens.
 	wsQueryErr := &url.Error{
 		Op:  "Get",
 		URL: "http://127.0.0.1:5100/jobs",
-		Err: fmt.Errorf("redirect to http://127.0.0.1:5100/a?q=hello secretword failed"),
+		Err: fmt.Errorf("upstream failed on http://127.0.0.1:5100/a?q=hello secretword"),
 	}
 	if strings.Contains(SanitizeURLError(wsQueryErr).Error(), "secretword") {
 		t.Fatalf("SanitizeURLError leaked whitespace-split URL query token: %v", SanitizeURLError(wsQueryErr))
 	}
 
-	// Uppercase HTTPS:// scheme with fragment and malformed relative redirect Location with fragment.
+	// Uppercase HTTPS:// scheme with fragment (without "redirect" wording) and malformed relative Location.
 	upperErr := &url.Error{
 		Op:  "Get",
 		URL: "http://127.0.0.1:5100/jobs",
-		Err: fmt.Errorf("redirect to HTTPS://127.0.0.1:5100/other#fragsecret1 blocked"),
+		Err: fmt.Errorf("upstream peer HTTPS://127.0.0.1:5100/other#fragsecret1 refused"),
 	}
 	if strings.Contains(SanitizeURLError(upperErr).Error(), "fragsecret1") {
 		t.Fatalf("SanitizeURLError leaked uppercase-scheme fragment: %v", SanitizeURLError(upperErr))
+	}
+
+	// Joined error where context.Canceled sits OUTSIDE url.Error.Err must still match errors.Is!
+	joinedErr := errors.Join(&url.Error{
+		Op:  "Post",
+		URL: "http://user:pass@127.0.0.1:5100/jobs?k=joinedsecret",
+		Err: errors.New("connection reset"),
+	}, context.Canceled)
+	sanJoined := SanitizeURLError(joinedErr)
+	if strings.Contains(sanJoined.Error(), "joinedsecret") || strings.Contains(sanJoined.Error(), "pass") {
+		t.Fatalf("SanitizeURLError leaked joined URL secret: %v", sanJoined)
+	}
+	if !errors.Is(sanJoined, context.Canceled) {
+		t.Fatalf("SanitizeURLError broke errors.Is on joined context.Canceled: %v", sanJoined)
 	}
 	malformedLocErr := &url.Error{
 		Op:  "Get",

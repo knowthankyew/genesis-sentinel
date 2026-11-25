@@ -106,7 +106,7 @@ func TestBuildTriagePromptSanitizesAndPreservesClosingFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTriagePromptChecked(MinPromptBytes) failed: %v", err)
 	}
-	if !strings.Contains(minPrompt, "\ntemplate=") || !strings.Contains(minPrompt, "\nsample=") || !strings.HasSuffix(minPrompt, "\nEND_UNTRUSTED_LOG_TELEMETRY") {
+	if !strings.Contains(minPrompt, "\ntemplate=GET /admin") || !strings.Contains(minPrompt, "\nsample=GET /admin/export") || !strings.HasSuffix(minPrompt, "\nEND_UNTRUSTED_LOG_TELEMETRY") {
 		t.Fatalf("MinPromptBytes prompt dropped event text or closing fence: %q", minPrompt)
 	}
 }
@@ -487,29 +487,28 @@ func TestClientRejectsExplicitEmptyAdapterAndTripsOnFlushDeadline(t *testing.T) 
 	if strings.Contains(redTok, "opaqueTok9999") {
 		t.Fatalf("redactErrSnippet leaked JSON token field: %q", redTok)
 	}
-	redEscKey := redactErrSnippet(`{"detail":"bad key \"quoted\"secret99"}`, `"quoted"secret99`)
+	redEscKey := redactErrSnippet(`{"detail":"bad key \"quoted\"<angle>secret99"}`, `"quoted"<angle>secret99`)
 	if strings.Contains(redEscKey, "secret99") {
-		t.Fatalf("redactErrSnippet leaked JSON-escaped API key: %q", redEscKey)
+		t.Fatalf("redactErrSnippet leaked JSON-escaped API key with angle brackets: %q", redEscKey)
 	}
 
-	// 4. Verify caller deadline propagates onto the outbound HTTP request context AND an
-	// already-expired context before dispatch does NOT trip the circuit breaker.
+	// 4. Verify caller deadline propagates deterministically onto the outbound HTTP request context
+	// (no short wall-clock sleep race) AND an already-expired context before dispatch keeps breaker closed.
 	var sawDeadline atomic.Bool
 	waitCtxRT := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if _, ok := req.Context().Deadline(); ok {
 			sawDeadline.Store(true)
 		}
-		<-req.Context().Done()
-		return nil, req.Context().Err()
+		return nil, context.DeadlineExceeded
 	})
 	cProp, err := NewClient(ClientOptions{BaseURL: "http://127.0.0.1:8000", Timeout: 5 * time.Second, Cooldown: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("NewClient prop: %v", err)
 	}
 	cProp.httpClient = &http.Client{Transport: waitCtxRT}
-	shortCtx, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancelShort()
-	if _, _, err := cProp.TriageWindow(shortCtx, PromptInput{Service: "api", SampleLine: "prop"}); err == nil {
+	propCtx, cancelProp := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelProp()
+	if _, _, err := cProp.TriageWindow(propCtx, PromptInput{Service: "api", SampleLine: "prop"}); err == nil {
 		t.Fatal("expected deadline error from context-observing transport")
 	}
 	if !sawDeadline.Load() || !cProp.Stats().CircuitOpen {

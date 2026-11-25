@@ -3,11 +3,13 @@ package feedback
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/emit"
@@ -57,7 +59,9 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 		"batch 1234 4111 1111 1111 1111",
 		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.sig1234567890",
 		"postgres://admin:p@ssword@db.internal:5432/app",
+		"postgres://admin:p;a,ss@db.internal:5432/app",
 		`password="unterminated_secret_val`,
+		`DB_PASSWORD="part1"'part2' nextarg`,
 		"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBALeakedTruncatedKey",
 	} {
 		if _, found := ScanForPII(sample); !found {
@@ -66,8 +70,8 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	}
 
 	// Verify boundary card redaction, sliding-window card following another number,
-	// connection URL credentials (with '@' inside password), short-claims JWT,
-	// unterminated quoted credentials, and truncated PEM blocks.
+	// connection URL credentials (with '@', ';', ',' inside password), short-claims JWT,
+	// prefixed keys (DB_PASSWORD), adjacent quoted sections, unterminated quotes, and truncated PEM blocks.
 	cardBoundary, _ := RedactText("card=4111 1111 1111 1111 2 attempts")
 	if cardBoundary != "card=[REDACTED_CARD] 2 attempts" {
 		t.Fatalf("unexpected card boundary redaction: got %q", cardBoundary)
@@ -76,12 +80,19 @@ func TestRedactTextAndScanForPII(t *testing.T) {
 	if cardSlide != "batch 1234 [REDACTED_CARD]" {
 		t.Fatalf("unexpected sliding card redaction: got %q", cardSlide)
 	}
-	urlCred, _ := RedactText("connect postgres://admin:p@ssword@db.internal:5432/app ok")
-	if strings.Contains(urlCred, "p@ssword") || strings.Contains(urlCred, "admin:") || !strings.Contains(urlCred, "postgres://[REDACTED_SECRET]@db.internal:5432/app") {
+	urlCred, _ := RedactText("connect postgres://admin:p;a,ss@db.internal:5432/app, next")
+	if strings.Contains(urlCred, "p;a,ss") || strings.Contains(urlCred, "admin:") || !strings.Contains(urlCred, "postgres://[REDACTED_SECRET]@db.internal:5432/app, next") {
 		t.Fatalf("unexpected URL credential redaction: got %q", urlCred)
 	}
 	if cat, found := ScanForPII(urlCred); found {
 		t.Fatalf("scrubbed URL credential failed re-scan (%s): %q", cat, urlCred)
+	}
+	adjCred, _ := RedactText(`DB_PASSWORD="part1"'part2' nextarg=keep`)
+	if strings.Contains(adjCred, "part1") || strings.Contains(adjCred, "part2") || !strings.Contains(adjCred, "nextarg=keep") {
+		t.Fatalf("unexpected prefixed/adjacent quoted credential redaction: got %q", adjCred)
+	}
+	if cat, found := ScanForPII(adjCred); found {
+		t.Fatalf("scrubbed prefixed credential failed re-scan (%s): %q", cat, adjCred)
 	}
 	shortJWT, _ := RedactText("tok eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.sig1234567890")
 	if strings.Contains(shortJWT, "sig1234567890") {
@@ -346,6 +357,7 @@ func TestStoreAppendExportAndValidateJSONL(t *testing.T) {
 		"extra-field.jsonl":  `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","extra":"harmless metadata"}` + "\n",
 		"dup-key.jsonl":      `{"prompt":"first clean prompt","prompt":"second clean prompt","completion":"[BENIGN-NOISE]"}` + "\n",
 		"null-prompt.jsonl":  `{"prompt":null,"completion":"[BENIGN-NOISE]"}` + "\n",
+		"null-weight.jsonl":  `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]","weight":null}` + "\n",
 		"nbsp-prefix.jsonl":  "\u00a0" + `{"prompt":"valid prompt text","completion":"[BENIGN-NOISE]"}` + "\n",
 		"invalid-utf8.jsonl": "{\"prompt\":\"bad \xff utf8\",\"completion\":\"[BENIGN-NOISE]\"}\n",
 		"email-pii.jsonl":    `{"prompt":"contact alice@example.com for alert","completion":"[BENIGN-NOISE]"}` + "\n",
@@ -627,5 +639,94 @@ func TestAlertJournalRecordFindCapRedactionAndSafety(t *testing.T) {
 	if _, found, err := jBig.FindByID("sentinel-small"); err != nil || !found {
 		t.Fatalf("expected small neighbor to remain readable: found=%v err=%v", found, err)
 	}
+
+	// Verify UpdateIfPresent updates existing alerts in-place AND never re-inserts/evicts
+	// newer alerts when an older alert has already aged out of the bounded journal ring.
+	jRing := NewAlertJournal(t.TempDir())
+	jRing.maxRecords = 1
+	if err := jRing.Record(emit.Alert{AlertID: "alert-A", Severity: "LOW", Tier: "tier0"}); err != nil {
+		t.Fatalf("Record A: %v", err)
+	}
+	if err := jRing.Record(emit.Alert{AlertID: "alert-B", Severity: "HIGH", Tier: "tier0"}); err != nil {
+		t.Fatalf("Record B: %v", err)
+	}
+	// alert-A aged out; delayed async Tier 2 update for alert-A must NOT evict alert-B!
+	if err := jRing.UpdateIfPresent(emit.Alert{AlertID: "alert-A", Severity: "LOW", Tier: "tier0+tier2"}); err != nil {
+		t.Fatalf("UpdateIfPresent aged-out A: %v", err)
+	}
+	if _, foundB, err := jRing.FindByID("alert-B"); err != nil || !foundB {
+		t.Fatalf("delayed UpdateIfPresent for aged-out A evicted B: found=%v err=%v", foundB, err)
+	}
+	if err := jRing.UpdateIfPresent(emit.Alert{AlertID: "alert-B", Severity: "HIGH", Tier: "tier0+tier2", TriageClass: "AUTH-BRUTEFORCE"}); err != nil {
+		t.Fatalf("UpdateIfPresent B: %v", err)
+	}
+	gotB, foundB, err := jRing.FindByID("alert-B")
+	if err != nil || !foundB || gotB.Tier != "tier0+tier2" || gotB.TriageClass != "AUTH-BRUTEFORCE" {
+		t.Fatalf("expected UpdateIfPresent to upgrade alert-B in-place, got=%+v found=%v err=%v", gotB, foundB, err)
+	}
 	_ = config.DefaultMaxTrainingFileBytes
+}
+
+func TestHelperProcessDirLock(t *testing.T) {
+	dir := os.Getenv("SENTINEL_TEST_LOCK_HELPER_DIR")
+	if dir == "" {
+		return
+	}
+	unlock, err := AcquireDirLock(dir)
+	if err != nil {
+		t.Fatalf("helper AcquireDirLock: %v", err)
+	}
+	defer unlock()
+	marker := filepath.Join(dir, "child-acquired.marker")
+	if err := os.WriteFile(marker, []byte("ok"), 0600); err != nil {
+		t.Fatalf("helper write marker: %v", err)
+	}
+}
+
+func TestAcquireDirLockSerializesSeparateOSProcesses(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := AcquireDirLock(dir)
+	if err != nil {
+		t.Fatalf("parent AcquireDirLock: %v", err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			unlock()
+		}
+	}()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessDirLock$")
+	cmd.Env = append(os.Environ(), "SENTINEL_TEST_LOCK_HELPER_DIR="+dir)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start lock helper process: %v", err)
+	}
+	doneCh := make(chan error, 1)
+	go func() { doneCh <- cmd.Wait() }()
+
+	// While parent holds the OS directory lock, child process MUST wait and not acquire it.
+	select {
+	case err := <-doneCh:
+		t.Fatalf("child OS process bypassed held directory lock (err=%v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "child-acquired.marker")); !os.IsNotExist(statErr) {
+		t.Fatal("child process wrote marker while parent still held OS directory lock")
+	}
+
+	unlock()
+	released = true
+
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Fatalf("child lock helper failed after parent release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("child process did not acquire directory lock after parent released it")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "child-acquired.marker")); statErr != nil {
+		t.Fatalf("child process did not create marker after acquiring lock: %v", statErr)
+	}
 }

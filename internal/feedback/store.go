@@ -718,11 +718,12 @@ func parseStrictFTaaSRecord(line string) (string, string, error) {
 			}
 			hasComp = true
 		case "weight":
-			if strings.TrimSpace(string(raw)) != "null" {
-				var w float64
-				if err := json.Unmarshal(raw, &w); err != nil || math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 {
-					return "", "", fmt.Errorf("has invalid weight")
-				}
+			var w float64
+			if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+				return "", "", fmt.Errorf("has invalid null weight")
+			}
+			if err := json.Unmarshal(raw, &w); err != nil || math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 {
+				return "", "", fmt.Errorf("has invalid weight")
 			}
 		default:
 			return "", "", fmt.Errorf("contains unexpected field %q (only prompt, completion, and optional weight are permitted)", key)
@@ -753,9 +754,8 @@ func (s *Store) isExistingCuratedQueue(outPath string) bool {
 	if strings.TrimSpace(s.dir) == "" {
 		return false
 	}
-	dirCanon := canonicalPathForCompare(s.dir)
-	outParentCanon := canonicalPathForCompare(filepath.Dir(outPath))
-	if dirCanon != outParentCanon {
+	outParent := filepath.Dir(outPath)
+	if !sameTargetPath(s.dir, outParent) {
 		return false
 	}
 	// Match case-insensitively as well so case-insensitive filesystems (Windows/macOS)

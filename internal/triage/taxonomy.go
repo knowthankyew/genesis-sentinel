@@ -197,7 +197,8 @@ func FormatCanonicalCompletion(class, severity, mitre, explanation string) strin
 			mitre = "NONE"
 		}
 	}
-	cleanExp := sanitizeSingleLine(explanation, MaxExplanationBytes)
+	cleanExp, _ := security.SanitizeUntrustedLogText(explanation, MaxExplanationBytes*3+64)
+	cleanExp = sanitizeSingleLine(cleanExp, MaxExplanationBytes)
 	if cleanExp == "" {
 		cleanExp = "Operator-verified classification for host log pattern."
 	}

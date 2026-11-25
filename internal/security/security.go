@@ -339,8 +339,9 @@ func SanitizeUntrustedLogText(raw string, maxBytes int) (string, []string) {
 }
 
 type sanitizedCauseError struct {
-	msg  string
-	orig error
+	msg   string
+	orig  error
+	extra error
 }
 
 func (e *sanitizedCauseError) Error() string {
@@ -349,6 +350,10 @@ func (e *sanitizedCauseError) Error() string {
 
 func (e *sanitizedCauseError) Unwrap() error {
 	return e.orig
+}
+
+func (e *sanitizedCauseError) Is(target error) bool {
+	return e.extra != nil && errors.Is(e.extra, target)
 }
 
 func (e *sanitizedCauseError) Timeout() bool {
@@ -363,8 +368,8 @@ func (e *sanitizedCauseError) Temporary() bool {
 
 // SanitizeURLError strips userinfo, query parameters, and fragments from wrapped *url.Error
 // transport errors — including any unsanitized redirect URLs embedded inside url.Error.Err —
-// while returning a *url.Error so both errors.As(err, &urlErr) and errors.Is(err, context.Canceled)
-// continue to work cleanly.
+// while returning a *url.Error so errors.As(err, &urlErr), urlErr.Timeout(), and errors.Is
+// (including joined errors outside url.Error.Err) continue to work cleanly.
 func SanitizeURLError(err error) error {
 	if err == nil {
 		return nil
@@ -378,12 +383,17 @@ func SanitizeURLError(err error) error {
 	if ue.Err != nil {
 		cleanCause = sanitizeErrMessage(ue.Err.Error())
 	}
+	var extra error
+	if err != error(ue) {
+		extra = err
+	}
 	return &url.Error{
 		Op:  ue.Op,
 		URL: cleanURL,
 		Err: &sanitizedCauseError{
-			msg:  cleanCause,
-			orig: ue.Err,
+			msg:   cleanCause,
+			orig:  ue.Err,
+			extra: extra,
 		},
 	}
 }

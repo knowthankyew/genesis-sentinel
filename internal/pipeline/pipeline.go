@@ -179,6 +179,7 @@ type Pipeline struct {
 	asyncDoneCh          chan struct{}
 	activeAsyncCancel    context.CancelFunc
 	beforeAsyncPublishFn func() // optional test hook invoked right before publish check
+	afterAsyncTaskFn     func() // optional test hook invoked right after task completes
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
@@ -457,6 +458,9 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 		p.activeAsyncCancel = nil
 		p.asyncMu.Unlock()
 		cancelReq()
+		if p.afterAsyncTaskFn != nil {
+			p.afterAsyncTaskFn()
+		}
 	}()
 
 	enriched := task.alert
@@ -488,7 +492,9 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 	}
 	p.triageUpdatesEmitted.Add(1)
 	if p.alertJournal != nil {
-		if err := p.alertJournal.Record(enriched); err != nil {
+		// Use UpdateIfPresent so a delayed async Tier 2 result updates its existing alert
+		// in-place and never evicts newer alerts if the original record aged out or was burned.
+		if err := p.alertJournal.UpdateIfPresent(enriched); err != nil {
 			p.journalErrors.Add(1)
 		}
 	}
@@ -890,11 +896,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 		cleanService := bucket.displayService
 		cleanLevel := bucket.displayLevel
-		cleanTemplate, _ := security.SanitizeUntrustedLogText(tmplStr, p.cfg.MaxPromptByte)
+		cleanTemplate := sanitizeAndRedactField(tmplStr, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
 		if p.cfg.RequireRedaction {
 			cleanService, _ = feedback.RedactText(cleanService)
 			cleanLevel, _ = feedback.RedactText(cleanLevel)
-			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
 			bestSample, _ = feedback.RedactText(bestSample)
 		}
 
@@ -1004,16 +1009,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		w := sw.win
-		cleanService, svcSigs := security.SanitizeUntrustedLogText(w.Service, 128)
-		cleanLevel, lvlSigs := security.SanitizeUntrustedLogText(w.Level, 64)
-		cleanTemplate, _ := security.SanitizeUntrustedLogText(w.Template, p.cfg.MaxPromptByte)
-		cleanSample, msgSigs := security.SanitizeUntrustedLogText(w.SampleLine, p.cfg.MaxPromptByte)
-		if p.cfg.RequireRedaction {
-			cleanService, _ = feedback.RedactText(cleanService)
-			cleanLevel, _ = feedback.RedactText(cleanLevel)
-			cleanTemplate, _ = feedback.RedactText(cleanTemplate)
-			cleanSample, _ = feedback.RedactText(cleanSample)
-		}
+		cleanService, svcSigs := sanitizeAndRedactWithSignals(w.Service, 128, p.cfg.RequireRedaction)
+		cleanLevel, lvlSigs := sanitizeAndRedactWithSignals(w.Level, 64, p.cfg.RequireRedaction)
+		cleanTemplate := sanitizeAndRedactField(w.Template, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
+		cleanSample, msgSigs := sanitizeAndRedactWithSignals(w.SampleLine, p.cfg.MaxPromptByte, p.cfg.RequireRedaction)
 
 		var injSignals []string
 		seenSig := make(map[string]struct{})
@@ -1399,11 +1398,17 @@ func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
 		p.activeAsyncCancel()
 	}
 	p.asyncMu.Unlock()
+	respDataDir := p.cfg.DataDir
+	if strings.TrimSpace(respDataDir) != "" {
+		if absDir, absErr := filepath.Abs(respDataDir); absErr == nil {
+			respDataDir = absDir
+		}
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "activated",
 		"base_model":     state.BaseModel,
 		"adapter_path":   state.AdapterPath,
-		"data_dir":       p.cfg.DataDir,
+		"data_dir":       respDataDir,
 		"triage_enabled": p.triageClient != nil,
 	})
 }
@@ -1592,15 +1597,16 @@ func BurnLocalStateWithFeedbackDir(dataDir, feedbackDir string) (BurnReport, err
 
 	// 3. If a separate custom feedbackDir was configured outside dataDir/feedback, purge ONLY
 	// Sentinel-named feedback files there via an os.Root handle and shared directory lock.
-	// Strip only redundant trailing path separators (so Linux Lstat never follows a symlink
-	// ending in '/') while preserving exact directory names (including trailing spaces).
+	// Normalize with filepath.Clean (matching Store.PathFor) and strip redundant trailing
+	// OS path separators (so Linux Lstat never follows a symlink ending in '/') while
+	// preserving exact directory names (including trailing spaces and Unix backslashes).
 	if strings.TrimSpace(feedbackDir) != "" {
-		checkedFeedbackDir := stripTrailingPathSeparators(feedbackDir)
+		checkedFeedbackDir := filepath.Clean(stripTrailingPathSeparators(feedbackDir))
 		cleanDefault := ""
 		if strings.TrimSpace(dataDir) != "" {
 			cleanDefault = filepath.Clean(filepath.Join(dataDir, "feedback"))
 		}
-		if filepath.Clean(checkedFeedbackDir) != cleanDefault {
+		if checkedFeedbackDir != cleanDefault {
 			customInfo, lstatErr := os.Lstat(checkedFeedbackDir)
 			if lstatErr == nil {
 				if customInfo.Mode()&os.ModeSymlink != 0 {
@@ -1680,10 +1686,34 @@ func isOwnedTopLevelFile(name string) bool {
 func stripTrailingPathSeparators(p string) string {
 	volLen := len(filepath.VolumeName(p))
 	trimmed := p
-	for len(trimmed) > volLen+1 && (trimmed[len(trimmed)-1] == '/' || trimmed[len(trimmed)-1] == '\\') {
+	for len(trimmed) > volLen+1 && os.IsPathSeparator(trimmed[len(trimmed)-1]) {
 		trimmed = trimmed[:len(trimmed)-1]
 	}
 	return trimmed
+}
+
+func sanitizeAndRedactField(raw string, maxBytes int, requireRedaction bool) string {
+	s, _ := sanitizeAndRedactWithSignals(raw, maxBytes, requireRedaction)
+	return s
+}
+
+// sanitizeAndRedactWithSignals neutralizes chat delimiters and scrubs credentials/URL userinfo
+// BEFORE enforcing maxBytes truncation so a secret spanning the truncation boundary (such as a
+// long URL userinfo whose '@' sits past maxBytes) cannot leave an unmasked prefix behind.
+func sanitizeAndRedactWithSignals(raw string, maxBytes int, requireRedaction bool) (string, []string) {
+	if requireRedaction {
+		fullCap := len(raw)*3 + 64
+		if maxBytes > fullCap {
+			fullCap = maxBytes
+		}
+		sanitized, sigs := security.SanitizeUntrustedLogText(raw, fullCap)
+		redacted, _ := feedback.RedactText(sanitized)
+		if maxBytes > 0 && len(redacted) > maxBytes {
+			redacted, _ = security.SanitizeUntrustedLogText(redacted, maxBytes)
+		}
+		return redacted, sigs
+	}
+	return security.SanitizeUntrustedLogText(raw, maxBytes)
 }
 
 // normalizeAlertTimestamp enforces the Unix-seconds alert timestamp contract expected by

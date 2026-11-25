@@ -414,22 +414,25 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 	return enc.Encode(state)
 }
 
-func sameCleanDir(a, b string) bool {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
+func sameCleanDir(daemonDir, localDir string) bool {
+	if strings.TrimSpace(daemonDir) == "" || strings.TrimSpace(localDir) == "" {
 		return false
 	}
-	absA, errA := filepath.Abs(a)
-	absB, errB := filepath.Abs(b)
-	if errA == nil && errB == nil {
-		if evalA, err := filepath.EvalSymlinks(absA); err == nil {
-			absA = evalA
-		}
-		if evalB, err := filepath.EvalSymlinks(absB); err == nil {
-			absB = evalB
-		}
-		return filepath.Clean(absA) == filepath.Clean(absB)
+	// Require daemonDir to be absolute so a relative path reported by a daemon running in a
+	// different working directory is never resolved against this CLI's working directory.
+	if !filepath.IsAbs(daemonDir) {
+		return false
 	}
-	return filepath.Clean(a) == filepath.Clean(b)
+	absA := filepath.Clean(daemonDir)
+	absB, errB := filepath.Abs(localDir)
+	if errB != nil {
+		return false
+	}
+	if evalA, err := filepath.EvalSymlinks(absA); err == nil {
+		absA = evalA
+	}
+	if evalB, err := filepath.EvalSymlinks(absB); err == nil {
+		absB = evalB
+	}
+	return filepath.Clean(absA) == filepath.Clean(absB)
 }
