@@ -681,11 +681,20 @@ class TestClaimsLinter(unittest.TestCase):
             ("orphan <!-- /claim --> here", "orphan closing"),
             ("<!-- claim:sentinel_version -->0.5.0<!-- /claim_term -->", "mismatched closing"),
             ("<!-- BEGIN_EMPIRICAL -->\n| A | B | C |\n", "unbalanced empirical delimiters"),
+            ("`v<!-- claim:sentinel_version -->0.5.0<!-- /claim -->`", "inside inline backtick code span"),
         ]
         for content, expected_sub in bad_cases:
             ok, errs = sync_docs.lint_claim_markers_and_regions(content, "docs/DECISIONS.md", registry_path=reg_path)
             self.assertFalse(ok, f"Expected failure for {content!r}")
             self.assertTrue(any(expected_sub in e for e in errs), (content, errs))
+
+        # Backticks INSIDE a claim value (outside-comment, inside-code) must pass cleanly!
+        ok_inner_bt, errs_inner_bt = sync_docs.lint_claim_markers_and_regions(
+            "Version <!-- claim:sentinel_version -->`v0.5.0-phase4`<!-- /claim --> is active.",
+            "README.md",
+            registry_path=reg_path,
+        )
+        self.assertTrue(ok_inner_bt, errs_inner_bt)
 
     def test_expanded_personal_host_paths_and_no_prohibited_word_bypass(self):
         """Verify /home/ and Windows C:\\Users\\ leaks are blocked and meta-phrases cannot bypass prohibited words."""

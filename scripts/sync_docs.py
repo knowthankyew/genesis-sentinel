@@ -1411,6 +1411,40 @@ def _strip_fenced_code_blocks_preserve_lines(content: str) -> str:
     return "\n".join(out)
 
 
+def _find_inline_code_spans(line: str) -> list[str]:
+    """Extract CommonMark §6.1 inline backtick code spans from a single line."""
+    spans: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] == "`":
+            j = i
+            while j < n and line[j] == "`":
+                j += 1
+            ticks = j - i
+            k = j
+            found = -1
+            while k < n:
+                if line[k] == "`":
+                    m = k
+                    while m < n and line[m] == "`":
+                        m += 1
+                    if m - k == ticks:
+                        found = k
+                        break
+                    k = m
+                else:
+                    k += 1
+            if found != -1:
+                spans.append(line[j:found])
+                i = found + ticks
+            else:
+                i = j
+        else:
+            i += 1
+    return spans
+
+
 def lint_claim_markers_and_regions(
     content: str,
     doc_name: str = "document",
@@ -1419,7 +1453,8 @@ def lint_claim_markers_and_regions(
     """
     Validate structural integrity of `<!-- claim:... -->`, `<!-- claim_term:... -->`, and
     `<!-- BEGIN_EMPIRICAL -->` markers across ANY scanned Markdown file (even docs outside `used_in`).
-    Catches unknown IDs, unclosed HTML comments, mismatched/nested closing tags, and ungoverned empirical blocks.
+    Catches unknown IDs, unclosed HTML comments, mismatched/nested closing tags, inline-backtick-wrapped
+    markers that render visibly on GitHub, and ungoverned empirical blocks.
     """
     errors: list[str] = []
     if registry_path is None:
@@ -1437,6 +1472,17 @@ def lint_claim_markers_and_regions(
             return False, errors
 
     stripped = _strip_fenced_code_blocks_preserve_lines(content)
+
+    # 0. Reject claim markers wrapped inside inline backtick code spans (rendered visibly as literal text in GFM)
+    inline_claim_re = re.compile(r"<!--\s*/?claim(?:_term)?\b")
+    for line_no, raw_line in enumerate(stripped.splitlines(), 1):
+        if "`" in raw_line and "<!--" in raw_line:
+            for span in _find_inline_code_spans(raw_line):
+                if inline_claim_re.search(span):
+                    errors.append(
+                        f"Marker lint failure in {doc_name}:{line_no}: claim marker inside inline backtick code "
+                        f"span renders visibly on GitHub (keep '<!-- claim:... -->' outside backticks): `{span}`"
+                    )
 
     # 1. Balanced BEGIN_EMPIRICAL / END_EMPIRICAL delimiters
     for begin_marker, end_marker in EMPIRICAL_BLOCK_DELIMITERS:

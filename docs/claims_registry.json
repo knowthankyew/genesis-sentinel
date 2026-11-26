@@ -24,7 +24,7 @@
     "sentinel_version": {
       "source_artifact": "internal/cli/cli.go",
       "go_const": "Version",
-      "format_rule": "{value}",
+      "format_rule": "`v{value}`",
       "used_in": ["README.md"],
       "description": "Current Genesis Sentinel release version declared in CLI entrypoint"
     },
@@ -143,21 +143,21 @@
     "default_base_model": {
       "source_artifact": "internal/model/types.go",
       "go_const": "ModelSmolLM2135MInstruct",
-      "format_rule": "{value}",
+      "format_rule": "`{value}`",
       "used_in": ["README.md", "NOTICE.md", "docs/ARCHITECTURE.md"],
       "description": "Default Phase 0-4 SmolLM2-Instruct base model identifier"
     },
     "stepup_base_model": {
       "source_artifact": "internal/model/types.go",
       "go_const": "ModelSmolLM2360MInstruct",
-      "format_rule": "{value}",
+      "format_rule": "`{value}`",
       "used_in": ["README.md", "NOTICE.md", "docs/ARCHITECTURE.md"],
       "description": "Optional Phase 0-4 SmolLM2-Instruct step-up base model identifier"
     },
     "phase5_base_model": {
       "source_artifact": "internal/model/types.go",
       "go_const": "ModelGemma22BIT",
-      "format_rule": "{value}",
+      "format_rule": "`{value}`",
       "used_in": ["NOTICE.md", "docs/ARCHITECTURE.md"],
       "description": "Phase 5 reasoning-tier base model identifier"
     },
