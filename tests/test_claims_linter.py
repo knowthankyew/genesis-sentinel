@@ -819,15 +819,23 @@ class TestClaimsLinter(unittest.TestCase):
             audit_mod.audit_go_network_egress_boundary(errs_ok, repo_root=tmp_root)
             self.assertEqual(errs_ok, [])
 
-            # Raw net.DialTimeout, &http.Client{}, or new(http.Client) outside internal/security must fail closed!
+            # Raw net.DialTimeout, &http.Client{}, new(http.Client), and zero-value var declarations outside internal/security must fail closed!
             (tmp_root / "internal" / "emit" / "bypass.go").write_text(
                 'package emit\nimport ("net"; "net/http")\n'
-                'func bad() { _, _ = net.DialTimeout("tcp", "localhost:9000", 0); _ = &http.Client{}; _ = new(http.Client) }\n',
+                'func bad() {\n'
+                '    var d net.Dialer\n'
+                '    var c http.Client\n'
+                '    var tr http.Transport\n'
+                '    _, _ = net.DialTimeout("tcp", "localhost:9000", 0)\n'
+                '    _ = &http.Client{}\n'
+                '    _ = new(http.Client)\n'
+                '    _, _, _ = d, c, tr\n'
+                '}\n',
                 encoding="utf-8",
             )
             errs_bad: list[str] = []
             audit_mod.audit_go_network_egress_boundary(errs_bad, repo_root=tmp_root)
-            self.assertEqual(len(errs_bad), 3, errs_bad)
+            self.assertEqual(len(errs_bad), 6, errs_bad)
             self.assertTrue(all("bypass.go" in e for e in errs_bad), errs_bad)
 
             # Stale (>180 days) landscape-meta must fail closed!
@@ -842,6 +850,143 @@ class TestClaimsLinter(unittest.TestCase):
             errs_stale: list[str] = []
             audit_mod.audit_landscape_freshness(errs_stale, repo_root=tmp_root)
             self.assertTrue(any("STALE" in e for e in errs_stale), errs_stale)
+
+            # Inflated (>180 days) or non-integer review-cadence-days must fail closed!
+            for bad_cadence, expected_sub in (("99999", "between 1 and 180"), ("abc", "not a valid integer")):
+                (tmp_root / "docs" / "ALTERNATIVES.md").write_text(
+                    "<!-- landscape-meta\n"
+                    "last-reviewed: 2026-11-25\n"
+                    f"review-cadence-days: {bad_cadence}\n"
+                    "reviewed-versions: [fail2ban@v1.1, crowdsec@v1.6, falco@v0.39]\n"
+                    "-->\n# Alternatives\n",
+                    encoding="utf-8",
+                )
+                errs_cad: list[str] = []
+                audit_mod.audit_landscape_freshness(errs_cad, repo_root=tmp_root)
+                self.assertTrue(any(expected_sub in e for e in errs_cad), (bad_cadence, errs_cad))
+
+    def test_hardened_json_overflow_rerun_filenames_recomputed_gates_and_gfm_edges(self):
+        """Verify 1e309 float overflow, -rN rerun filenames, recomputed P99/slowdown, HTML Types 3/5, and empirical header bypasses."""
+        # 1. JSON float overflow (1e309 -> inf) must fail closed in _loads_strict_json!
+        with self.assertRaises(ValueError) as ctx_inf:
+            sync_docs._loads_strict_json('{"val": 1e309}')
+        self.assertIn("Non-finite JSON floating-point value", str(ctx_inf.exception))
+
+        # 2. Data row containing "Measured Result" inside BEGIN_EMPIRICAL must NOT bypass unmanaged-digit / status checks!
+        bypass_emp = (
+            "<!-- BEGIN_EMPIRICAL -->\n"
+            "| Gate | Target | Measured Result | Status |\n"
+            "| :--- | :--- | :--- | :--- |\n"
+            "| **Fake Row** | 123 | Measured Result 999 | PASSED |\n"
+            "<!-- END_EMPIRICAL -->\n"
+        )
+        ok_emp, errs_emp = sync_docs.check_empirical_regions(bypass_emp, "bypass.md")
+        self.assertFalse(ok_emp)
+        self.assertTrue(any("status cell" in e for e in errs_emp), errs_emp)
+        self.assertTrue(any("unmanaged digits" in e for e in errs_emp), errs_emp)
+
+        # 3. CommonMark §4.6 Type 3 (<? ... ?>) and Type 5 (<![CDATA[ ... ]]>) hide tables; 1-cell body row keeps scanning!
+        md_special = (
+            "<?\n| A | B |\n|---|---|\n| **HiddenPI** | 1 |\n?>\n\n"
+            "<![CDATA[\n| A | B |\n|---|---|\n| **HiddenCDATA** | 2 |\n]]>\n\n"
+            "| Metric | Value |\n"
+            "| :--- | :--- |\n"
+            "| **RowOne** | 10 |\n"
+            "| NotesOnly |\n"
+            "| **RowTwo** | 20 |\n"
+        )
+        rows, labels, dups = sync_docs._extract_published_markdown_table_rows(md_special)
+        self.assertEqual(dups, [])
+        self.assertNotIn("**HiddenPI**", labels)
+        self.assertNotIn("**HiddenCDATA**", labels)
+        self.assertIn("**RowOne**", labels)
+        self.assertIn("**RowTwo**", labels)
+        self.assertIn("| **RowTwo** | 20 |", rows)
+
+        # 4. Same-day rerun -r2.md accepted; invalid -r1.md rejected; recomputed P99 boundary gate uses calc_p99!
+        bench_json = DOCS_DIR / "benchmarks" / "empirical_benchmarks.json"
+        base_bench = json.loads(bench_json.read_text(encoding="utf-8"))
+        orig_md_rel = base_bench["metadata"]["report_markdown"]
+        orig_md_text = (REPO_ROOT / orig_md_rel).read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "docs" / "benchmarks").mkdir(parents=True)
+
+            # 4a. Valid -r2.md suffix must pass
+            r2_rel = orig_md_rel[:-3] + "-r2.md"
+            (tmp_root / r2_rel).write_text(orig_md_text, encoding="utf-8")
+            r2_bench = json.loads(json.dumps(base_bench))
+            r2_bench["metadata"]["report_markdown"] = r2_rel
+            p_r2 = tmp_root / "r2_bench.json"
+            p_r2.write_text(json.dumps(r2_bench), encoding="utf-8")
+            ok_r2, errs_r2 = sync_docs.independent_recompute_metrics(p_r2, repo_root=tmp_root)
+            self.assertTrue(ok_r2, errs_r2)
+
+            # 4b. Invalid -r1.md suffix must fail closed
+            r1_rel = orig_md_rel[:-3] + "-r1.md"
+            (tmp_root / r1_rel).write_text(orig_md_text, encoding="utf-8")
+            r1_bench = json.loads(json.dumps(base_bench))
+            r1_bench["metadata"]["report_markdown"] = r1_rel
+            p_r1 = tmp_root / "r1_bench.json"
+            p_r1.write_text(json.dumps(r1_bench), encoding="utf-8")
+            ok_r1, errs_r1 = sync_docs.independent_recompute_metrics(p_r1, repo_root=tmp_root)
+            self.assertFalse(ok_r1)
+            self.assertTrue(any("filename" in e for e in errs_r1), errs_r1)
+
+            # 4c. Tier 1 P99 boundary: raw samples -> calc_p99=10.000 against target 10.0; stored 9.9996 must NOT pass!
+            bnd_t1 = json.loads(json.dumps(base_bench))
+            bnd_t1["acceptance_gates"]["tier1_p99_target_us"] = 10.0
+            bnd_t1["tier1_surprisal"]["evaluations"] = 4
+            bnd_t1["tier1_surprisal"]["raw_samples_us"] = [5.0, 6.0, 9.0, 10.0]
+            bnd_t1["tier1_surprisal"]["p50_us"] = 6.0
+            bnd_t1["tier1_surprisal"]["p90_us"] = 10.0
+            bnd_t1["tier1_surprisal"]["p99_us"] = 9.9996
+            bnd_t1["tier1_surprisal"]["max_us"] = 10.0
+            bnd_t1["tier1_surprisal"]["p99_gate_status"] = "PASSED"
+            p_t1b = tmp_root / "bnd_t1.json"
+            p_t1b.write_text(json.dumps(bnd_t1), encoding="utf-8")
+            ok_t1b, errs_t1b = sync_docs.independent_recompute_metrics(p_t1b, repo_root=tmp_root)
+            self.assertFalse(ok_t1b)
+            self.assertTrue(any("p99_gate_status mismatch" in e for e in errs_t1b), errs_t1b)
+
+            # 4d. Embedding comparison slowdown must derive from raw-sample recomputed P50, not unrounded stored float!
+            emb_bnd = {
+                "metadata": {"date": "2026-11-25T00:00:00Z", "model_id": "test", "offline_mode": True},
+                "dataset": {
+                    "eval_total_windows": 4,
+                    "eval_benign_windows": 2,
+                    "eval_structural_attack_windows": 1,
+                    "eval_disguised_semantic_windows": 1,
+                },
+                "pure_laplace_lk": {
+                    "tp": 1, "fp": 0, "fn": 1, "tn": 2,
+                    "structural_tp": 1, "disguised_semantic_tp": 0,
+                    "precision": 1.0, "recall": 0.5, "f1": 0.6667,
+                    "structural_recall": 1.0, "disguised_semantic_recall": 0.0,
+                    "latency_p50_ms": 0.020049, "latency_p99_ms": 0.04,
+                    "raw_samples_ms": [0.01, 0.02, 0.03, 0.04],
+                },
+                "hybrid_laplace_lk_minilm": {
+                    "tp": 2, "fp": 0, "fn": 0, "tn": 2,
+                    "structural_tp": 1, "disguised_semantic_tp": 1,
+                    "precision": 1.0, "recall": 1.0, "f1": 1.0,
+                    "structural_recall": 1.0, "disguised_semantic_recall": 1.0,
+                    "latency_p50_ms": 6.0, "latency_p99_ms": 8.0,
+                    "raw_samples_ms": [5.0, 6.0, 7.0, 8.0],
+                },
+                "comparison": {
+                    "f1_delta": 0.3333,
+                    "fp_delta": 0,
+                    "disguised_semantic_recall_delta": 1.0,
+                    "p50_latency_slowdown_x": 299.3,
+                },
+            }
+            p_eb = tmp_root / "emb_bnd.json"
+            p_eb.write_text(json.dumps(emb_bnd), encoding="utf-8")
+            ok_eb, errs_eb = sync_docs.independent_recompute_embedding_comparison(p_eb)
+            self.assertFalse(ok_eb)
+            self.assertTrue(any("p50_latency_slowdown_x mismatch" in e for e in errs_eb), errs_eb)
 
 
 if __name__ == "__main__":

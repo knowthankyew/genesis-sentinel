@@ -19,8 +19,10 @@ import json
 import math
 import os
 import platform
+import re
 import resource
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -459,11 +461,32 @@ def main() -> int:
     }
 
     encoded = json.dumps(result, indent=2, allow_nan=False) + "\n"
-    if "/Users/" in encoded or "/home/" in encoded:
+    if re.search(r"(?:/Users/|/home/|[A-Za-z]:(?:\\|/)[Uu]sers(?:\\|/))", encoded):
         raise RuntimeError("Refusing to write embedding comparison JSON containing personal host path")
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    args.out_json.write_text(encoded, encoding="utf-8")
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(args.out_json.parent),
+            prefix=f".{args.out_json.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tf:
+            tmp_path = Path(tf.name)
+            tf.write(encoded)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.replace(tmp_path, args.out_json)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     print(f"Wrote {args.out_json}")
     print(f"Pure Laplace-LK:       F1={lk_metrics['f1']:.4f} (struct={lk_metrics['structural_recall']:.4f}, disguised={lk_metrics['disguised_semantic_recall']:.4f}) P50={lk_p50:.4f}ms")
     print(f"Hybrid + MiniLM-L6-v2: F1={hyb_metrics['f1']:.4f} (struct={hyb_metrics['structural_recall']:.4f}, disguised={hyb_metrics['disguised_semantic_recall']:.4f}) P50={hyb_p50:.4f}ms")

@@ -60,7 +60,7 @@
       "source_artifact": "internal/config/config.go",
       "go_const": "DefaultMaxMemMB",
       "format_rule": "{value} MB",
-      "used_in": ["docs/ARCHITECTURE.md"],
+      "used_in": ["docs/ARCHITECTURE.md", "docs/ALTERNATIVES.md"],
       "description": "Default Sentinel Go runtime memory budget ceiling in megabytes"
     },
     "default_window_sec": {

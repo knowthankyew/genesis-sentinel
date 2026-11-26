@@ -38,9 +38,8 @@ REQUIRED_LANDSCAPE_DOC = "docs/ALTERNATIVES.md"
 
 RAW_GO_NETWORK_RE = re.compile(
     r"\bnet\.Dial(?:Timeout|TCP|UDP|IP|Unix)?\b"
-    r"|\bnet\.Dialer\s*\{"
-    r"|\bhttp\.(?:Client|Transport)\s*\{"
-    r"|\bnew\s*\(\s*(?:net\.Dialer|http\.(?:Client|Transport))\s*\)"
+    r"|(?<!\*)\bnet\.Dialer\b"
+    r"|(?<!\*)\bhttp\.(?:Client|Transport)\b"
     r"|\bhttp\.Default(?:Client|Transport)\b"
     r"|\bhttp\.(?:Get|Head|Post|PostForm)\s*\("
 )
@@ -249,10 +248,19 @@ def audit_landscape_freshness(errors: list[str], repo_root: Path = REPO_ROOT) ->
         errors.append(f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): last-reviewed '{raw_date}' is not an ISO date (YYYY-MM-DD)")
         return
 
+    raw_cadence = meta.get("review-cadence-days", "180")
     try:
-        cadence_days = int(meta.get("review-cadence-days", "180"))
+        cadence_days = int(raw_cadence)
     except ValueError:
-        cadence_days = 180
+        errors.append(
+            f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): review-cadence-days '{raw_cadence}' is not a valid integer"
+        )
+        return
+    if cadence_days < 1 or cadence_days > 180:
+        errors.append(
+            f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): review-cadence-days must be between 1 and 180, got {cadence_days}"
+        )
+        return
 
     today = datetime.now(timezone.utc).date()
     elapsed = (today - rev_date).days
@@ -325,7 +333,9 @@ def audit_license_and_sbom(errors: list[str]) -> None:
         if sync_docs._has_personal_host_path_text(raw_bom):
             errors.append("bom.json contains leaked personal host path")
         try:
-            bom = json.loads(raw_bom)
+            bom = sync_docs._loads_strict_json(raw_bom)
+            if not isinstance(bom, dict):
+                raise ValueError(f"bom.json root must be a JSON object, got {type(bom).__name__}")
             if bom.get("bomFormat") != "CycloneDX" or bom.get("specVersion") != "1.5":
                 errors.append("bom.json must be CycloneDX specVersion 1.5")
             comp = bom.get("metadata", {}).get("component", {})
@@ -544,6 +554,18 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "TestAdversarialPIIAndSecretExfiltrationEndToEnd",
         ),
         (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAdversarialTemplateOnlySignalAndAlertFieldNeutralization",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/ingest",
+            "TestSegReaderScratchBufferDoesNotAliasEvents",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/ingest",
+            "TestSegReaderRecoveryAfterInvalidHeaderInsideReadAhead",
+        ),
+        (
             "github.com/knowthankyew/genesis-sentinel/cmd/sentinel-bench",
             "TestRunBenchmarksOfflineAndMarkdownParity",
         ),
@@ -564,6 +586,10 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "TestRuleLiteralPrefilterMatchesRawRE2Soundness",
         ),
         (
+            "github.com/knowthankyew/genesis-sentinel/internal/rules",
+            "TestMatchEventControlSplitDelimiterDetection",
+        ),
+        (
             "github.com/knowthankyew/genesis-sentinel/internal/triage",
             "TestClientValidationRejectsBitNetOffLoopbackTraversalAndBadURLCredentials",
         ),
@@ -575,6 +601,7 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "github.com/knowthankyew/genesis-sentinel/internal/triage",
             "TestClientDiscardsStaleVerdictOnAdapterHotSwapOrReset",
         ),
+        ("github.com/knowthankyew/genesis-sentinel/internal/triage", "TestBuildTriagePromptSanitizesAndPreservesClosingFence"),
         ("github.com/knowthankyew/genesis-sentinel/internal/triage", "TestParseCompletionFailClosedAndInjectionOverride"),
         ("github.com/knowthankyew/genesis-sentinel/internal/feedback", "TestRedactTextAndScanForPII"),
         (
@@ -593,6 +620,7 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "./internal/model",
             "./internal/config",
             "./internal/cli",
+            "./internal/ingest",
             "./internal/pipeline",
             "./internal/rules",
             "./internal/template",

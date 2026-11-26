@@ -141,10 +141,20 @@ def resolve_claim_value(
 ) -> str:
     """Resolve and format a registered claim value from its Go source or validated JSON snapshot."""
     artifact_rel = claim_cfg.get("source_artifact")
-    if not artifact_rel:
+    if not isinstance(artifact_rel, str) or not artifact_rel.strip():
         raise ValueError(f"Claim '{claim_id}' missing 'source_artifact'")
+    if Path(artifact_rel).is_absolute():
+        raise ValueError(f"Claim '{claim_id}' source_artifact must be repository-relative: {artifact_rel!r}")
     artifact_path = repo_root / artifact_rel
-    resolved_artifact = artifact_path.resolve()
+    try:
+        resolved_artifact = artifact_path.resolve()
+        resolved_root = repo_root.resolve()
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"Claim '{claim_id}' has invalid source_artifact {artifact_rel!r}: {exc}") from exc
+    try:
+        resolved_artifact.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"Claim '{claim_id}' source_artifact escapes repository root: {artifact_rel!r}") from exc
 
     fmt = claim_cfg.get("format_rule", "{value}")
 
@@ -181,6 +191,13 @@ def _reject_nonfinite_json_constant(const: str) -> None:
     raise ValueError(f"Non-standard non-finite JSON constant not permitted: {const!r}")
 
 
+def _parse_finite_json_float(raw: str) -> float:
+    val = float(raw)
+    if not math.isfinite(val):
+        raise ValueError(f"Non-finite JSON floating-point value not permitted: {raw!r}")
+    return val
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     out: dict[str, object] = {}
     for k, v in pairs:
@@ -193,6 +210,7 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
 def _loads_strict_json(raw: str):
     return json.loads(
         raw,
+        parse_float=_parse_finite_json_float,
         parse_constant=_reject_nonfinite_json_constant,
         object_pairs_hook=_reject_duplicate_json_keys,
     )
@@ -416,6 +434,8 @@ def _req_num(section: dict, key: str, errors: list[str], prefix: str) -> float |
 
 
 _HTML_TYPE1_OPEN_RE = re.compile(r"^ {0,3}<(pre|script|style|textarea)(?:[\s>]|$)", re.IGNORECASE)
+_HTML_TYPE3_OPEN_RE = re.compile(r"^ {0,3}<\?")
+_HTML_TYPE5_OPEN_RE = re.compile(r"^ {0,3}<!\[CDATA\[")
 _HTML_TYPE6_OPEN_RE = re.compile(
     r"^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|"
@@ -425,7 +445,11 @@ _HTML_TYPE6_OPEN_RE = re.compile(
 )
 
 
-def _parse_gfm_row(raw_line: str, require_outer_pipes: bool = False) -> tuple[str, list[str]] | None:
+def _parse_gfm_row(
+    raw_line: str,
+    require_outer_pipes: bool = False,
+    min_cells: int = 2,
+) -> tuple[str, list[str]] | None:
     """Parse a GFM table row outside 4-space/tab indented code blocks (optional outer pipes)."""
     if raw_line.startswith("    ") or raw_line.startswith("\t"):
         return None
@@ -440,7 +464,7 @@ def _parse_gfm_row(raw_line: str, require_outer_pipes: bool = False) -> tuple[st
     if inner.endswith("|") and not inner.endswith(r"\|"):
         inner = inner[:-1]
     cells = [c.strip() for c in re.split(r"(?<!\\)\|", inner)]
-    if len(cells) < 2:
+    if len(cells) < min_cells:
         return None
     return line, cells
 
@@ -453,10 +477,10 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
     """
     Strip CommonMark fenced code blocks (backticks and tildes >= 3), 4-space/tab indented code
     blocks (before scanning for HTML comments), raw HTML blocks (Type 1 <pre>/<script>/<style>/
-    <textarea> and Type 6 block tags), and HTML comments (including unclosed '<!--' through EOF),
-    then collect rendered body rows strictly from valid GFM tables (header row immediately
-    followed by a matching-column delimiter row, supporting optional outer pipes and honoring
-    GFM column-width truncation on body rows).
+    <textarea>, Type 3 <? ... ?>, Type 5 <![CDATA[...]]>, and Type 6 block tags), and HTML
+    comments (including unclosed '<!--' through EOF), then collect rendered body rows strictly
+    from valid GFM tables (header row immediately followed by a matching-column delimiter row,
+    supporting optional outer pipes, 1-cell body rows, and honoring GFM column-width truncation).
     Returns (published_table_rows, seen_bold_labels, duplicate_bold_labels).
     """
     cleaned_lines: list[str] = []
@@ -464,6 +488,8 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
     fence_len = 0
     in_comment = False
     html_type1_end: re.Pattern[str] | None = None
+    in_html_type3 = False
+    in_html_type5 = False
     in_html_type6 = False
     can_start_indented_code = True
 
@@ -480,6 +506,20 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
         if html_type1_end is not None:
             if html_type1_end.search(raw_line):
                 html_type1_end = None
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        if in_html_type3:
+            if "?>" in raw_line:
+                in_html_type3 = False
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        if in_html_type5:
+            if "]]>" in raw_line:
+                in_html_type5 = False
             cleaned_lines.append("")
             can_start_indented_code = True
             continue
@@ -536,6 +576,22 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
             can_start_indented_code = True
             continue
 
+        # CommonMark §4.6 Type 3 raw HTML blocks (<? ... ?> processing instructions)
+        if _HTML_TYPE3_OPEN_RE.match(line):
+            if "?>" not in line:
+                in_html_type3 = True
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        # CommonMark §4.6 Type 5 raw HTML blocks (<![CDATA[ ... ]]>)
+        if _HTML_TYPE5_OPEN_RE.match(line):
+            if "]]>" not in line:
+                in_html_type5 = True
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
         # CommonMark §4.6 Type 6 raw HTML blocks (<div>, <table>, etc., terminated by blank line)
         if _HTML_TYPE6_OPEN_RE.match(line):
             in_html_type6 = True
@@ -573,7 +629,7 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
                 header_cols = len(hdr[1])
                 i += 2
                 while i < total_lines:
-                    body = _parse_gfm_row(cleaned_lines[i], require_outer_pipes=False)
+                    body = _parse_gfm_row(cleaned_lines[i], require_outer_pipes=False, min_cells=1)
                     if body is None:
                         break
                     line, parts = body
@@ -750,6 +806,7 @@ def independent_recompute_metrics(
     stored_sep = _req_num(t1, "separation_nats", errors, "tier1_surprisal")
     raw_t1_samples = _req_sample_array(t1, "raw_samples_us", t1_evals, errors, "tier1_surprisal") if t1_evals is not None else None
 
+    calc_t1: dict[str, float] = {}
     if p50_us is not None and p90_us is not None and p99_us is not None and max_us is not None:
         if not (0 < p50_us <= p90_us <= p99_us <= max_us):
             errors.append(
@@ -765,12 +822,17 @@ def independent_recompute_metrics(
                 ("max_us", max_us, 100.0),
             ):
                 calc_v = _round_go(_nearest_rank_percentile(sorted_t1, p_rank), 3)
+                calc_t1[lbl] = calc_v
                 if f"{stored_v:.3f}" != f"{calc_v:.3f}":
                     errors.append(f"Tier 1 {lbl} raw-sample recomputation mismatch: stored {stored_v:.3f}, calculated {calc_v:.3f}")
         if p99_target_us is not None:
-            exp_p99_status = "PASSED" if p99_us < p99_target_us else "MISSED TARGET"
+            gate_p99 = calc_t1.get("p99_us", p99_us)
+            exp_p99_status = "PASSED" if gate_p99 < p99_target_us else "MISSED TARGET"
             if t1.get("p99_gate_status") != exp_p99_status:
-                errors.append(f"tier1_surprisal p99_gate_status mismatch: expected {exp_p99_status!r}")
+                errors.append(
+                    f"tier1_surprisal p99_gate_status mismatch: expected {exp_p99_status!r} "
+                    f"for recomputed P99 {gate_p99:.3f}us vs target {p99_target_us:.3f}us"
+                )
 
     if benign_mean is not None and anom_mean is not None and stored_sep is not None:
         calc_sep = _round_go(anom_mean - benign_mean, 4)
@@ -825,6 +887,7 @@ def independent_recompute_metrics(
     # 5. Tier 2 triage latency & defensive injection-safety checks (when enabled)
     # Note: injection_overrides_actual counts defensive fail-closed overrides where Sentinel
     # forced a coerced BENIGN-NOISE model output back to NEEDS-REVIEW (HIGH).
+    calc_t2: dict[str, float] = {}
     t2_enabled = t2.get("enabled")
     if not isinstance(t2_enabled, bool):
         errors.append(f"tier2_triage.enabled must be a boolean, got {t2_enabled!r}")
@@ -850,6 +913,7 @@ def independent_recompute_metrics(
                     ("max_ms", t2_max, 100.0),
                 ):
                     calc_v = _round_go(_nearest_rank_percentile(sorted_t2, p_rank), 3)
+                    calc_t2[lbl] = calc_v
                     if f"{stored_v:.3f}" != f"{calc_v:.3f}":
                         errors.append(f"Tier 2 {lbl} raw-sample recomputation mismatch: stored {stored_v:.3f}, calculated {calc_v:.3f}")
         inj_attempted = _req_int(t2, "injection_probes_attempted", errors, "tier2_triage", min_val=0)
@@ -936,10 +1000,10 @@ def independent_recompute_metrics(
                 else:
                     report_path = cand
                     if commit_valid and isinstance(git_commit, str):
-                        if not re.fullmatch(rf"\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(git_commit)}\.md", cand.name):
+                        if not re.fullmatch(rf"\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(git_commit)}(?:-r[2-9]\d*)?\.md", cand.name):
                             errors.append(
                                 f"Benchmark report_markdown filename {cand.name!r} must match "
-                                f"'YYYY-MM-DD-{git_commit}.md' for metadata.git_commit={git_commit!r}"
+                                f"'YYYY-MM-DD-{git_commit}[-rN].md' for metadata.git_commit={git_commit!r}"
                             )
 
     if report_path is not None and not errors:
@@ -954,19 +1018,27 @@ def independent_recompute_metrics(
         if dup_labels:
             errors.append(f"Markdown benchmark report {report_rel} contains duplicate metric row labels: {dup_labels}")
 
+        row_t1_p50 = calc_t1.get("p50_us", p50_us)
+        row_t1_p90 = calc_t1.get("p90_us", p90_us)
+        row_t1_p99 = calc_t1.get("p99_us", p99_us)
+        row_t1_max = calc_t1.get("max_us", max_us)
         expected_rows = [
             f"| **Lines Written / Read** | `{lines_written}` written / `{lines_read}` read (`{lines_dropped}` dropped, digest matched=`{'true' if digest_matched else 'false'}`) | `{t0['lossless_gate_status']}` |",
             f"| **Tier 0+1 Throughput** | `{calc_tps:.2f} lines/sec` (target >= {tps_target:.0f} lines/sec) | `{t0['throughput_gate_status']}` |",
             f"| **Templates Emitted / Collapse Ratio** | `{tmpls}` windows (`{calc_collapse:.2f}x` collapse, `{clusters_active}` active clusters) | — |",
-            f"| **Latency P50 / P90 / P99 / Max** | `{p50_us:.3f} us` / `{p90_us:.3f} us` / `{p99_us:.3f} us` / `{max_us:.3f} us` | `{t1['p99_gate_status']}` |",
+            f"| **Latency P50 / P90 / P99 / Max** | `{row_t1_p50:.3f} us` / `{row_t1_p90:.3f} us` / `{row_t1_p99:.3f} us` / `{row_t1_max:.3f} us` | `{t1['p99_gate_status']}` |",
             f"| **Precision / Recall / F1** | `{calc_prec:.4f}` / `{calc_rec:.4f}` / `{calc_f1:.4f}` (target F1 >= {f1_target:.2f}) | `{det['f1_gate_status']}` |",
             f"| **Sampled Go Heap Plateau / Peak** | `{plateau_mb:.2f} MB` plateau / `{peak_mb:.2f} MB` sampled peak (ceiling `{ceiling_mb:.0f} MB`, method=`{mem.get('heap_sampling_method', '')}`) | `{mem['heap_gate_status']}` |",
             f"| **Process Peak RSS** | `{rss_kb} KB` (`{calc_rss_mb:.2f} MB`) | — |",
             f"| **Adversarial Hostile-Log Self-Checks** | `{adv_passed}/{adv_total}` passed (`{calc_adv_pct:.2f}%`) | `{adv['gate_status']}` |",
         ]
         if t2_enabled:
+            row_t2_p50 = calc_t2.get("p50_ms", t2["p50_ms"])
+            row_t2_p90 = calc_t2.get("p90_ms", t2["p90_ms"])
+            row_t2_p99 = calc_t2.get("p99_ms", t2["p99_ms"])
+            row_t2_max = calc_t2.get("max_ms", t2["max_ms"])
             expected_rows.extend([
-                f"| **Inference Latency P50 / P90 / P99 / Max** | `{t2['p50_ms']:.3f} ms` / `{t2['p90_ms']:.3f} ms` / `{t2['p99_ms']:.3f} ms` / `{t2['max_ms']:.3f} ms` | — |",
+                f"| **Inference Latency P50 / P90 / P99 / Max** | `{row_t2_p50:.3f} ms` / `{row_t2_p90:.3f} ms` / `{row_t2_p99:.3f} ms` / `{row_t2_max:.3f} ms` | — |",
                 f"| **Hostile Injection Safety** | `{t2['injection_probes_safe']}/{t2['injection_probes_attempted']}` safe non-benign verdicts (`{t2['injection_overrides_actual']}` actual overrides, `{t2['injection_probes_failed']}` failed) | `{t2['injection_override_gate_status']}` |",
             ])
         else:
@@ -1150,15 +1222,17 @@ def independent_recompute_embedding_comparison(
         if not (0 < p50 <= p99):
             errors.append(f"embedding_comparison {key} latency ordering invalid: p50={p50}, p99={p99}")
         raw_emb_samples = _req_sample_array(sec, "raw_samples_ms", eval_total, errors, key)
+        eff_p50 = p50
         if raw_emb_samples is not None:
             sorted_emb = sorted(raw_emb_samples)
             calc_p50 = round(_nearest_rank_percentile(sorted_emb, 50.0), 4)
             calc_p99 = round(_nearest_rank_percentile(sorted_emb, 99.0), 4)
+            eff_p50 = calc_p50
             if f"{p50:.4f}" != f"{calc_p50:.4f}":
                 errors.append(f"embedding_comparison {key} latency_p50_ms raw-sample mismatch: stored {p50:.4f}, calc {calc_p50:.4f}")
             if f"{p99:.4f}" != f"{calc_p99:.4f}":
                 errors.append(f"embedding_comparison {key} latency_p99_ms raw-sample mismatch: stored {p99:.4f}, calc {calc_p99:.4f}")
-        recomputed[key] = {"f1": f1, "disg_rec": disg_rec, "fp": fp, "p50": p50}
+        recomputed[key] = {"f1": f1, "disg_rec": disg_rec, "fp": fp, "p50": eff_p50}
 
     if "pure_laplace_lk" in recomputed and "hybrid_laplace_lk_minilm" in recomputed:
         stored_f1_delta = _req_num(cmp_sec, "f1_delta", errors, "comparison")
@@ -1482,26 +1556,39 @@ def validate_claims_registry(
         if not isinstance(art_rel, str) or not art_rel.strip() or Path(art_rel).is_absolute():
             errors.append(f"Claim '{cid}' has missing or non-relative source_artifact: {art_rel!r}")
         else:
-            art_path = (repo_root / art_rel).resolve()
             try:
-                art_path.relative_to(resolved_root)
-            except ValueError:
-                errors.append(f"Claim '{cid}' source_artifact escapes repository root: {art_rel!r}")
-            else:
-                if not art_path.is_file():
-                    errors.append(f"Claim '{cid}' required source_artifact does not exist: {art_rel}")
-                elif art_rel == "docs/benchmarks/empirical_benchmarks.json" and str(cfg.get("json_path", "")).startswith("tier2_triage."):
-                    if art_path not in json_cache:
-                        try:
-                            json_cache[art_path] = _loads_strict_json(art_path.read_text(encoding="utf-8"))
-                        except Exception:
-                            json_cache[art_path] = {}
-                    t2_sec = json_cache[art_path].get("tier2_triage", {})
-                    if not isinstance(t2_sec, dict) or t2_sec.get("enabled") is not True:
-                        errors.append(
-                            f"Claim '{cid}' references live Tier 2 benchmark path '{cfg.get('json_path')}', "
-                            f"but tier2_triage.enabled is not true in {art_rel}"
-                        )
+                art_path = (repo_root / art_rel).resolve()
+            except (ValueError, OSError) as exc:
+                errors.append(f"Claim '{cid}' has invalid source_artifact {art_rel!r}: {exc}")
+                art_path = None
+            if art_path is not None:
+                try:
+                    art_path.relative_to(resolved_root)
+                except ValueError:
+                    errors.append(f"Claim '{cid}' source_artifact escapes repository root: {art_rel!r}")
+                else:
+                    if not art_path.is_file():
+                        errors.append(f"Claim '{cid}' required source_artifact does not exist: {art_rel}")
+                    elif "json_path" in cfg:
+                        if art_path not in json_cache:
+                            try:
+                                raw_art = art_path.read_text(encoding="utf-8")
+                                if _has_personal_host_path_text(raw_art):
+                                    errors.append(f"Claim '{cid}' source_artifact {art_rel} contains leaked personal host path")
+                                parsed_art = _loads_strict_json(raw_art)
+                                if _contains_personal_host_path(parsed_art):
+                                    errors.append(f"Claim '{cid}' source_artifact {art_rel} contains leaked personal host path in decoded strings")
+                                json_cache[art_path] = parsed_art if isinstance(parsed_art, dict) else {}
+                            except Exception as exc:
+                                errors.append(f"Claim '{cid}' source_artifact {art_rel} failed strict JSON parse: {exc}")
+                                json_cache[art_path] = {}
+                        if art_rel == "docs/benchmarks/empirical_benchmarks.json" and str(cfg.get("json_path", "")).startswith("tier2_triage."):
+                            t2_sec = json_cache[art_path].get("tier2_triage", {})
+                            if not isinstance(t2_sec, dict) or t2_sec.get("enabled") is not True:
+                                errors.append(
+                                    f"Claim '{cid}' references live Tier 2 benchmark path '{cfg.get('json_path')}', "
+                                    f"but tier2_triage.enabled is not true in {art_rel}"
+                                )
 
         used_in = cfg.get("used_in")
         if not isinstance(used_in, list) or not used_in:
@@ -1518,7 +1605,11 @@ def validate_claims_registry(
                 errors.append(f"Claim '{cid}' has duplicate 'used_in' entry: {norm_rel}")
                 continue
             seen_docs.add(norm_rel)
-            doc_p = (repo_root / norm_rel).resolve()
+            try:
+                doc_p = (repo_root / norm_rel).resolve()
+            except (ValueError, OSError) as exc:
+                errors.append(f"Claim '{cid}' has invalid 'used_in' path {norm_rel!r}: {exc}")
+                continue
             try:
                 doc_p.relative_to(resolved_root)
             except ValueError:
@@ -1555,15 +1646,32 @@ def check_empirical_regions(content: str, doc_name: str = "document") -> tuple[b
         for match in re.finditer(pattern, content, re.DOTALL):
             block_text = match.group(1)
             line_offset = content[: match.start()].count("\n") + 1
+            block_lines = block_text.splitlines()
+            skip_indices: set[int] = set()
+            for idx_line in range(len(block_lines) - 1):
+                hdr_row = _parse_gfm_row(block_lines[idx_line], require_outer_pipes=False)
+                delim_row = _parse_gfm_row(block_lines[idx_line + 1], require_outer_pipes=False)
+                if (
+                    hdr_row is not None
+                    and delim_row is not None
+                    and len(hdr_row[1]) == len(delim_row[1])
+                    and _is_gfm_delimiter_row(delim_row[1])
+                ):
+                    skip_indices.add(idx_line)
+                    skip_indices.add(idx_line + 1)
+
             filtered_lines = []
-            for row_idx, line in enumerate(block_text.splitlines(), 1):
+            for row_idx, line in enumerate(block_lines, 1):
                 line_str = line.strip()
                 if not line_str:
                     continue
-                if line_str.startswith("|") and (":---" in line_str or "Measured Result" in line_str):
+                if (row_idx - 1) in skip_indices:
                     continue
-                if line_str.startswith("|") and line_str.endswith("|"):
-                    parts = [p.strip() for p in line_str.split("|")[1:-1]]
+                parsed_row = _parse_gfm_row(line, require_outer_pipes=False, min_cells=2)
+                if parsed_row is not None:
+                    _, parts = parsed_row
+                    if _is_gfm_delimiter_row(parts):
+                        continue
                     if len(parts) >= 3:
                         status_cell = parts[-1]
                         if not claim_marker_re.search(status_cell):
@@ -1775,7 +1883,7 @@ def main() -> int:
         target_docs = [DEFAULT_README_PATH]
         if args.registry.is_file():
             try:
-                reg_data = json.loads(args.registry.read_text(encoding="utf-8"))
+                reg_data = _loads_strict_json(args.registry.read_text(encoding="utf-8"))
                 for c_cfg in reg_data.get("claims", {}).values():
                     for rel_p in c_cfg.get("used_in", []):
                         candidate = REPO_ROOT / rel_p
