@@ -126,6 +126,7 @@ make build
 * [Execution Roadmap & Model Inventory](docs/ROADMAP.md)
 * [Architecture Specification & Invariants](docs/ARCHITECTURE.md)
 * [Architecture Decision Records (ADRs)](docs/DECISIONS.md)
+* [When to Use Genesis Sentinel (Alternatives)](docs/ALTERNATIVES.md)
 * [Security Policy & Hostile-Log Threat Model](SECURITY.md)
 * [Governance & Third-Party Attribution Notice](NOTICE.md)
 * [Contributing Guidelines](CONTRIBUTING.md)

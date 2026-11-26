@@ -5,14 +5,15 @@ for Genesis Sentinel (`knowthankyew/genesis-sentinel`).
 
 Provides portfolio-standard CLI discoverability (scripts/audit-claims.py) matching `genesis` and `ml`:
 1. Claims & Go constant bound unit tests (tests/test_claims_linter.py)
-2. Document Claims & Constant Sync Check across all registered docs (scripts/sync_docs.py --check)
-3. Prohibited & Guarded Vocabulary + Personal Path Audit across README.md, NOTICE.md, SECURITY.md,
+2. Document Claims, Script AST & Benchmark Math Sync Check across all registered docs (scripts/sync_docs.py --check)
+3. Prohibited & Guarded Vocabulary, Marker Integrity + Personal Path Audit across README.md, NOTICE.md, SECURITY.md,
    CHANGELOG.md, CONTRIBUTING.md, and docs/**/*.md
 4. Architecture Diagram Freshness & Path Existence Audit (diagram-meta covers & code paths)
-5. Canonical MIT License, SPDX, NOTICE.md (including Pillar 1 Variance & arXiv:2510.22809 Attribution),
+5. Competitive Landscape Freshness Gate (180-day cadence on docs/ALTERNATIVES.md)
+6. Canonical MIT License, SPDX, NOTICE.md (including Pillar 1 Variance & arXiv:2510.22809 Attribution),
    and CycloneDX 1.5 SBOM (bom.json) Governance Gate
-6. Pure-Go Stdlib Zero-Dependency, Model Governance (Smol-First / BitNet Excluded), Loopback-Only,
-   Prompt Sanitizer & Local Burn Security Invariant Verification
+7. Pure-Go Stdlib Zero-Dependency, Static Outbound-Network Boundary (internal/security), Model Governance
+   (Smol-First / BitNet Excluded), Loopback-Only, Prompt Sanitizer & Local Burn Security Invariant Verification
 """
 
 import hashlib
@@ -31,6 +32,18 @@ DIAGRAM_META_RE = re.compile(r"<!--\s*diagram-meta\b(.*?)-->", re.DOTALL)
 DIAGRAM_CODE_PATH_RE = re.compile(r"<code>([^<>\s]+)</code>")
 DIAGRAM_PATH_PREFIXES = ("cmd/", "internal/", "scripts/", "docs/", ".github/", "tests/")
 REQUIRED_DIAGRAM_DOC = "docs/ARCHITECTURE.md"
+
+LANDSCAPE_META_RE = re.compile(r"<!--\s*landscape-meta\b(.*?)-->", re.DOTALL)
+REQUIRED_LANDSCAPE_DOC = "docs/ALTERNATIVES.md"
+
+RAW_GO_NETWORK_RE = re.compile(
+    r"\bnet\.Dial(?:Timeout|TCP|UDP|IP|Unix)?\b"
+    r"|\bnet\.Dialer\s*\{"
+    r"|\bhttp\.(?:Client|Transport)\s*\{"
+    r"|\bnew\s*\(\s*(?:net\.Dialer|http\.(?:Client|Transport))\s*\)"
+    r"|\bhttp\.Default(?:Client|Transport)\b"
+    r"|\bhttp\.(?:Get|Head|Post|PostForm)\s*\("
+)
 
 CANONICAL_MIT_SHA256 = "49f4b2686067fc56489ee83e4280c72a38b5c09d275bf352f5247d90572c8b9b"
 SPDX_PREFIX = "SPDX" + "-License-Identifier:"
@@ -71,6 +84,16 @@ def get_docs_to_scan() -> list[Path]:
 
 def audit_vocabulary(errors: list[str]) -> None:
     registry_path = REPO_ROOT / "docs" / "claims_registry.json"
+    reg_ok, reg_errs = sync_docs.validate_claims_registry(registry_path, repo_root=REPO_ROOT)
+    if not reg_ok:
+        for e in reg_errs:
+            errors.append(f"Registry hygiene violation: {e}")
+
+    ast_ok, ast_errs = sync_docs.lint_script_conclusions(REPO_ROOT / "scripts")
+    if not ast_ok:
+        for e in ast_errs:
+            errors.append(f"Script conclusion AST violation: {e}")
+
     for doc in get_docs_to_scan():
         content = doc.read_text(encoding="utf-8")
         rel_name = str(doc.relative_to(REPO_ROOT)).replace("\\", "/")
@@ -80,6 +103,12 @@ def audit_vocabulary(errors: list[str]) -> None:
         if not ok:
             for e in word_errs:
                 errors.append(f"Vocabulary/Path violation: {e}")
+        m_ok, m_errs = sync_docs.lint_claim_markers_and_regions(
+            content, rel_name, registry_path=registry_path
+        )
+        if not m_ok:
+            for e in m_errs:
+                errors.append(f"Marker/Region violation: {e}")
 
 
 def parse_diagram_meta(text: str) -> dict | None:
@@ -182,6 +211,65 @@ def audit_architecture_diagrams(errors: list[str]) -> None:
         _audit_diagram_doc(doc, errors)
 
 
+def parse_landscape_meta(text: str) -> dict | None:
+    m = LANDSCAPE_META_RE.search(text)
+    if not m:
+        return None
+    meta: dict = {}
+    for line in m.group(1).splitlines():
+        key, sep, val = line.partition(":")
+        if sep:
+            meta[key.strip()] = val.strip()
+    versions = meta.get("reviewed-versions", "")
+    if versions.startswith("[") and versions.endswith("]"):
+        meta["reviewed-versions"] = [v.strip() for v in versions[1:-1].split(",") if v.strip()]
+    else:
+        meta["reviewed-versions"] = []
+    return meta
+
+
+def audit_landscape_freshness(errors: list[str], repo_root: Path = REPO_ROOT) -> None:
+    doc_path = repo_root / REQUIRED_LANDSCAPE_DOC
+    if not doc_path.is_file():
+        errors.append(f"Landscape gate: required document {REQUIRED_LANDSCAPE_DOC} not found")
+        return
+    text = doc_path.read_text(encoding="utf-8")
+    meta = parse_landscape_meta(text)
+    if not meta:
+        errors.append(f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): missing <!-- landscape-meta ... --> header")
+        return
+
+    raw_date = meta.get("last-reviewed", "")
+    try:
+        rev_date = date.fromisoformat(raw_date)
+        max_allowed_date = datetime.now(timezone.utc).date() + timedelta(days=1)
+        if rev_date > max_allowed_date:
+            errors.append(f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): last-reviewed {raw_date} is in the future")
+    except ValueError:
+        errors.append(f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): last-reviewed '{raw_date}' is not an ISO date (YYYY-MM-DD)")
+        return
+
+    try:
+        cadence_days = int(meta.get("review-cadence-days", "180"))
+    except ValueError:
+        cadence_days = 180
+
+    today = datetime.now(timezone.utc).date()
+    elapsed = (today - rev_date).days
+    if elapsed > cadence_days:
+        errors.append(
+            f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): STALE. Last reviewed {raw_date} "
+            f"({elapsed} days ago, exceeds cadence of {cadence_days} days). "
+            f"Review external alternatives, verify claims against latest releases, and update last-reviewed."
+        )
+
+    versions = meta.get("reviewed-versions", [])
+    if len(versions) < 3:
+        errors.append(
+            f"Landscape gate ({REQUIRED_LANDSCAPE_DOC}): reviewed-versions list must contain at least 3 pinned competitor versions"
+        )
+
+
 def audit_license_and_sbom(errors: list[str]) -> None:
     license_file = REPO_ROOT / "LICENSE"
     if not license_file.is_file():
@@ -234,8 +322,8 @@ def audit_license_and_sbom(errors: list[str]) -> None:
         errors.append("Governance gate: bom.json is missing")
     else:
         raw_bom = bom_path.read_text(encoding="utf-8")
-        if "/Users/" in raw_bom:
-            errors.append("bom.json contains leaked '/Users/' path")
+        if sync_docs._has_personal_host_path_text(raw_bom):
+            errors.append("bom.json contains leaked personal host path")
         try:
             bom = json.loads(raw_bom)
             if bom.get("bomFormat") != "CycloneDX" or bom.get("specVersion") != "1.5":
@@ -284,6 +372,117 @@ def audit_license_and_sbom(errors: list[str]) -> None:
             errors.append(f"bom.json invalid JSON or schema error: {exc}")
 
 
+def strip_go_comments_and_strings(src: str) -> str:
+    """Replace Go comments and string/rune literals with spaces while preserving newlines for line numbers."""
+    out: list[str] = []
+    i = 0
+    n = len(src)
+    state = "code"  # code | line_comment | block_comment | dquote | rawstr | rune
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                out.append("  ")
+                i += 2
+                continue
+            if ch == '"':
+                state = "dquote"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "`":
+                state = "rawstr"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "'":
+                state = "rune"
+                out.append(" ")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "code"
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                out.append("  ")
+                i += 2
+            elif ch == "\n":
+                out.append("\n")
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+        elif state == "dquote":
+            if ch == "\\" and i + 1 < n:
+                out.append("\n" if nxt == "\n" else "  ")
+                i += 2
+            elif ch == '"':
+                state = "code"
+                out.append(" ")
+                i += 1
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+        elif state == "rawstr":
+            if ch == "`":
+                state = "code"
+                out.append(" ")
+            else:
+                out.append("\n" if ch == "\n" else " ")
+            i += 1
+        elif state == "rune":
+            if ch == "\\" and i + 1 < n:
+                out.append("\n" if nxt == "\n" else "  ")
+                i += 2
+            elif ch == "'":
+                state = "code"
+                out.append(" ")
+                i += 1
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+    return "".join(out)
+
+
+def audit_go_network_egress_boundary(errors: list[str], repo_root: Path = REPO_ROOT) -> None:
+    """
+    Enforce that zero non-test Go files outside internal/security construct raw outbound
+    TCP/UDP dialers or HTTP clients/transports (preventing accidental dial-time loopback bypasses).
+    """
+    for top in ("cmd", "internal"):
+        base = repo_root / top
+        if not base.is_dir():
+            continue
+        for go_file in sorted(base.rglob("*.go")):
+            if go_file.name.endswith("_test.go"):
+                continue
+            rel = go_file.relative_to(repo_root).as_posix()
+            if rel.startswith("internal/security/"):
+                continue
+            cleaned = strip_go_comments_and_strings(go_file.read_text(encoding="utf-8"))
+            for line_no, line in enumerate(cleaned.splitlines(), 1):
+                for m in RAW_GO_NETWORK_RE.finditer(line):
+                    errors.append(
+                        f"Go network boundary violation in {rel}:{line_no}: raw outbound primitive "
+                        f"'{m.group(0).strip()}' forbidden outside internal/security"
+                    )
+
+
 def audit_sentinel_invariants(errors: list[str]) -> None:
     # 1. Zero external Go dependencies
     gomod_path = REPO_ROOT / "go.mod"
@@ -299,13 +498,20 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
     if gosum_path.is_file() and gosum_path.read_text(encoding="utf-8").strip():
         errors.append("go.sum is non-empty (violates stdlib-only invariant)")
 
-    # 2. Security, Model Governance (BitNet excluded), Config Redaction, Tier 2/Feedback & Burn Invariant Go Tests
+    # 2. Static outbound-network boundary (all dialers/HTTP clients confined to internal/security)
+    audit_go_network_egress_boundary(errors, repo_root=REPO_ROOT)
+
+    # 3. Security, Model Governance (BitNet excluded), Config Redaction, Tier 2/Feedback & Burn Invariant Go Tests
     expected_invariant_tests = [
         ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestIsLoopbackEndpoint"),
         ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestIsBindingAllInterfaces"),
         ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestAuthMiddleware"),
         ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestSanitizeUntrustedLogText"),
         ("github.com/knowthankyew/genesis-sentinel/internal/security", "TestNewLoopbackHTTPClientRedirectPolicies"),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/emit",
+            "TestGenesisTCPSinkLoopbackPolicyRejectsRemoteAndDialsLocalhost",
+        ),
         ("github.com/knowthankyew/genesis-sentinel/internal/model", "TestValidateBaseModel"),
         ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestDefaultConfigValidates"),
         ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestConfigRejectsBitNetAndNonLoopback"),
@@ -383,6 +589,7 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
             "test",
             "-json",
             "./internal/security",
+            "./internal/emit",
             "./internal/model",
             "./internal/config",
             "./internal/cli",
@@ -454,11 +661,11 @@ def main() -> int:
     if ok_sync:
         print("  ✓ Multi-doc Go constant claims and empirical guardrails synchronized (sync_docs.py)")
 
-    # 3. Audit prohibited and guarded vocabulary + personal path leaks across docs
+    # 3. Audit prohibited and guarded vocabulary, claim marker structure + personal path leaks across docs
     before_vocab = len(errors)
     audit_vocabulary(errors)
     if len(errors) == before_vocab:
-        print("  ✓ README.md, NOTICE.md, SECURITY.md, CHANGELOG.md, CONTRIBUTING.md, and docs/*.md clean of prohibited/unguarded vocabulary & /Users/ leaks")
+        print("  ✓ All Markdown docs, claims_registry.json & benchmark scripts clean of vocabulary, marker, AST & personal-path violations")
 
     # 4. Architecture diagram freshness & path existence
     before_diagram = len(errors)
@@ -466,17 +673,23 @@ def main() -> int:
     if len(errors) == before_diagram:
         print("  ✓ Architecture diagram metadata is fresh and every referenced path exists")
 
-    # 5. Canonical MIT license, SPDX, Pillar 1 variance NOTICE & CycloneDX SBOM governance gate
+    # 5. Competitive landscape freshness gate (180-day cadence on docs/ALTERNATIVES.md)
+    before_landscape = len(errors)
+    audit_landscape_freshness(errors)
+    if len(errors) == before_landscape:
+        print("  ✓ Competitive landscape comparison (docs/ALTERNATIVES.md) is within 180-day review cadence")
+
+    # 6. Canonical MIT license, SPDX, Pillar 1 variance NOTICE & CycloneDX SBOM governance gate
     before_license = len(errors)
     audit_license_and_sbom(errors)
     if len(errors) == before_license:
         print("  ✓ MIT canonical license integrity, SPDX identifiers, NOTICE.md & CycloneDX 1.5 SBOM verified")
 
-    # 6. Pure-Go stdlib zero-dep, loopback, prompt sanitizer, BitNet exclusion & burn invariants
+    # 7. Pure-Go stdlib zero-dep, static outbound-dialer boundary, loopback, prompt sanitizer, BitNet exclusion & burn invariants
     before_inv = len(errors)
     audit_sentinel_invariants(errors)
     if len(errors) == before_inv:
-        print("  ✓ Zero external Go dependencies, loopback enforcement, BitNet exclusion, prompt sanitizer & burn invariants verified")
+        print("  ✓ Zero external Go dependencies, static internal/security network boundary, loopback enforcement, BitNet exclusion & burn invariants verified")
 
     if errors:
         print(f"\n[FAIL] {len(errors)} invariant violation(s) detected:", file=sys.stderr)

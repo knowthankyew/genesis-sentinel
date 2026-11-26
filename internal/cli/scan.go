@@ -119,7 +119,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 
 	var sink emit.Sink = emit.NopSink{}
 	if *emitGenesis {
-		tcpSink := emit.NewGenesisTCPSink(cfg.GenesisTCPAddr, 2*time.Second)
+		tcpSink := emit.NewGenesisTCPSinkWithPolicy(cfg.GenesisTCPAddr, 2*time.Second, cfg.AllowRemoteEndpoints)
 		defer func() { _ = tcpSink.Close() }()
 		sink = tcpSink
 	}

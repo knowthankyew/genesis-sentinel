@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
+	"github.com/knowthankyew/genesis-sentinel/internal/security"
 )
 
 // Alert is the structured JSON telemetry event emitted by Sentinel back into Genesis
@@ -138,20 +139,28 @@ func HighestSeverity(hits []model.RuleHit) string {
 
 // GenesisTCPSink streams newline-delimited JSON alerts to Genesis's TCP ingestion listener.
 type GenesisTCPSink struct {
-	mu      sync.Mutex
-	addr    string
-	timeout time.Duration
-	conn    net.Conn
+	mu          sync.Mutex
+	addr        string
+	timeout     time.Duration
+	allowRemote bool
+	conn        net.Conn
 }
 
-// NewGenesisTCPSink creates a loopback TCP alert sink targeting Genesis (e.g. 127.0.0.1:9000).
+// NewGenesisTCPSink creates a loopback-only TCP alert sink targeting Genesis (e.g. 127.0.0.1:9000).
 func NewGenesisTCPSink(addr string, timeout time.Duration) *GenesisTCPSink {
+	return NewGenesisTCPSinkWithPolicy(addr, timeout, false)
+}
+
+// NewGenesisTCPSinkWithPolicy creates a TCP alert sink targeting Genesis, enforcing dial-time
+// loopback IP verification unless allowRemote is explicitly true.
+func NewGenesisTCPSinkWithPolicy(addr string, timeout time.Duration, allowRemote bool) *GenesisTCPSink {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
 	return &GenesisTCPSink{
-		addr:    addr,
-		timeout: timeout,
+		addr:        addr,
+		timeout:     timeout,
+		allowRemote: allowRemote,
 	}
 }
 
@@ -181,7 +190,7 @@ func (s *GenesisTCPSink) Emit(alert Alert) error {
 
 func (s *GenesisTCPSink) writeLocked(payload []byte) error {
 	if s.conn == nil {
-		conn, err := net.DialTimeout("tcp", s.addr, s.timeout)
+		conn, err := security.DialEndpointTimeout("tcp", s.addr, s.timeout, s.allowRemote)
 		if err != nil {
 			return fmt.Errorf("dial genesis tcp %s: %w", s.addr, err)
 		}

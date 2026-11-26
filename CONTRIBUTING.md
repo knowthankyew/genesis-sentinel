@@ -48,6 +48,12 @@ make race
 
 # Run linter
 make lint
+
+# Regenerate deterministic CycloneDX 1.5 SBOM (when version or internal/* packages change)
+make sbom
+
+# Run claims, benchmark math recomputation, diagram freshness, landscape & security invariant audit
+make audit
 ```
 
 Use conventional commit prefixes: `feat:`, `fix:`, `docs:`, `test:`, `chore:`.

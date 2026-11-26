@@ -34,14 +34,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Generate CycloneDX 1.5 SBOM (bom.json)
-        run: python3 ./scripts/generate-sbom.py bom.json
-
       - name: Run Claims Linter Unit Tests
         run: python3 -m unittest discover -s tests
 
       - name: Verify Zero-Dependency, Loopback, Model Governance & Claims Gate
         run: python3 ./scripts/audit-claims.py
+
+      - name: Generate CycloneDX 1.5 SBOM (bom.json)
+        run: python3 ./scripts/generate-sbom.py bom.json
 
       - name: Verify gofmt Formatting
         run: |
@@ -58,10 +58,10 @@ jobs:
       - name: Run Unit & Race Detector Tests
         run: go test -race ./...
 
-      - name: Build Sentinel Binary
+      - name: Build Sentinel Binaries
         run: |
           make build
-          shasum -a 256 bin/sentinel bom.json > SHA256SUMS
+          shasum -a 256 bin/sentinel bin/sentinel-bench bom.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Attest Build Provenance (SLSA)
@@ -71,6 +71,7 @@ jobs:
           subject-path: |
             bom.json
             bin/sentinel
+            bin/sentinel-bench
 
       - name: Upload CycloneDX SBOM & Binary Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -80,3 +81,4 @@ jobs:
             bom.json
             SHA256SUMS
             bin/sentinel
+            bin/sentinel-bench

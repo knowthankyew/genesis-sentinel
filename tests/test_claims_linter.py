@@ -232,9 +232,11 @@ class TestClaimsLinter(unittest.TestCase):
         self.assertTrue(ok, f"Benchmark recomputation failed: {errs}")
 
         emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
-        if emb_json.is_file():
-            e_ok, e_errs = sync_docs.independent_recompute_embedding_comparison(emb_json)
-            self.assertTrue(e_ok, f"Embedding comparison recomputation failed: {e_errs}")
+        self.assertTrue(emb_json.is_file(), f"Missing {emb_json}")
+        e_ok, e_errs = sync_docs.independent_recompute_embedding_comparison(
+            emb_json, repo_root=REPO_ROOT, require_governed_fields=True
+        )
+        self.assertTrue(e_ok, f"Embedding comparison recomputation failed: {e_errs}")
 
     def test_negative_benchmark_recomputation_detects_drift_and_leaks(self):
         """Verify independent_recompute_metrics fails closed on tampered throughput, latency, F1, and /Users/ paths."""
@@ -535,6 +537,311 @@ class TestClaimsLinter(unittest.TestCase):
             ok_bnd, errs_bnd = sync_docs.independent_recompute_metrics(p_bnd, repo_root=tmp_root)
             self.assertFalse(ok_bnd)
             self.assertTrue(any("throughput_gate_status mismatch" in e for e in errs_bnd), errs_bnd)
+
+    def test_script_conclusion_ast_linter_passes_and_catches_hardcoded_digits(self):
+        """Verify AST linter passes on scripts/ and rejects hardcoded digits/literals in conclusion builders."""
+        ok, errs = sync_docs.lint_script_conclusions(REPO_ROOT / "scripts")
+        self.assertTrue(ok, f"Script conclusion AST lint failed: {errs}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = Path(tmp)
+            # 1. Missing conclusion builder in governed eval_embedding_comparison.py must fail.
+            (sdir / "eval_embedding_comparison.py").write_text("def helper(x):\n    return str(x)\n", encoding="utf-8")
+            ok_miss, errs_miss = sync_docs.lint_script_conclusions(sdir)
+            self.assertFalse(ok_miss)
+            self.assertTrue(any("must define a conclusion builder" in e for e in errs_miss), errs_miss)
+
+            # 2. Hardcoded digit in f-string fragment must fail, even if format specs like :.4f are used.
+            (sdir / "eval_embedding_comparison.py").write_text(
+                'def build_conclusion_recommendation(v):\n'
+                '    return f"P50 was {v:.4f} ms (347x slower)"\n',
+                encoding="utf-8",
+            )
+            ok_str, errs_str = sync_docs.lint_script_conclusions(sdir)
+            self.assertFalse(ok_str)
+            self.assertTrue(any("hardcoded digit in string fragment" in e for e in errs_str), errs_str)
+
+            # 3. Hardcoded numeric literal inside conclusion function body must fail.
+            (sdir / "eval_embedding_comparison.py").write_text(
+                'def build_conclusion_recommendation(delta):\n'
+                '    return "improved" if delta > 0.5 else "unchanged"\n',
+                encoding="utf-8",
+            )
+            ok_num, errs_num = sync_docs.lint_script_conclusions(sdir)
+            self.assertFalse(ok_num)
+            self.assertTrue(any("hardcoded numeric literal" in e for e in errs_num), errs_num)
+
+            # 4. Clean parameterized conclusion with P50/P99 labels and format specs must pass.
+            (sdir / "eval_embedding_comparison.py").write_text(
+                'def build_conclusion_recommendation(p50_ms, ratio, improved):\n'
+                '    """Docstring with 123 digits is ignored."""\n'
+                '    state = "improved" if improved else "flat"\n'
+                '    return f"Measured P50 {p50_ms:.4f} ms ({ratio:.1f}x, {state})"\n',
+                encoding="utf-8",
+            )
+            ok_clean, errs_clean = sync_docs.lint_script_conclusions(sdir)
+            self.assertTrue(ok_clean, errs_clean)
+
+    def test_claims_registry_validation_and_tier2_live_gate(self):
+        """Verify validate_claims_registry catches orphaned claims, missing artifacts, and disabled Tier 2."""
+        reg_path = DOCS_DIR / "claims_registry.json"
+        ok, errs = sync_docs.validate_claims_registry(reg_path, repo_root=REPO_ROOT)
+        self.assertTrue(ok, f"Committed claims_registry.json failed validation: {errs}")
+
+        base_reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "docs" / "benchmarks").mkdir(parents=True)
+            (tmp_root / "internal" / "cli").mkdir(parents=True)
+            (tmp_root / "internal" / "cli" / "cli.go").write_text('package cli\nconst Version = "0.5.0"\n', encoding="utf-8")
+            (tmp_root / "README.md").write_text("v<!-- claim:ver -->0.5.0<!-- /claim -->\n", encoding="utf-8")
+
+            # 1. Orphaned claim (empty used_in) must fail.
+            orphan_reg = {
+                "version": "2.0.0",
+                "claim_terms": {},
+                "claims": {
+                    "ver": {
+                        "source_artifact": "internal/cli/cli.go",
+                        "go_const": "Version",
+                        "format_rule": "{value}",
+                        "used_in": [],
+                    }
+                },
+            }
+            p_orphan = tmp_root / "docs" / "orphan_reg.json"
+            p_orphan.write_text(json.dumps(orphan_reg), encoding="utf-8")
+            ok1, errs1 = sync_docs.validate_claims_registry(p_orphan, repo_root=tmp_root)
+            self.assertFalse(ok1)
+            self.assertTrue(any("orphaned claim" in e for e in errs1), errs1)
+
+            # 2. Missing marker in listed used_in doc must fail.
+            (tmp_root / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+            missing_marker_reg = json.loads(json.dumps(orphan_reg))
+            missing_marker_reg["claims"]["ver"]["used_in"] = ["CHANGELOG.md"]
+            p_mm = tmp_root / "docs" / "mm_reg.json"
+            p_mm.write_text(json.dumps(missing_marker_reg), encoding="utf-8")
+            ok2, errs2 = sync_docs.validate_claims_registry(p_mm, repo_root=tmp_root)
+            self.assertFalse(ok2)
+            self.assertTrue(any("marker is missing" in e for e in errs2), errs2)
+
+            # 3. Missing governed embedding_comparison.json must fail closed in both registry and recompute.
+            missing_emb_reg = {
+                "version": "2.0.0",
+                "claim_terms": {},
+                "claims": {
+                    "embed_f1": base_reg["claims"]["embed_pure_lk_f1"],
+                },
+            }
+            (tmp_root / "README.md").write_text("<!-- claim:embed_f1 -->0.7500<!-- /claim -->\n", encoding="utf-8")
+            p_me = tmp_root / "docs" / "me_reg.json"
+            p_me.write_text(json.dumps(missing_emb_reg), encoding="utf-8")
+            ok3, errs3 = sync_docs.validate_claims_registry(p_me, repo_root=tmp_root)
+            self.assertFalse(ok3)
+            self.assertTrue(any("required source_artifact does not exist" in e for e in errs3), errs3)
+
+            ok3b, errs3b = sync_docs.independent_recompute_embedding_comparison(
+                tmp_root / "docs" / "benchmarks" / "embedding_comparison.json",
+                repo_root=tmp_root,
+                require_governed_fields=True,
+            )
+            self.assertFalse(ok3b)
+            self.assertTrue(any("Missing required embedding comparison JSON" in e for e in errs3b), errs3b)
+
+            # 4. Offline benchmark (tier2_triage.enabled = false) must fail governed Tier 2 claims.
+            (tmp_root / "docs" / "benchmarks" / "empirical_benchmarks.json").write_text(
+                json.dumps({"tier2_triage": {"enabled": False, "p50_ms": 0.0}}),
+                encoding="utf-8",
+            )
+            (tmp_root / "README.md").write_text("<!-- claim:bench_tier2_p50_ms -->P50 0.00 ms<!-- /claim -->\n", encoding="utf-8")
+            t2_reg = {
+                "version": "2.0.0",
+                "claim_terms": {},
+                "claims": {"bench_tier2_p50_ms": base_reg["claims"]["bench_tier2_p50_ms"]},
+            }
+            p_t2 = tmp_root / "docs" / "t2_reg.json"
+            p_t2.write_text(json.dumps(t2_reg), encoding="utf-8")
+            ok4, errs4 = sync_docs.validate_claims_registry(p_t2, repo_root=tmp_root)
+            self.assertFalse(ok4)
+            self.assertTrue(any("tier2_triage.enabled is not true" in e for e in errs4), errs4)
+
+    def test_cross_doc_marker_linter_catches_unclosed_unknown_and_mismatched_markers(self):
+        """Verify lint_claim_markers_and_regions catches malformed markers in any doc while ignoring code fences."""
+        reg_path = DOCS_DIR / "claims_registry.json"
+
+        # Fenced code examples must not trigger false positives.
+        fenced_ok = "```markdown\n<!-- claim:example_id -->123<!-- /claim -->\n<!-- BEGIN_EMPIRICAL -->\n```\n"
+        ok0, errs0 = sync_docs.lint_claim_markers_and_regions(fenced_ok, "CONTRIBUTING.md", registry_path=reg_path)
+        self.assertTrue(ok0, errs0)
+
+        bad_cases = [
+            ("<!-- claim:nonexistent_claim_xyz -->42<!-- /claim -->", "unknown claim ID"),
+            ("<!-- claim:sentinel_version -->0.5.0", "unclosed"),
+            ("<!-- claim:sentinel_version 0.5.0", "unclosed HTML claim marker"),
+            ("orphan <!-- /claim --> here", "orphan closing"),
+            ("<!-- claim:sentinel_version -->0.5.0<!-- /claim_term -->", "mismatched closing"),
+            ("<!-- BEGIN_EMPIRICAL -->\n| A | B | C |\n", "unbalanced empirical delimiters"),
+        ]
+        for content, expected_sub in bad_cases:
+            ok, errs = sync_docs.lint_claim_markers_and_regions(content, "docs/DECISIONS.md", registry_path=reg_path)
+            self.assertFalse(ok, f"Expected failure for {content!r}")
+            self.assertTrue(any(expected_sub in e for e in errs), (content, errs))
+
+    def test_expanded_personal_host_paths_and_no_prohibited_word_bypass(self):
+        """Verify /home/ and Windows C:\\Users\\ leaks are blocked and meta-phrases cannot bypass prohibited words."""
+        reg_path = DOCS_DIR / "claims_registry.json"
+
+        for leaked_line in (
+            "Saved under /home/alice/.genesis-sentinel/cursor.json",
+            r"Saved under C:\Users\alice\.genesis-sentinel\cursor.json",
+            "Saved under c:/users/alice/logs",
+        ):
+            ok, errs = sync_docs.lint_prose_and_words(leaked_line, "doc.md", registry_path=reg_path)
+            self.assertFalse(ok, f"Expected path leak rejection for {leaked_line!r}")
+            self.assertTrue(any("Personal path leak" in e for e in errs), errs)
+
+        # Normal lowercase REST paths like /api/v1/users/profile must NOT false-positive.
+        ok_api, errs_api = sync_docs.lint_prose_and_words(
+            "GET /api/v1/users/profile HTTP/1.1 200 OK", "doc.md", registry_path=reg_path
+        )
+        self.assertTrue(ok_api, errs_api)
+
+        # Including 'prohibited word' on the same line must NOT bypass prohibited-adjective detection.
+        ok_byp, errs_byp = sync_docs.lint_prose_and_words(
+            "Note on prohibited word policy: this system is bulletproof.", "doc.md", registry_path=reg_path
+        )
+        self.assertFalse(ok_byp)
+        self.assertTrue(any("bulletproof" in e for e in errs_byp), errs_byp)
+
+    def test_provenance_gate_pinning_and_embedding_narrative_parity(self):
+        """Verify git_commit cleanliness, report filename parity, Go gate pinning, and embedding recommendation parity."""
+        bench_json = DOCS_DIR / "benchmarks" / "empirical_benchmarks.json"
+        base_bench = json.loads(bench_json.read_text(encoding="utf-8"))
+        emb_json = DOCS_DIR / "benchmarks" / "embedding_comparison.json"
+        base_emb = json.loads(emb_json.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+
+            # 1. Dirty git_commit in empirical_benchmarks.json must fail closed.
+            dirty_bench = json.loads(json.dumps(base_bench))
+            dirty_bench["metadata"]["git_commit"] = f"{base_bench['metadata']['git_commit']}-dirty"
+            p_dirty = tmp_dir / "dirty_bench.json"
+            p_dirty.write_text(json.dumps(dirty_bench), encoding="utf-8")
+            ok1, errs1 = sync_docs.independent_recompute_metrics(p_dirty, repo_root=REPO_ROOT)
+            self.assertFalse(ok1)
+            self.assertTrue(any("dirty/unknown" in e for e in errs1), errs1)
+
+            # 2. Loosened memory_ceiling_mb vs DefaultMaxMemMB in config.go must fail closed against REPO_ROOT.
+            loose_mem = json.loads(json.dumps(base_bench))
+            loose_mem["acceptance_gates"]["memory_ceiling_mb"] = 1024
+            p_mem = tmp_dir / "loose_mem.json"
+            p_mem.write_text(json.dumps(loose_mem), encoding="utf-8")
+            ok2, errs2 = sync_docs.independent_recompute_metrics(p_mem, repo_root=REPO_ROOT)
+            self.assertFalse(ok2)
+            self.assertTrue(any("DefaultMaxMemMB" in e for e in errs2), errs2)
+
+            # 3. Loosened threshold_nats vs DefaultThresholdNats in math.go must fail closed against REPO_ROOT.
+            loose_thr = json.loads(json.dumps(base_bench))
+            loose_thr["tier1_surprisal"]["threshold_nats"] = 9.5
+            p_thr = tmp_dir / "loose_thr.json"
+            p_thr.write_text(json.dumps(loose_thr), encoding="utf-8")
+            ok3, errs3 = sync_docs.independent_recompute_metrics(p_thr, repo_root=REPO_ROOT)
+            self.assertFalse(ok3)
+            self.assertTrue(any("DefaultThresholdNats" in e for e in errs3), errs3)
+
+            # 4. Tampered rss_delta_mb, fp_delta, or recommendation prose in embedding_comparison.json must fail closed.
+            bad_rss = json.loads(json.dumps(base_emb))
+            bad_rss["metadata"]["rss_delta_mb"] = 12.34
+            p_rss = tmp_dir / "bad_rss.json"
+            p_rss.write_text(json.dumps(bad_rss), encoding="utf-8")
+            ok4, errs4 = sync_docs.independent_recompute_embedding_comparison(
+                p_rss, repo_root=REPO_ROOT, require_governed_fields=True
+            )
+            self.assertFalse(ok4)
+            self.assertTrue(any("rss_delta_mb mismatch" in e for e in errs4), errs4)
+
+            bad_fp = json.loads(json.dumps(base_emb))
+            bad_fp["comparison"]["fp_delta"] = 3
+            p_fp = tmp_dir / "bad_fp.json"
+            p_fp.write_text(json.dumps(bad_fp), encoding="utf-8")
+            ok5, errs5 = sync_docs.independent_recompute_embedding_comparison(
+                p_fp, repo_root=REPO_ROOT, require_governed_fields=True
+            )
+            self.assertFalse(ok5)
+            self.assertTrue(any("fp_delta mismatch" in e for e in errs5), errs5)
+
+            bad_rec = json.loads(json.dumps(base_emb))
+            bad_rec["comparison"]["recommendation"] = bad_rec["comparison"]["recommendation"].replace("347.6x", "999.9x")
+            p_rec = tmp_dir / "bad_rec.json"
+            p_rec.write_text(json.dumps(bad_rec), encoding="utf-8")
+            ok6, errs6 = sync_docs.independent_recompute_embedding_comparison(
+                p_rec, repo_root=REPO_ROOT, require_governed_fields=True
+            )
+            self.assertFalse(ok6)
+            self.assertTrue(any("recommendation narrative drifted" in e for e in errs6), errs6)
+
+    def test_static_go_network_boundary_and_landscape_gate(self):
+        """Verify audit-claims.py static Go network boundary and 180-day landscape freshness gate."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("audit_claims_mod", REPO_ROOT / "scripts" / "audit-claims.py")
+        audit_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(audit_mod)
+
+        # 1. Committed repository passes both static Go network boundary and landscape freshness.
+        errs_live: list[str] = []
+        audit_mod.audit_go_network_egress_boundary(errs_live, repo_root=REPO_ROOT)
+        audit_mod.audit_landscape_freshness(errs_live, repo_root=REPO_ROOT)
+        self.assertEqual(errs_live, [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "internal" / "security").mkdir(parents=True)
+            (tmp_root / "internal" / "emit").mkdir(parents=True)
+            (tmp_root / "docs").mkdir(parents=True)
+
+            # Allowed inside internal/security, struct pointer fields (*http.Client), comments/strings, and _test.go files.
+            (tmp_root / "internal" / "security" / "net.go").write_text(
+                'package security\nimport "net"\nfunc d() { _, _ = net.DialTimeout("tcp", "127.0.0.1:9", 0) }\n',
+                encoding="utf-8",
+            )
+            (tmp_root / "internal" / "emit" / "safe.go").write_text(
+                'package emit\nimport "net/http"\ntype Wrapper struct { c *http.Client }\n'
+                '// net.DialTimeout("tcp", "x", 0)\n/* &http.Client{} */\nconst msg = "http.Get(url)"\n',
+                encoding="utf-8",
+            )
+            (tmp_root / "internal" / "emit" / "sink_test.go").write_text(
+                'package emit\nimport "net/http"\nvar _ = &http.Client{}\n',
+                encoding="utf-8",
+            )
+            errs_ok: list[str] = []
+            audit_mod.audit_go_network_egress_boundary(errs_ok, repo_root=tmp_root)
+            self.assertEqual(errs_ok, [])
+
+            # Raw net.DialTimeout, &http.Client{}, or new(http.Client) outside internal/security must fail closed!
+            (tmp_root / "internal" / "emit" / "bypass.go").write_text(
+                'package emit\nimport ("net"; "net/http")\n'
+                'func bad() { _, _ = net.DialTimeout("tcp", "localhost:9000", 0); _ = &http.Client{}; _ = new(http.Client) }\n',
+                encoding="utf-8",
+            )
+            errs_bad: list[str] = []
+            audit_mod.audit_go_network_egress_boundary(errs_bad, repo_root=tmp_root)
+            self.assertEqual(len(errs_bad), 3, errs_bad)
+            self.assertTrue(all("bypass.go" in e for e in errs_bad), errs_bad)
+
+            # Stale (>180 days) landscape-meta must fail closed!
+            (tmp_root / "docs" / "ALTERNATIVES.md").write_text(
+                "<!-- landscape-meta\n"
+                "last-reviewed: 2024-01-01\n"
+                "review-cadence-days: 180\n"
+                "reviewed-versions: [fail2ban@v1.1, crowdsec@v1.6, falco@v0.39]\n"
+                "-->\n# Alternatives\n",
+                encoding="utf-8",
+            )
+            errs_stale: list[str] = []
+            audit_mod.audit_landscape_freshness(errs_stale, repo_root=tmp_root)
+            self.assertTrue(any("STALE" in e for e in errs_stale), errs_stale)
 
 
 if __name__ == "__main__":

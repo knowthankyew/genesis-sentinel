@@ -49,4 +49,4 @@ audit:
 	python3 ./scripts/audit-claims.py
 
 clean:
-	rm -rf bin/
+	rm -rf bin/ *.test

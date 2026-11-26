@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,5 +87,66 @@ func TestGenesisTCPSinkEmitsValidGenesisJSONLine(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for TCP alert")
+	}
+}
+
+func TestGenesisTCPSinkLoopbackPolicyRejectsRemoteAndDialsLocalhost(t *testing.T) {
+	alert := Alert{
+		Timestamp:     1763996400,
+		Service:       "sentinel",
+		Level:         "ERROR",
+		TraceID:       "alert-loopback-check",
+		Message:       "test alert",
+		AlertID:       "alert-loopback-check",
+		Tier:          "tier0",
+		SourceService: "sshd",
+		Severity:      "HIGH",
+		Count:         1,
+	}
+
+	// 1. Default loopback policy must fail closed at dial time on non-loopback targets without opening external sockets.
+	remoteSink := NewGenesisTCPSink("203.0.113.10:9000", 150*time.Millisecond)
+	defer func() { _ = remoteSink.Close() }()
+	err := remoteSink.Emit(alert)
+	if err == nil || !strings.Contains(err.Error(), "refusing non-loopback dial target") {
+		t.Fatalf("expected dial-time loopback policy rejection for 203.0.113.10:9000, got err=%v", err)
+	}
+
+	// 2. Hostname "localhost:<port>" must dial loopback IP literals directly via DialLoopbackContext.
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp4: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+
+	done := make(chan string, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			done <- ""
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		done <- line
+	}()
+
+	localhostSink := NewGenesisTCPSink(net.JoinHostPort("localhost", port), 2*time.Second)
+	defer func() { _ = localhostSink.Close() }()
+	if err := localhostSink.Emit(alert); err != nil {
+		t.Fatalf("expected localhost dial via DialLoopbackContext to succeed, got: %v", err)
+	}
+	select {
+	case line := <-done:
+		if !strings.Contains(line, `"alert-loopback-check"`) {
+			t.Fatalf("unexpected TCP payload: %q", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for localhost TCP alert")
 	}
 }

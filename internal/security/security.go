@@ -164,6 +164,25 @@ func DialLoopbackContext(ctx context.Context, network, addr string) (net.Conn, e
 	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 }
 
+// DialEndpointTimeout dials network/addr with the given timeout, enforcing dial-time
+// loopback IP verification (via DialLoopbackContext) whenever allowRemote is false so
+// DNS or hosts-file overrides cannot divert a loopback-configured TCP/UDP client off-host.
+func DialEndpointTimeout(network, addr string, timeout time.Duration, allowRemote bool) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if !allowRemote {
+		return DialLoopbackContext(ctx, network, addr)
+	}
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}
+	return dialer.DialContext(ctx, network, addr)
+}
+
 // dialLocalhostDualStack attempts 127.0.0.1 first and staggers ::1 after 150ms (or immediately
 // on IPv4 error) so a stalled/filtered IPv4 loopback dial cannot consume the caller's request
 // timeout before IPv6 loopback is tried.

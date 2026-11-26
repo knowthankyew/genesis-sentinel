@@ -185,11 +185,11 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 		sink = emit.NewWriterSink(stdout)
 	} else if stdoutAlerts {
 		sink = emit.NewMultiSink(
-			emit.NewGenesisTCPSink(cfg.GenesisTCPAddr, 2*time.Second),
+			emit.NewGenesisTCPSinkWithPolicy(cfg.GenesisTCPAddr, 2*time.Second, cfg.AllowRemoteEndpoints),
 			emit.NewWriterSink(stdout),
 		)
 	} else {
-		sink = emit.NewGenesisTCPSink(cfg.GenesisTCPAddr, 2*time.Second)
+		sink = emit.NewGenesisTCPSinkWithPolicy(cfg.GenesisTCPAddr, 2*time.Second, cfg.AllowRemoteEndpoints)
 	}
 	defer func() { _ = sink.Close() }()
 

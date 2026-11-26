@@ -4,7 +4,7 @@ eval_embedding_comparison.py — Phase 4 Offline Semantic Embedding Experiment
 for Genesis Sentinel (`knowthankyew/genesis-sentinel`).
 
 Compares:
-  1. Pure Laplace-LK log-domain features (matching internal/surprisal/math.go exactly)
+  1. Pure Laplace-LK log-domain feature proxy (approximating internal/surprisal/ in pure Python)
   2. Hybrid Laplace-LK + `sentence-transformers/all-MiniLM-L6-v2` semantic cosine novelty
 
 Runs 100% offline (HF_HUB_OFFLINE=1, local_files_only=True) using cached local weights
@@ -122,6 +122,49 @@ def laplace_lk_score(
     scores.sort()
     k = min(K_NEIGHBORS, len(scores))
     return sum(scores[:k]) / k
+
+
+def build_conclusion_recommendation(
+    model_short_name: str,
+    threshold_nats: float,
+    semantic_weight: float,
+    recall_improved: bool,
+    recall_delta: float,
+    lk_disg_recall: float,
+    hyb_disg_recall: float,
+    fp_delta: int,
+    lk_fp: int,
+    hyb_fp: int,
+    lk_p50: float,
+    hyb_p50: float,
+    latency_ratio: float,
+    rss_delta: float,
+) -> str:
+    """Build governed conclusion prose exclusively from computed metrics (enforced via AST lint)."""
+    if recall_improved:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {threshold_nats:.1f} nats "
+            f"(semantic_weight={semantic_weight:g}), disguised-semantic recall changed by "
+            f"{recall_delta:+.4f} ({lk_disg_recall:.4f} -> "
+            f"{hyb_disg_recall:.4f}) with FP delta {fp_delta:+d} "
+            f"({lk_fp} -> {hyb_fp})."
+        )
+    else:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {threshold_nats:.1f} nats "
+            f"(semantic_weight={semantic_weight:g}), disguised-semantic recall showed "
+            f"{recall_delta:+.4f} change ({lk_disg_recall:.4f} -> "
+            f"{hyb_disg_recall:.4f}) with FP delta {fp_delta:+d}."
+        )
+
+    return (
+        f"In this Python proxy comparison, the Laplace-LK baseline scored P50 {lk_p50:.4f} ms vs hybrid "
+        f"{model_short_name} P50 {hyb_p50:.4f} ms (~{latency_ratio}x slower in Python, +{rss_delta:.2f} MB peak "
+        f"process RSS delta after PyTorch/Transformers imports). {recall_summary} Because neural embedding "
+        f"inference measured {hyb_p50:.4f} ms P50 latency and +{rss_delta:.2f} MB post-import peak process RSS "
+        f"overhead in this benchmark, semantic embeddings remain optional for sidecar or offline evaluation "
+        f"rather than embedded in the zero-dependency Go binary."
+    )
 
 
 def build_corpus() -> tuple[list[dict], list[dict]]:
@@ -335,29 +378,21 @@ def main() -> int:
     fp_delta = hyb_metrics["fp"] - lk_metrics["fp"]
     rss_delta = round(max(rss_after_model - rss_before_model, 0.0), 2)
 
-    if recall_delta > 0:
-        recall_summary = (
-            f"On this synthetic corpus at fixed threshold {DEFAULT_THRESHOLD_NATS:.1f} nats "
-            f"(semantic_weight={args.semantic_weight:g}), disguised-semantic recall changed by "
-            f"{recall_delta:+.4f} ({lk_metrics['disguised_semantic_recall']:.4f} -> "
-            f"{hyb_metrics['disguised_semantic_recall']:.4f}) with FP delta {fp_delta:+d} "
-            f"({lk_metrics['fp']} -> {hyb_metrics['fp']})."
-        )
-    else:
-        recall_summary = (
-            f"On this synthetic corpus at fixed threshold {DEFAULT_THRESHOLD_NATS:.1f} nats "
-            f"(semantic_weight={args.semantic_weight:g}), disguised-semantic recall showed "
-            f"{recall_delta:+.4f} change ({lk_metrics['disguised_semantic_recall']:.4f} -> "
-            f"{hyb_metrics['disguised_semantic_recall']:.4f}) with FP delta {fp_delta:+d}."
-        )
-
-    recommendation = (
-        f"In this Python proxy comparison, the Laplace-LK baseline scored P50 {lk_p50:.4f} ms vs hybrid "
-        f"all-MiniLM-L6-v2 P50 {hyb_p50:.4f} ms (~{latency_ratio}x slower in Python, +{rss_delta:.2f} MB peak "
-        f"process RSS delta after PyTorch/Transformers imports). {recall_summary} Because neural embedding "
-        f"inference measured {hyb_p50:.4f} ms P50 latency and +{rss_delta:.2f} MB post-import peak process RSS "
-        f"overhead in this benchmark, semantic embeddings remain optional for sidecar or offline evaluation "
-        f"rather than embedded in the zero-dependency Go binary."
+    recommendation = build_conclusion_recommendation(
+        model_short_name=MODEL_ID.split("/")[-1],
+        threshold_nats=DEFAULT_THRESHOLD_NATS,
+        semantic_weight=args.semantic_weight,
+        recall_improved=recall_delta > 0,
+        recall_delta=recall_delta,
+        lk_disg_recall=lk_metrics["disguised_semantic_recall"],
+        hyb_disg_recall=hyb_metrics["disguised_semantic_recall"],
+        fp_delta=fp_delta,
+        lk_fp=lk_metrics["fp"],
+        hyb_fp=hyb_metrics["fp"],
+        lk_p50=lk_p50,
+        hyb_p50=hyb_p50,
+        latency_ratio=latency_ratio,
+        rss_delta=rss_delta,
     )
 
     import subprocess as _sp

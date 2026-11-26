@@ -26,6 +26,7 @@ import json
 import math
 import operator
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,6 +37,13 @@ DEFAULT_README_PATH = REPO_ROOT / "README.md"
 EMPIRICAL_BLOCK_DELIMITERS = [
     ("<!-- BEGIN_EMPIRICAL -->", "<!-- END_EMPIRICAL -->"),
 ]
+
+REQUIRED_CONCLUSION_SCRIPTS = (
+    "eval_embedding_comparison.py",
+)
+
+_PERSONAL_HOST_PATH_RE = re.compile(r"(?:/Users/|/home/|[A-Za-z]:(?:\\|/)[Uu]sers(?:\\|/))")
+_ALLOWED_PERCENTILE_TOKEN_RE = re.compile(r"\bP(?:50|90|95|99)\b")
 
 PROHIBITED_WORDS = [
     re.compile(r"\bbullet-?proof\b", re.IGNORECASE),
@@ -233,15 +241,128 @@ def _req_sample_array(
     return out
 
 
+def _has_personal_host_path_text(text: str) -> bool:
+    """Detect leaked macOS (/Users/), Linux (/home/), or Windows (C:\\Users\\) personal paths."""
+    return _PERSONAL_HOST_PATH_RE.search(text) is not None
+
+
 def _contains_personal_host_path(obj) -> bool:
     """Recursively check decoded JSON strings for personal host prefixes (catching JSON-escaped slashes)."""
     if isinstance(obj, str):
-        return "/Users/" in obj or "/home/" in obj
+        return _has_personal_host_path_text(obj)
     if isinstance(obj, dict):
         return any(_contains_personal_host_path(k) or _contains_personal_host_path(v) for k, v in obj.items())
     if isinstance(obj, list):
         return any(_contains_personal_host_path(v) for v in obj)
     return False
+
+
+def _verify_git_commit_ancestry(commit: object, repo_root: Path, label: str, errors: list[str]) -> bool:
+    """Verify git_commit metadata is a clean 7-40 hex hash (never 'unknown' or '-dirty') and an ancestor of HEAD."""
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+        errors.append(
+            f"{label}: git_commit {commit!r} must be a clean 7-40 hex git commit hash (dirty/unknown builds not permitted)"
+        )
+        return False
+    if (repo_root / ".git").exists():
+        try:
+            rev = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+            )
+            if rev.returncode != 0:
+                errors.append(f"{label}: git_commit '{commit}' not found in repository git history")
+                return False
+            anc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+            )
+            if anc.returncode != 0:
+                errors.append(f"{label}: git_commit '{commit}' is not an ancestor of HEAD")
+                return False
+        except FileNotFoundError as exc:
+            errors.append(f"{label}: git executable not found while verifying commit ancestry ({exc})")
+            return False
+    return True
+
+
+def lint_script_conclusions(scripts_dir: Path) -> tuple[bool, list[str]]:
+    """
+    AST check (ported from companion `ml`) verifying that functions building narrative
+    conclusion/recommendation prose contain zero hardcoded numeric literals or digit-bearing
+    string fragments (other than standard P50/P90/P95/P99 percentile labels and format specs),
+    and that governed benchmark scripts define a `*conclusion*` builder function.
+    """
+    errors: list[str] = []
+    if not scripts_dir.is_dir():
+        return True, []
+
+    def _walk_excluding_format_specs(node: ast.AST):
+        yield node
+        for field_name, field_val in ast.iter_fields(node):
+            if isinstance(node, ast.FormattedValue) and field_name == "format_spec":
+                continue
+            if isinstance(field_val, list):
+                for item in field_val:
+                    if isinstance(item, ast.AST):
+                        yield from _walk_excluding_format_specs(item)
+            elif isinstance(field_val, ast.AST):
+                yield from _walk_excluding_format_specs(field_val)
+
+    for py_file in sorted(scripts_dir.glob("*.py")):
+        if py_file.name in ("sync_docs.py", "audit-claims.py", "generate-sbom.py"):
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        except Exception as exc:
+            errors.append(f"Failed to parse AST for {py_file.name}: {exc}")
+            continue
+
+        found_conclusion_fn = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and "conclusion" in node.name.lower():
+                found_conclusion_fn = True
+                docstring_node = (
+                    node.body[0].value
+                    if (
+                        node.body
+                        and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)
+                    )
+                    else None
+                )
+                for stmt in node.body:
+                    for child in _walk_excluding_format_specs(stmt):
+                        if child is docstring_node:
+                            continue
+                        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                            scrubbed = _ALLOWED_PERCENTILE_TOKEN_RE.sub("", child.value)
+                            if re.search(r"\d", scrubbed):
+                                errors.append(
+                                    f"Script AST lint: {py_file.name}::{node.name} line {getattr(child, 'lineno', '?')} "
+                                    f"contains hardcoded digit in string fragment: {child.value!r}"
+                                )
+                        elif (
+                            isinstance(child, ast.Constant)
+                            and isinstance(child.value, (int, float))
+                            and not isinstance(child.value, bool)
+                        ):
+                            errors.append(
+                                f"Script AST lint: {py_file.name}::{node.name} line {getattr(child, 'lineno', '?')} "
+                                f"contains hardcoded numeric literal: {child.value!r}"
+                            )
+
+        if py_file.name in REQUIRED_CONCLUSION_SCRIPTS and not found_conclusion_fn:
+            errors.append(
+                f"Script AST lint: {py_file.name} must define a conclusion builder function (*conclusion*) governed by AST lint."
+            )
+
+    return len(errors) == 0, errors
 
 
 def _is_int(v) -> bool:
@@ -494,7 +615,7 @@ def independent_recompute_metrics(
         raw_json = benchmark_json_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return False, [f"Failed to read {benchmark_json_path}: {exc}"]
-    if "/Users/" in raw_json or "/home/" in raw_json:
+    if _has_personal_host_path_text(raw_json):
         errors.append("Empirical benchmark JSON contains leaked personal host path")
 
     try:
@@ -518,7 +639,10 @@ def independent_recompute_metrics(
     if errors:
         return False, errors
 
-    # 1. Verify Sentinel version metadata against internal/cli/cli.go (when present in repo_root)
+    # 1. Verify Sentinel version, git_commit provenance, and Go code-constant gate pinning (when present in repo_root)
+    git_commit = meta.get("git_commit")
+    commit_valid = _verify_git_commit_ancestry(git_commit, repo_root, "Empirical benchmark metadata", errors)
+
     cli_go = repo_root / "internal" / "cli" / "cli.go"
     if cli_go.is_file():
         try:
@@ -529,6 +653,31 @@ def independent_recompute_metrics(
                 )
         except Exception as exc:
             errors.append(f"Failed to extract CLI Version for benchmark check: {exc}")
+
+    config_go = repo_root / "internal" / "config" / "config.go"
+    if config_go.is_file():
+        try:
+            expected_mem_mb = extract_go_constant(config_go, "DefaultMaxMemMB")
+            if gates.get("memory_ceiling_mb") != expected_mem_mb:
+                errors.append(
+                    f"Benchmark acceptance_gates.memory_ceiling_mb ({gates.get('memory_ceiling_mb')!r}) drifted from "
+                    f"DefaultMaxMemMB ({expected_mem_mb!r}) in internal/config/config.go"
+                )
+        except Exception as exc:
+            errors.append(f"Failed to extract DefaultMaxMemMB for gate check: {exc}")
+
+    math_go = repo_root / "internal" / "surprisal" / "math.go"
+    if math_go.is_file():
+        try:
+            expected_thresh = extract_go_constant(math_go, "DefaultThresholdNats")
+            stored_thresh = t1.get("threshold_nats")
+            if not _is_finite_num(stored_thresh) or float(stored_thresh) != float(expected_thresh):
+                errors.append(
+                    f"Benchmark tier1_surprisal.threshold_nats ({stored_thresh!r}) drifted from "
+                    f"DefaultThresholdNats ({expected_thresh!r}) in internal/surprisal/math.go"
+                )
+        except Exception as exc:
+            errors.append(f"Failed to extract DefaultThresholdNats for gate check: {exc}")
 
     # 2. Tier 0 replay throughput, lossless drop count, digest identity, and collapse ratio
     tps_target = _req_num(gates, "throughput_target_lps", errors, "acceptance_gates")
@@ -786,13 +935,19 @@ def independent_recompute_metrics(
                     errors.append(f"Referenced markdown benchmark report not found: {report_rel!r}")
                 else:
                     report_path = cand
+                    if commit_valid and isinstance(git_commit, str):
+                        if not re.fullmatch(rf"\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(git_commit)}\.md", cand.name):
+                            errors.append(
+                                f"Benchmark report_markdown filename {cand.name!r} must match "
+                                f"'YYYY-MM-DD-{git_commit}.md' for metadata.git_commit={git_commit!r}"
+                            )
 
     if report_path is not None and not errors:
         try:
             md_text = report_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             return False, [f"Failed to read markdown benchmark report {report_rel}: {exc}"]
-        if "/Users/" in md_text or "/home/" in md_text:
+        if _has_personal_host_path_text(md_text):
             errors.append(f"Markdown benchmark report {report_rel} contains leaked personal host path")
 
         published_rows, seen_labels, dup_labels = _extract_published_markdown_table_rows(md_text)
@@ -834,13 +989,57 @@ def independent_recompute_metrics(
     return len(errors) == 0, errors
 
 
+def _format_expected_embedding_recommendation(
+    model_short_name: str,
+    threshold_nats: float,
+    semantic_weight: float,
+    recall_delta: float,
+    lk_disg_recall: float,
+    hyb_disg_recall: float,
+    fp_delta: int,
+    lk_fp: int,
+    hyb_fp: int,
+    lk_p50: float,
+    hyb_p50: float,
+    latency_ratio: float,
+    rss_delta: float,
+) -> str:
+    if recall_delta > 0:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {threshold_nats:.1f} nats "
+            f"(semantic_weight={semantic_weight:g}), disguised-semantic recall changed by "
+            f"{recall_delta:+.4f} ({lk_disg_recall:.4f} -> "
+            f"{hyb_disg_recall:.4f}) with FP delta {fp_delta:+d} "
+            f"({lk_fp} -> {hyb_fp})."
+        )
+    else:
+        recall_summary = (
+            f"On this synthetic corpus at fixed threshold {threshold_nats:.1f} nats "
+            f"(semantic_weight={semantic_weight:g}), disguised-semantic recall showed "
+            f"{recall_delta:+.4f} change ({lk_disg_recall:.4f} -> "
+            f"{hyb_disg_recall:.4f}) with FP delta {fp_delta:+d}."
+        )
+    return (
+        f"In this Python proxy comparison, the Laplace-LK baseline scored P50 {lk_p50:.4f} ms vs hybrid "
+        f"{model_short_name} P50 {hyb_p50:.4f} ms (~{latency_ratio}x slower in Python, +{rss_delta:.2f} MB peak "
+        f"process RSS delta after PyTorch/Transformers imports). {recall_summary} Because neural embedding "
+        f"inference measured {hyb_p50:.4f} ms P50 latency and +{rss_delta:.2f} MB post-import peak process RSS "
+        f"overhead in this benchmark, semantic embeddings remain optional for sidecar or offline evaluation "
+        f"rather than embedded in the zero-dependency Go binary."
+    )
+
+
 def independent_recompute_embedding_comparison(
     embedding_json_path: Path,
+    repo_root: Path = REPO_ROOT,
     validated_json_cache: dict[Path, dict] | None = None,
+    require_governed_fields: bool = False,
 ) -> tuple[bool, list[str]]:
-    """Independently verify mathematical consistency of docs/benchmarks/embedding_comparison.json."""
+    """Independently verify mathematical consistency and narrative parity of docs/benchmarks/embedding_comparison.json."""
     errors: list[str] = []
     if not embedding_json_path.exists():
+        if require_governed_fields:
+            return False, [f"Missing required embedding comparison JSON: {embedding_json_path}"]
         return True, []
     if not embedding_json_path.is_file():
         return False, [f"Embedding comparison path is not a regular file: {embedding_json_path}"]
@@ -849,7 +1048,7 @@ def independent_recompute_embedding_comparison(
         raw = embedding_json_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return False, [f"Failed to read {embedding_json_path}: {exc}"]
-    if "/Users/" in raw or "/home/" in raw:
+    if _has_personal_host_path_text(raw):
         errors.append("Embedding comparison JSON contains leaked personal host path")
     try:
         data = _loads_strict_json(raw)
@@ -860,12 +1059,35 @@ def independent_recompute_embedding_comparison(
     if _contains_personal_host_path(data):
         errors.append("Embedding comparison JSON contains leaked personal host path in decoded strings")
 
+    meta = _req_dict(data, "metadata", errors, "embedding_comparison")
     ds = _req_dict(data, "dataset", errors, "embedding_comparison")
     lk = _req_dict(data, "pure_laplace_lk", errors, "embedding_comparison")
     hyb = _req_dict(data, "hybrid_laplace_lk_minilm", errors, "embedding_comparison")
     cmp_sec = _req_dict(data, "comparison", errors, "embedding_comparison")
     if errors:
         return False, errors
+
+    if require_governed_fields or "git_commit" in meta:
+        _verify_git_commit_ancestry(meta.get("git_commit"), repo_root, "Embedding comparison metadata", errors)
+    if require_governed_fields and meta.get("offline_mode") is not True:
+        errors.append(f"embedding_comparison metadata.offline_mode must be true, got {meta.get('offline_mode')!r}")
+
+    calc_rss_delta: float | None = None
+    if require_governed_fields or any(k in meta for k in ("rss_before_model_mb", "rss_after_model_mb", "rss_delta_mb")):
+        rss_before = _req_num(meta, "rss_before_model_mb", errors, "metadata")
+        rss_after = _req_num(meta, "rss_after_model_mb", errors, "metadata")
+        rss_delta = _req_num(meta, "rss_delta_mb", errors, "metadata")
+        if None not in (rss_before, rss_after, rss_delta):
+            if not (0 < rss_before <= rss_after):
+                errors.append(
+                    f"embedding_comparison RSS ordering invalid: before={rss_before}MB, after={rss_after}MB"
+                )
+            else:
+                calc_rss_delta = round(max(rss_after - rss_before, 0.0), 2)
+                if f"{rss_delta:.2f}" != f"{calc_rss_delta:.2f}":
+                    errors.append(
+                        f"embedding_comparison metadata.rss_delta_mb mismatch: stored {rss_delta:.2f}, calc {calc_rss_delta:.2f}"
+                    )
 
     eval_total = _req_int(ds, "eval_total_windows", errors, "dataset", min_val=1)
     eval_benign = _req_int(ds, "eval_benign_windows", errors, "dataset", min_val=0)
@@ -940,27 +1162,65 @@ def independent_recompute_embedding_comparison(
 
     if "pure_laplace_lk" in recomputed and "hybrid_laplace_lk_minilm" in recomputed:
         stored_f1_delta = _req_num(cmp_sec, "f1_delta", errors, "comparison")
+        stored_fp_delta = _req_int(cmp_sec, "fp_delta", errors, "comparison")
         stored_disg_delta = _req_num(cmp_sec, "disguised_semantic_recall_delta", errors, "comparison")
         stored_slowdown = _req_num(cmp_sec, "p50_latency_slowdown_x", errors, "comparison")
+        exp_fp_delta = int(recomputed["hybrid_laplace_lk_minilm"]["fp"]) - int(recomputed["pure_laplace_lk"]["fp"])
+        exp_disg_delta = round(recomputed["hybrid_laplace_lk_minilm"]["disg_rec"] - recomputed["pure_laplace_lk"]["disg_rec"], 4)
+        lk_p50_v = float(recomputed["pure_laplace_lk"]["p50"])
+        hyb_p50_v = float(recomputed["hybrid_laplace_lk_minilm"]["p50"])
+        exp_slowdown = round(hyb_p50_v / max(lk_p50_v, 0.0001), 1)
+
         if stored_f1_delta is not None:
             exp_f1_delta = round(recomputed["hybrid_laplace_lk_minilm"]["f1"] - recomputed["pure_laplace_lk"]["f1"], 4)
             if f"{stored_f1_delta:.4f}" != f"{exp_f1_delta:.4f}":
                 errors.append(f"embedding_comparison f1_delta mismatch: stored {stored_f1_delta:.4f}, calc {exp_f1_delta:.4f}")
+        if stored_fp_delta is not None and stored_fp_delta != exp_fp_delta:
+            errors.append(f"embedding_comparison fp_delta mismatch: stored {stored_fp_delta}, calc {exp_fp_delta}")
         if stored_disg_delta is not None:
-            exp_disg_delta = round(recomputed["hybrid_laplace_lk_minilm"]["disg_rec"] - recomputed["pure_laplace_lk"]["disg_rec"], 4)
             if f"{stored_disg_delta:.4f}" != f"{exp_disg_delta:.4f}":
                 errors.append(
                     f"embedding_comparison disguised_semantic_recall_delta mismatch: "
                     f"stored {stored_disg_delta:.4f}, calc {exp_disg_delta:.4f}"
                 )
         if stored_slowdown is not None:
-            lk_p50_v = float(recomputed["pure_laplace_lk"]["p50"])
-            hyb_p50_v = float(recomputed["hybrid_laplace_lk_minilm"]["p50"])
-            exp_slowdown = round(hyb_p50_v / max(lk_p50_v, 0.0001), 1)
             if f"{stored_slowdown:.1f}" != f"{exp_slowdown:.1f}":
                 errors.append(
                     f"embedding_comparison p50_latency_slowdown_x mismatch: stored {stored_slowdown:.1f}, calc {exp_slowdown:.1f}"
                 )
+
+        if require_governed_fields or "recommendation" in cmp_sec:
+            rec_text = cmp_sec.get("recommendation")
+            model_id = meta.get("model_id")
+            thresh_nats = _req_num(ds, "threshold_nats", errors, "dataset")
+            sem_weight = _req_num(ds, "semantic_weight_nats", errors, "dataset")
+            if not isinstance(rec_text, str) or not rec_text.strip():
+                errors.append("embedding_comparison comparison.recommendation must be a non-empty string")
+            elif not isinstance(model_id, str) or not model_id.strip():
+                errors.append("embedding_comparison metadata.model_id must be a non-empty string")
+            elif calc_rss_delta is None:
+                errors.append("embedding_comparison recommendation check requires metadata.rss_before_model_mb/rss_after_model_mb/rss_delta_mb")
+            elif thresh_nats is not None and sem_weight is not None:
+                exp_rec = _format_expected_embedding_recommendation(
+                    model_short_name=model_id.split("/")[-1],
+                    threshold_nats=thresh_nats,
+                    semantic_weight=sem_weight,
+                    recall_delta=exp_disg_delta,
+                    lk_disg_recall=float(recomputed["pure_laplace_lk"]["disg_rec"]),
+                    hyb_disg_recall=float(recomputed["hybrid_laplace_lk_minilm"]["disg_rec"]),
+                    fp_delta=exp_fp_delta,
+                    lk_fp=int(recomputed["pure_laplace_lk"]["fp"]),
+                    hyb_fp=int(recomputed["hybrid_laplace_lk_minilm"]["fp"]),
+                    lk_p50=lk_p50_v,
+                    hyb_p50=hyb_p50_v,
+                    latency_ratio=exp_slowdown,
+                    rss_delta=calc_rss_delta,
+                )
+                if rec_text != exp_rec:
+                    errors.append(
+                        f"embedding_comparison comparison.recommendation narrative drifted from recomputed metrics:\n"
+                        f"  stored  : {rec_text!r}\n  expected: {exp_rec!r}"
+                    )
 
     if not errors and validated_json_cache is not None:
         validated_json_cache[embedding_json_path.resolve()] = data
@@ -1004,16 +1264,8 @@ def lint_prose_and_words(
     errors: list[str] = []
 
     for idx, line in enumerate(content.splitlines(), 1):
-        if "/Users/" in line:
-            errors.append(f"Personal path leak in {doc_name}:{idx}: found '/Users/' host path.")
-        lower = line.lower()
-        if (
-            "prohibits unprovable" in lower
-            or "prohibited word" in lower
-            or "prohibited marketing" in lower
-            or "banned vocabulary" in lower
-        ):
-            continue
+        if _has_personal_host_path_text(line):
+            errors.append(f"Personal path leak in {doc_name}:{idx}: found personal host path.")
         for pat in PROHIBITED_WORDS:
             m = pat.search(line)
             if m:
@@ -1026,7 +1278,7 @@ def lint_prose_and_words(
     claim_terms = {}
     if registry_path and registry_path.is_file():
         try:
-            claim_terms = json.loads(registry_path.read_text(encoding="utf-8")).get("claim_terms", {})
+            claim_terms = _loads_strict_json(registry_path.read_text(encoding="utf-8")).get("claim_terms", {})
         except Exception as exc:
             errors.append(f"Failed to load claim_terms from {registry_path.name}: {exc}")
 
@@ -1058,6 +1310,233 @@ def lint_prose_and_words(
                 f"Word lint failure in {doc_name} line {line_no}: guarded term '{match.group(0)}' "
                 f"used in bare text without being tied to a registered claim marker."
             )
+
+    return len(errors) == 0, errors
+
+
+def _strip_fenced_code_blocks_preserve_lines(content: str) -> str:
+    """Blank out CommonMark backtick/tilde fenced code blocks while preserving 1-based line numbers."""
+    out: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for raw_line in content.splitlines():
+        if fence_char is not None:
+            close_m = re.match(r"^ {0,3}(" + re.escape(fence_char) + r"{3,})[ \t]*$", raw_line)
+            if close_m and len(close_m.group(1)) >= fence_len:
+                fence_char = None
+                fence_len = 0
+            out.append("")
+            continue
+        open_m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", raw_line)
+        if open_m and (open_m.group(1)[0] == "~" or "`" not in open_m.group(2)):
+            fence_char = open_m.group(1)[0]
+            fence_len = len(open_m.group(1))
+            out.append("")
+            continue
+        out.append(raw_line)
+    return "\n".join(out)
+
+
+def lint_claim_markers_and_regions(
+    content: str,
+    doc_name: str = "document",
+    registry_path: Path | None = None,
+) -> tuple[bool, list[str]]:
+    """
+    Validate structural integrity of `<!-- claim:... -->`, `<!-- claim_term:... -->`, and
+    `<!-- BEGIN_EMPIRICAL -->` markers across ANY scanned Markdown file (even docs outside `used_in`).
+    Catches unknown IDs, unclosed HTML comments, mismatched/nested closing tags, and ungoverned empirical blocks.
+    """
+    errors: list[str] = []
+    if registry_path is None:
+        registry_path = DEFAULT_REGISTRY_PATH
+
+    known_claims: set[str] = set()
+    known_terms: set[str] = set()
+    if registry_path and registry_path.is_file():
+        try:
+            reg = _loads_strict_json(registry_path.read_text(encoding="utf-8"))
+            known_claims = set(reg.get("claims", {}).keys())
+            known_terms = set(reg.get("claim_terms", {}).keys())
+        except Exception as exc:
+            errors.append(f"Failed to parse {registry_path.name}: {exc}")
+            return False, errors
+
+    stripped = _strip_fenced_code_blocks_preserve_lines(content)
+
+    # 1. Balanced BEGIN_EMPIRICAL / END_EMPIRICAL delimiters
+    for begin_marker, end_marker in EMPIRICAL_BLOCK_DELIMITERS:
+        b_count = stripped.count(begin_marker)
+        e_count = stripped.count(end_marker)
+        if b_count != e_count:
+            errors.append(
+                f"Marker lint failure in {doc_name}: unbalanced empirical delimiters "
+                f"({b_count} '{begin_marker}' vs {e_count} '{end_marker}')"
+            )
+
+    # 2. Scan all HTML comments starting with claim / /claim / claim_term / /claim_term
+    pos = 0
+    open_tag: tuple[str, str, int] | None = None  # (kind, id, line_no)
+    tag_start_re = re.compile(r"<!--\s*(/?claim(?:_term)?)\b")
+    full_open_re = re.compile(r"^<!--\s*(claim|claim_term):([a-zA-Z0-9_\-]+)\s*-->$")
+    full_close_re = re.compile(r"^<!--\s*/(claim|claim_term)\s*-->$")
+
+    while True:
+        m = tag_start_re.search(stripped, pos)
+        if not m:
+            break
+        start = m.start()
+        line_no = stripped[:start].count("\n") + 1
+        end = stripped.find("-->", start + 4)
+        if end == -1:
+            errors.append(f"Marker lint failure in {doc_name}:{line_no}: unclosed HTML claim marker comment")
+            break
+        raw_comment = stripped[start : end + 3]
+        pos = end + 3
+
+        mo = full_open_re.match(raw_comment)
+        mc = full_close_re.match(raw_comment)
+        if mo:
+            kind, cid = mo.group(1), mo.group(2)
+            if open_tag is not None:
+                errors.append(
+                    f"Marker lint failure in {doc_name}:{line_no}: nested or unclosed "
+                    f"'{open_tag[0]}:{open_tag[1]}' (opened at line {open_tag[2]}) before '{kind}:{cid}'"
+                )
+            open_tag = (kind, cid, line_no)
+            if kind == "claim" and known_claims and cid not in known_claims:
+                errors.append(f"Marker lint failure in {doc_name}:{line_no}: unknown claim ID '{cid}'")
+            elif kind == "claim_term" and known_terms and cid not in known_terms:
+                errors.append(f"Marker lint failure in {doc_name}:{line_no}: unknown claim_term ID '{cid}'")
+        elif mc:
+            close_kind = mc.group(1)
+            if open_tag is None:
+                errors.append(
+                    f"Marker lint failure in {doc_name}:{line_no}: orphan closing '<!-- /{close_kind} -->' without opening marker"
+                )
+            elif open_tag[0] != close_kind:
+                errors.append(
+                    f"Marker lint failure in {doc_name}:{line_no}: mismatched closing '<!-- /{close_kind} -->' "
+                    f"for '{open_tag[0]}:{open_tag[1]}' opened at line {open_tag[2]}"
+                )
+                open_tag = None
+            else:
+                open_tag = None
+        else:
+            errors.append(f"Marker lint failure in {doc_name}:{line_no}: malformed claim marker {raw_comment!r}")
+
+    if open_tag is not None:
+        errors.append(
+            f"Marker lint failure in {doc_name}:{open_tag[2]}: unclosed '<!-- {open_tag[0]}:{open_tag[1]} -->' (missing '<!-- /{open_tag[0]} -->')"
+        )
+
+    emp_ok, emp_errs = check_empirical_regions(stripped, doc_name)
+    if not emp_ok:
+        errors.extend(emp_errs)
+
+    return len(errors) == 0, errors
+
+
+def validate_claims_registry(
+    registry_path: Path,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[bool, list[str]]:
+    """
+    Validate structural & referential integrity of docs/claims_registry.json:
+    - Strict JSON (no duplicate claim IDs or non-finite constants) and zero personal paths
+    - Non-empty `used_in` lists pointing to existing repo-confined docs where each marker appears
+    - Required benchmark JSON artifacts exist and live Tier 2 claims are backed by `tier2_triage.enabled == true`
+    - All `claim_terms` evidence files and symbols exist
+    """
+    errors: list[str] = []
+    if not registry_path.is_file():
+        return False, [f"Registry not found: {registry_path}"]
+    try:
+        raw_reg = registry_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, [f"Failed to read {registry_path}: {exc}"]
+    if _has_personal_host_path_text(raw_reg):
+        errors.append(f"Registry {registry_path.name} contains leaked personal host path")
+    try:
+        reg = _loads_strict_json(raw_reg)
+    except Exception as exc:
+        return False, [f"Failed to parse {registry_path.name}: {exc}"]
+    if not isinstance(reg, dict):
+        return False, [f"Registry {registry_path.name} root must be a JSON object"]
+    if _contains_personal_host_path(reg):
+        errors.append(f"Registry {registry_path.name} contains leaked personal host path in decoded strings")
+
+    claims = reg.get("claims")
+    if not isinstance(claims, dict) or not claims:
+        return False, [f"Registry {registry_path.name} must define a non-empty 'claims' object"]
+
+    resolved_root = repo_root.resolve()
+    doc_cache: dict[Path, str] = {}
+    json_cache: dict[Path, dict] = {}
+
+    for cid, cfg in claims.items():
+        if not isinstance(cfg, dict):
+            errors.append(f"Claim '{cid}' config must be a JSON object")
+            continue
+        art_rel = cfg.get("source_artifact")
+        if not isinstance(art_rel, str) or not art_rel.strip() or Path(art_rel).is_absolute():
+            errors.append(f"Claim '{cid}' has missing or non-relative source_artifact: {art_rel!r}")
+        else:
+            art_path = (repo_root / art_rel).resolve()
+            try:
+                art_path.relative_to(resolved_root)
+            except ValueError:
+                errors.append(f"Claim '{cid}' source_artifact escapes repository root: {art_rel!r}")
+            else:
+                if not art_path.is_file():
+                    errors.append(f"Claim '{cid}' required source_artifact does not exist: {art_rel}")
+                elif art_rel == "docs/benchmarks/empirical_benchmarks.json" and str(cfg.get("json_path", "")).startswith("tier2_triage."):
+                    if art_path not in json_cache:
+                        try:
+                            json_cache[art_path] = _loads_strict_json(art_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            json_cache[art_path] = {}
+                    t2_sec = json_cache[art_path].get("tier2_triage", {})
+                    if not isinstance(t2_sec, dict) or t2_sec.get("enabled") is not True:
+                        errors.append(
+                            f"Claim '{cid}' references live Tier 2 benchmark path '{cfg.get('json_path')}', "
+                            f"but tier2_triage.enabled is not true in {art_rel}"
+                        )
+
+        used_in = cfg.get("used_in")
+        if not isinstance(used_in, list) or not used_in:
+            errors.append(f"Claim '{cid}' must declare a non-empty 'used_in' document list (orphaned claim)")
+            continue
+        seen_docs: set[str] = set()
+        marker_re = re.compile(rf"<!--\s*claim:{re.escape(cid)}\s*-->.*?<!--\s*/claim\s*-->", re.DOTALL)
+        for rel_doc in used_in:
+            if not isinstance(rel_doc, str) or not rel_doc.strip() or Path(rel_doc).is_absolute():
+                errors.append(f"Claim '{cid}' has invalid 'used_in' entry: {rel_doc!r}")
+                continue
+            norm_rel = rel_doc.replace("\\", "/")
+            if norm_rel in seen_docs:
+                errors.append(f"Claim '{cid}' has duplicate 'used_in' entry: {norm_rel}")
+                continue
+            seen_docs.add(norm_rel)
+            doc_p = (repo_root / norm_rel).resolve()
+            try:
+                doc_p.relative_to(resolved_root)
+            except ValueError:
+                errors.append(f"Claim '{cid}' 'used_in' path escapes repository root: {norm_rel}")
+                continue
+            if not doc_p.is_file():
+                errors.append(f"Claim '{cid}' 'used_in' document does not exist: {norm_rel}")
+                continue
+            if doc_p not in doc_cache:
+                doc_cache[doc_p] = doc_p.read_text(encoding="utf-8")
+            if not marker_re.search(doc_cache[doc_p]):
+                errors.append(f"Claim '{cid}' listed in 'used_in' for {norm_rel}, but marker is missing")
+
+    claim_terms = reg.get("claim_terms", {})
+    if isinstance(claim_terms, dict):
+        for tid, tcfg in claim_terms.items():
+            if isinstance(tcfg, dict):
+                errors.extend(_verify_claim_term_evidence(tid, tcfg, repo_root))
 
     return len(errors) == 0, errors
 
@@ -1128,9 +1607,9 @@ def sync_document(
         return False, [f"Target doc not found: {doc_path}"]
 
     raw_reg = registry_path.read_text(encoding="utf-8")
-    if "/Users/" in raw_reg:
-        errors.append(f"Registry {registry_path.name} contains leaked '/Users/' path")
-    registry = json.loads(raw_reg)
+    if _has_personal_host_path_text(raw_reg):
+        errors.append(f"Registry {registry_path.name} contains leaked personal host path")
+    registry = _loads_strict_json(raw_reg)
     claims = registry.get("claims", {})
     resolved_values: dict[str, str] = {}
 
@@ -1195,9 +1674,11 @@ def sync_document(
             messages.append(f"Wrote updated claims to {doc_path.name}")
 
     latest_text = doc_path.read_text(encoding="utf-8")
-    emp_ok, emp_errors = check_empirical_regions(latest_text, doc_path.name)
-    if not emp_ok:
-        errors.extend(emp_errors)
+    marker_ok, marker_errors = lint_claim_markers_and_regions(
+        latest_text, doc_path.name, registry_path=registry_path
+    )
+    if not marker_ok:
+        errors.extend(marker_errors)
 
     word_ok, word_errors = lint_prose_and_words(
         latest_text, doc_path.name, registry_path=registry_path, repo_root=repo_root
@@ -1224,6 +1705,23 @@ def main() -> int:
     print(f"=== Genesis Sentinel Claims Synchronizer & Linter v2 (mode: {'WRITE' if do_write else 'CHECK'}) ===")
     overall_success = True
 
+    ast_ok, ast_errs = lint_script_conclusions(REPO_ROOT / "scripts")
+    if not ast_ok:
+        overall_success = False
+        for err in ast_errs:
+            print(f"[FAIL] {err}", file=sys.stderr)
+    else:
+        print("[PASS] Benchmark script conclusion builders free of hardcoded numeric literals.")
+
+    if args.doc is None:
+        reg_ok, reg_errs = validate_claims_registry(args.registry, repo_root=REPO_ROOT)
+        if not reg_ok:
+            overall_success = False
+            for err in reg_errs:
+                print(f"[FAIL] {err}", file=sys.stderr)
+        else:
+            print("[PASS] Claims registry schema, non-orphan used_in mappings & Tier 2 artifact flags verified.")
+
     validated_json_cache: dict[Path, dict] = {}
     bench_json = REPO_ROOT / "docs" / "benchmarks" / "empirical_benchmarks.json"
     metrics_ok, metrics_errs = independent_recompute_metrics(
@@ -1239,17 +1737,30 @@ def main() -> int:
         print("[PASS] Independent benchmark math recomputation & Markdown parity verified.")
 
     emb_json = REPO_ROOT / "docs" / "benchmarks" / "embedding_comparison.json"
-    if emb_json.exists():
+    emb_required = emb_json.exists()
+    if args.registry.is_file():
+        try:
+            reg_peek = _loads_strict_json(args.registry.read_text(encoding="utf-8"))
+            if any(
+                isinstance(c, dict) and c.get("source_artifact") == "docs/benchmarks/embedding_comparison.json"
+                for c in reg_peek.get("claims", {}).values()
+            ):
+                emb_required = True
+        except Exception:
+            pass
+    if emb_required:
         emb_ok, emb_errs = independent_recompute_embedding_comparison(
             emb_json,
+            repo_root=REPO_ROOT,
             validated_json_cache=validated_json_cache,
+            require_governed_fields=True,
         )
         if not emb_ok:
             overall_success = False
             for err in emb_errs:
                 print(f"[FAIL] {err}", file=sys.stderr)
         else:
-            print("[PASS] Independent semantic embedding comparison math verified.")
+            print("[PASS] Independent semantic embedding comparison math & narrative parity verified.")
 
     # Refresh contract: cmd/sentinel-bench atomically regenerates empirical_benchmarks.json and its
     # paired Markdown report (which contains no claim markers). sync_docs.py --write only propagates
