@@ -286,34 +286,47 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	metaSignals = append(metaSignals, featSigs...)
 	signals := mergeSignals(in.InjectionSignals, sigSvc, sigLvl, sigTmpl, sigSample, metaSignals)
 	injSuspected := in.InjectionSuspected || len(signals) > 0
+	// Reserve budget for required current-event framing, top features, injection flag,
+	// template, and sample BEFORE appending optional correlated history ([9]).
+	const (
+		fieldLabelsLen     = len("\ntemplate=\nsample=")
+		minEventTextBudget = 64
+	)
+	framingLen := len(promptHeader) + len(promptFooter)
+	bodyBudget := maxPromptBytes - framingLen
+
 	metaLine := fmt.Sprintf("service=%s level=%s count=%d entropy=%.2f surprisal=%.2f/%.2f rules=%s categories=%s",
 		cleanSvc, cleanLvl, in.Count, clampFinite(in.SampleEntropy),
 		clampFinite(in.SurprisalNats), clampFinite(in.SurprisalThreshold),
 		rulesStr, catsStr)
-	if corrStr != "" {
-		metaLine += " correlated=" + corrStr
-	}
 	if topFeatStr != "" {
 		metaLine += " top_features=" + topFeatStr
 	}
 	if injSuspected {
 		metaLine += " injection_flag=true"
 	}
+	if corrStr != "" {
+		corrPrefix := " correlated="
+		maxCorrBudget := bodyBudget - fieldLabelsLen - minEventTextBudget - len(metaLine) - len(corrPrefix)
+		if maxCorrBudget >= 16 {
+			if len(corrStr) > maxCorrBudget {
+				trimmed := truncateUTF8(corrStr, maxCorrBudget)
+				if comma := strings.LastIndex(trimmed, ","); comma >= 12 {
+					trimmed = trimmed[:comma]
+				}
+				corrStr = strings.TrimSpace(trimmed)
+			}
+			if corrStr != "" {
+				metaLine += corrPrefix + corrStr
+			}
+		}
+	}
 
-	// Reserve space for the fixed header and closing fence first so END_UNTRUSTED_LOG_TELEMETRY
-	// is never truncated even when metadata (e.g. many rule IDs) exceeds the prompt budget.
-	framingLen := len(promptHeader) + len(promptFooter)
-	bodyBudget := maxPromptBytes - framingLen
-
-	const (
-		fieldLabelsLen     = len("\ntemplate=\nsample=")
-		minEventTextBudget = 32
-	)
 	avail := bodyBudget - len(metaLine) - fieldLabelsLen
-	if avail < minEventTextBudget && bodyBudget >= fieldLabelsLen+minEventTextBudget {
-		// Reserve at least minEventTextBudget bytes for template/sample event text before
-		// truncating metadata so MinPromptBytes still preserves telemetry for classification.
-		maxMetaLen := bodyBudget - fieldLabelsLen - minEventTextBudget
+	if avail < 32 && bodyBudget >= fieldLabelsLen+32 {
+		// Reserve at least 32 bytes for template/sample event text if core metadata itself
+		// exceeds the prompt budget on minimal MinPromptBytes configurations.
+		maxMetaLen := bodyBudget - fieldLabelsLen - 32
 		if len(metaLine) > maxMetaLen {
 			metaLine = truncateUTF8(metaLine, maxMetaLen)
 		}

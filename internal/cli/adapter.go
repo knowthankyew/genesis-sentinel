@@ -282,11 +282,7 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 		}
 		daemonRolledBack = true
 		daemonResp = resp
-		if security.IsLoopbackEndpoint(*sentinelHTTP) && strings.TrimSpace(resp.DataDir) != "" {
-			// Loopback daemon already persisted authoritative state under resp.DataDir;
-			// never overwrite a different local instance's DataDir.
-			daemonSavedSameDir = true
-		}
+		daemonSavedSameDir = shouldSkipLocalManifestMirror(*sentinelHTTP, resp.DataDir, *dataDir != "")
 	}
 
 	var manifest train.ActiveAdapter
@@ -360,11 +356,7 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 		}
 		daemonCalled = true
 		daemonResp = resp
-		if security.IsLoopbackEndpoint(*sentinelHTTP) && strings.TrimSpace(resp.DataDir) != "" {
-			// Loopback daemon already persisted authoritative state under resp.DataDir;
-			// never overwrite a different local instance's DataDir.
-			daemonSavedSameDir = true
-		}
+		daemonSavedSameDir = shouldSkipLocalManifestMirror(*sentinelHTTP, resp.DataDir, *dataDir != "")
 	}
 	if !daemonSavedSameDir {
 		updated, changed, err := train.DeactivateActiveAdapterSlot(cfg.DataDir, normSlot)
@@ -385,6 +377,13 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 		})
 	}
 	return writeIndentedJSON(stdout, daemonResp)
+}
+
+func shouldSkipLocalManifestMirror(sentinelHTTP, daemonDataDir string, dataDirExplicit bool) bool {
+	if security.IsLoopbackEndpoint(sentinelHTTP) && strings.TrimSpace(daemonDataDir) != "" {
+		return true
+	}
+	return !security.IsLoopbackEndpoint(sentinelHTTP) && !dataDirExplicit
 }
 
 func activateSlotWithOptionalDaemon(
@@ -442,14 +441,7 @@ func activateSlotWithOptionalDaemon(
 			daemonActivated = true
 			daemonResp = resp
 		}
-		if security.IsLoopbackEndpoint(sentinelHTTP) && strings.TrimSpace(daemonResp.DataDir) != "" {
-			// When a loopback daemon reports its own non-empty DataDir, leave persistence
-			// strictly to the daemon so an unrelated local DataDir is never modified.
-			_ = dataDirExplicit
-			daemonSavedSameDir = true
-		} else if !security.IsLoopbackEndpoint(sentinelHTTP) && !dataDirExplicit {
-			daemonSavedSameDir = true
-		}
+		daemonSavedSameDir = shouldSkipLocalManifestMirror(sentinelHTTP, daemonResp.DataDir, dataDirExplicit)
 	}
 
 	if !daemonSavedSameDir {

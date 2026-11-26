@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -345,5 +347,28 @@ func TestExecuteAdapterPositionalArgsAndIsolatedLocalManifest(t *testing.T) {
 	localLoaded, _, err := train.LoadActiveAdapter(otherLocalDir)
 	if err != nil || localLoaded.AdapterPath != "artifacts/other-instance/model_adapters" {
 		t.Fatalf("expected unrelated otherLocalDir untouched by loopback daemon swap, got %+v err=%v", localLoaded, err)
+	}
+
+	// Remote daemon rollback & deactivate with omitted --data-dir must leave the default local
+	// manifest intact rather than silently mutating local state ([3]).
+	defaultDataDir := t.TempDir()
+	cfgFile := filepath.Join(t.TempDir(), "sentinel.json")
+	if err := os.WriteFile(cfgFile, []byte(`{"data_dir":`+strconv.Quote(defaultDataDir)+`,"allow_remote_endpoints":true}`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := train.SaveActiveAdapter(defaultDataDir, train.ActiveAdapter{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/local-keep/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed defaultDataDir: %v", err)
+	}
+	if !shouldSkipLocalManifestMirror("https://remote-daemon.example.com:9090", "", false) {
+		t.Fatal("expected remote daemon operation with omitted --data-dir to skip mutating local manifest")
+	}
+	if shouldSkipLocalManifestMirror("https://remote-daemon.example.com:9090", "", true) {
+		t.Fatal("expected remote daemon operation with explicit --data-dir to update explicit local manifest")
+	}
+	keptLocal, _, err := train.LoadActiveAdapter(defaultDataDir)
+	if err != nil || keptLocal.AdapterPath != "artifacts/local-keep/model_adapters" {
+		t.Fatalf("expected defaultDataDir preserved, got %+v err=%v", keptLocal, err)
 	}
 }

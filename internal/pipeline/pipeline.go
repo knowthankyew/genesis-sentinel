@@ -204,6 +204,8 @@ type Pipeline struct {
 	escalationLockedByCLI  bool
 	primaryFromDisk        bool
 	escalationFromDisk     bool
+	pinnedPrimaryModel     string
+	pinnedEscalationModel  string
 	lastSyncedManifest     [sha256.Size]byte
 	hasSyncedManifest      bool
 
@@ -1407,10 +1409,10 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 		p.surprisalEng.Reset()
 	}
 	if p.triageClient != nil {
-		p.triageClient.ResetAdapter()
+		p.triageClient.ResetAdapterToBase(p.cfg.BaseModel)
 	}
 	if p.escalationClient != nil {
-		p.escalationClient.ResetAdapter()
+		p.escalationClient.ResetAdapterToBase(p.cfg.EscalationBaseModel)
 	}
 	p.escalationEpoch.Add(1)
 	p.corrMu.Lock()

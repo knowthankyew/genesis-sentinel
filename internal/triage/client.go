@@ -299,6 +299,27 @@ func (c *Client) ResetAdapter() {
 	c.mu.Unlock()
 }
 
+// ResetAdapterToBase deactivates any hot-swapped LoRA adapter and restores baseModel
+// (when non-empty and allowlisted) so removing a disk-loaded adapter with an alternate
+// base model returns the slot to its configured base-only inference model.
+func (c *Client) ResetAdapterToBase(baseModel string) {
+	trimmed := strings.TrimSpace(baseModel)
+	if trimmed != "" {
+		if _, err := model.ValidateBaseModel(trimmed); err != nil {
+			trimmed = ""
+		}
+	}
+	c.mu.Lock()
+	if trimmed != "" {
+		c.baseModel = trimmed
+	}
+	c.adapterPath = ""
+	c.openUntil = time.Time{}
+	c.circuitGen++
+	c.runtimeGen++
+	c.mu.Unlock()
+}
+
 // ResetCircuit clears the circuit breaker and bumps circuitGen so older in-flight failures
 // cannot re-open a freshly reset breaker.
 func (c *Client) ResetCircuit() {

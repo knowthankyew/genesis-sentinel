@@ -481,6 +481,7 @@ def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
     fence_len = 0
     in_comment = False
     html_type1_end: re.Pattern[str] | None = None
+    in_html_type2 = False
     in_html_type3 = False
     in_html_type5 = False
     in_html_type6 = False
@@ -499,6 +500,13 @@ def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
         if html_type1_end is not None:
             if html_type1_end.search(raw_line):
                 html_type1_end = None
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        if in_html_type2:
+            if "-->" in raw_line:
+                in_html_type2 = False
             cleaned_lines.append("")
             can_start_indented_code = True
             continue
@@ -565,6 +573,15 @@ def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
             end_re = re.compile(rf"</{m1.group(1)}>", re.IGNORECASE)
             if not end_re.search(line):
                 html_type1_end = end_re
+            cleaned_lines.append("")
+            can_start_indented_code = True
+            continue
+
+        # CommonMark §4.6 Type 2 raw HTML blocks (<!-- ... --> starting at up to 3 spaces)
+        # discard trailing text on the closing line so comments cannot mask table headers ([31]).
+        if re.match(r"^ {0,3}<!--", line):
+            if "-->" not in line[line.find("<!--") + 4 :]:
+                in_html_type2 = True
             cleaned_lines.append("")
             can_start_indented_code = True
             continue
@@ -1354,19 +1371,19 @@ def _format_expected_phase5_recommendation(
         p50_phrase = f"{gemma_p50_ms:.2f} ms (matched {smol_p50_ms:.2f} ms)"
 
     if hybrid_mean_ms < gemma_mean_ms:
-        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster mean turnaround than always running {gemma_label}"
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster replayed mean generation latency than always running {gemma_label}"
     elif hybrid_mean_ms > gemma_mean_ms:
-        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower mean turnaround than always running {gemma_label}"
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower replayed mean generation latency than always running {gemma_label}"
     else:
-        turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
+        turnaround_phrase = f"matched replayed mean generation latency vs always running {gemma_label}"
 
     return (
         f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign-cohort errors "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
-        f"{p50_phrase}, while selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
-        f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended mean latency "
+        f"{p50_phrase}, while selective escalation replay routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
+        f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended replayed mean latency "
         f"({turnaround_phrase}), with resident PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
     )
 
@@ -1552,13 +1569,18 @@ def independent_recompute_phase5_comparison(
                     errors.append(f"phase5 {key}.training.trainable_params ({tr_p}) must be < all_params ({all_p})")
 
         recomputed_models[key] = {
+            "fmt_cnt": fmt_cnt,
             "fmt_rate": round(fmt_cnt / ev_tot, 4),
             "acc": round(cls_cnt / ev_tot, 4),
             "cls_cnt": cls_cnt,
             "ev_tot": ev_tot,
             "fp": fp_cnt,
             "fp_rate": round(fp_cnt / eval_benign, 4),
+            "tp_cnt": tp_cnt,
+            "fn_cnt": fn_cnt,
+            "corr_cnt": corr_cnt,
             "corr_acc": round(corr_cnt / eval_corr, 4),
+            "mitre_cnt": mitre_cnt,
             "mitre_acc": round(mitre_cnt / mitre_app, 4),
             "qual": qual_avg,
             "rss_after": rss_after,
@@ -1569,7 +1591,7 @@ def independent_recompute_phase5_comparison(
             "training": tr_sec,
         }
 
-    # Hybrid escalation validation ([24])
+    # Hybrid escalation validation ([24], [25], [28])
     hyb_policy = hybrid.get("policy")
     if hyb_policy != "high_critical":
         errors.append(f"phase5 hybrid_escalation.policy must be 'high_critical', got {hyb_policy!r}")
@@ -1581,6 +1603,9 @@ def independent_recompute_phase5_comparison(
     hyb_acc = _req_num(hybrid, "class_accuracy", errors, "hybrid_escalation")
     hyb_fp = _req_int(hybrid, "benign_fp_count", errors, "hybrid_escalation", min_val=0)
     hyb_fp_rate = _req_num(hybrid, "benign_fp_rate", errors, "hybrid_escalation")
+    hyb_tp = _req_int(hybrid, "attack_tp_count", errors, "hybrid_escalation", min_val=0)
+    hyb_fn = _req_int(hybrid, "attack_fn_count", errors, "hybrid_escalation", min_val=0)
+    hyb_att_rec = _req_num(hybrid, "attack_recall", errors, "hybrid_escalation")
     hyb_corr_cnt = _req_int(hybrid, "correlated_correct_count", errors, "hybrid_escalation", min_val=0)
     hyb_corr_acc = _req_num(hybrid, "correlated_accuracy", errors, "hybrid_escalation")
     hyb_mitre_cnt = _req_int(hybrid, "mitre_correct_count", errors, "hybrid_escalation", min_val=0)
@@ -1590,7 +1615,7 @@ def independent_recompute_phase5_comparison(
     hyb_p50 = _req_num(hybrid, "blended_p50_ms", errors, "hybrid_escalation")
     eff_hyb_mean = hyb_mean
     eff_hyb_p50 = hyb_p50
-    if None not in (hyb_tot, hyb_esc, hyb_pri, hyb_rate, hyb_cls, hyb_acc, hyb_fp, hyb_fp_rate, hyb_corr_cnt, hyb_corr_acc, hyb_mitre_cnt, hyb_mitre_acc, hyb_qual, hyb_mean, hyb_p50):
+    if None not in (hyb_tot, hyb_esc, hyb_pri, hyb_rate, hyb_cls, hyb_acc, hyb_fp, hyb_fp_rate, hyb_tp, hyb_fn, hyb_att_rec, hyb_corr_cnt, hyb_corr_acc, hyb_mitre_cnt, hyb_mitre_acc, hyb_qual, hyb_mean, hyb_p50):
         if hyb_tot != eval_total:
             errors.append(f"phase5 hybrid_escalation.total_windows ({hyb_tot}) != {eval_total}")
         if hyb_esc + hyb_pri != hyb_tot:
@@ -1599,14 +1624,17 @@ def independent_recompute_phase5_comparison(
             errors.append(f"phase5 hybrid class_correct_count ({hyb_cls}) exceeds total_windows ({hyb_tot})")
         if hyb_fp > eval_benign:
             errors.append(f"phase5 hybrid benign_fp_count ({hyb_fp}) exceeds eval_benign_windows ({eval_benign})")
-        if hyb_corr_cnt > eval_corr:
-            errors.append(f"phase5 hybrid correlated_correct_count ({hyb_corr_cnt}) exceeds eval_correlated_windows ({eval_corr})")
+        if hyb_tp + hyb_fn != eval_attack:
+            errors.append(f"phase5 hybrid attack tp+fn ({hyb_tp + hyb_fn}) != eval_attack_windows ({eval_attack})")
+        if hyb_corr_cnt > eval_corr or hyb_corr_cnt > hyb_cls:
+            errors.append(f"phase5 hybrid correlated_correct_count ({hyb_corr_cnt}) out of range (corr={eval_corr}, cls={hyb_cls})")
         if hyb_mitre_cnt > mitre_app:
             errors.append(f"phase5 hybrid mitre_correct_count ({hyb_mitre_cnt}) exceeds mitre_applicable_windows ({mitre_app})")
         for rlbl, rval, calc_r in (
             ("escalation_rate", hyb_rate, round(hyb_esc / hyb_tot, 4)),
             ("class_accuracy", hyb_acc, round(hyb_cls / hyb_tot, 4)),
             ("benign_fp_rate", hyb_fp_rate, round(hyb_fp / eval_benign, 4)),
+            ("attack_recall", hyb_att_rec, round(hyb_tp / eval_attack, 4)),
             ("correlated_accuracy", hyb_corr_acc, round(hyb_corr_cnt / eval_corr, 4)),
             ("mitre_accuracy", hyb_mitre_acc, round(hyb_mitre_cnt / mitre_app, 4)),
         ):
@@ -1631,10 +1659,24 @@ def independent_recompute_phase5_comparison(
                 if not isinstance(decisions, list) or len(decisions) != eval_total or not all(isinstance(x, dict) for x in decisions):
                     errors.append(f"phase5 hybrid_escalation.per_sample_decisions must contain {eval_total} objects")
                 else:
+                    sev_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                    re_smol_fmt = re_smol_cls = re_smol_fp = re_smol_tp = re_smol_corr = re_smol_mitre = 0
+                    re_gemma_fmt = re_gemma_cls = re_gemma_fp = re_gemma_tp = re_gemma_corr = re_gemma_mitre = 0
+                    re_hyb_cls = re_hyb_fp = re_hyb_tp = re_hyb_corr = re_hyb_mitre = 0
+                    full_replay_fields = all(
+                        all(k in d for k in (
+                            "partition", "truth_class", "truth_mitre", "tier1_sev",
+                            "smol_format_valid", "smol_class", "smol_sev", "smol_mitre",
+                            "gemma_format_valid", "gemma_class", "gemma_sev", "gemma_mitre",
+                        ))
+                        for d in decisions
+                    )
+                    if require_governed_fields and not full_replay_fields:
+                        errors.append("phase5 hybrid_escalation.per_sample_decisions missing required replay verdict/truth fields")
                     for idx_d, (dec_row, flag) in enumerate(zip(decisions, esc_flags)):
                         t1_sev = dec_row.get("tier1_sev")
-                        p_sev = dec_row.get("primary_sev")
-                        p_cls = dec_row.get("primary_class")
+                        p_sev = dec_row.get("smol_sev", dec_row.get("primary_sev"))
+                        p_cls = dec_row.get("smol_class", dec_row.get("primary_class"))
                         inj_f = dec_row.get("inj")
                         corr_f = dec_row.get("correlated_case")
                         if not isinstance(inj_f, bool) or not isinstance(corr_f, bool) or not isinstance(dec_row.get("escalated"), bool):
@@ -1653,6 +1695,89 @@ def independent_recompute_phase5_comparison(
                                 f"decision={dec_row['escalated']}, flag={flag}"
                             )
                             break
+                        if full_replay_fields:
+                            part = dec_row["partition"]
+                            t_cls = dec_row["truth_class"]
+                            t_mit = dec_row["truth_mitre"]
+                            s_fv = bool(dec_row["smol_format_valid"])
+                            s_ne = bool(dec_row.get("smol_nonempty", True))
+                            s_cls = dec_row["smol_class"]
+                            s_sev = dec_row["smol_sev"]
+                            s_mit = dec_row["smol_mitre"]
+                            g_fv = bool(dec_row["gemma_format_valid"])
+                            g_ne = bool(dec_row.get("gemma_nonempty", True))
+                            g_cls = dec_row["gemma_class"]
+                            g_sev = dec_row["gemma_sev"]
+                            g_mit = dec_row["gemma_mitre"]
+
+                            if s_fv:
+                                re_smol_fmt += 1
+                                if s_cls == t_cls:
+                                    re_smol_cls += 1
+                                    if corr_f:
+                                        re_smol_corr += 1
+                                if part == "attack" and s_cls not in ("BENIGN-NOISE", "NEEDS-REVIEW"):
+                                    re_smol_tp += 1
+                                if t_mit != "NONE" and s_mit == t_mit:
+                                    re_smol_mitre += 1
+                            if part == "benign" and ((not s_fv) or s_cls != "BENIGN-NOISE"):
+                                re_smol_fp += 1
+
+                            if g_fv:
+                                re_gemma_fmt += 1
+                                if g_cls == t_cls:
+                                    re_gemma_cls += 1
+                                    if corr_f:
+                                        re_gemma_corr += 1
+                                if part == "attack" and g_cls not in ("BENIGN-NOISE", "NEEDS-REVIEW"):
+                                    re_gemma_tp += 1
+                                if t_mit != "NONE" and g_mit == t_mit:
+                                    re_gemma_mitre += 1
+                            if part == "benign" and ((not g_fv) or g_cls != "BENIGN-NOISE"):
+                                re_gemma_fp += 1
+
+                            if flag and (g_ne or not s_fv):
+                                c_fv, c_cls, c_sev, c_mit = g_fv, g_cls, g_sev, g_mit
+                            else:
+                                c_fv, c_cls, c_sev, c_mit = s_fv, s_cls, s_sev, s_mit
+                            if inj_f and c_cls == "BENIGN-NOISE":
+                                c_cls = "NEEDS-REVIEW"
+                                c_sev = "HIGH"
+                            if sev_rank.get(t1_sev, 0) > sev_rank.get(c_sev, 0):
+                                c_sev = t1_sev
+                            if c_fv:
+                                if c_cls == t_cls:
+                                    re_hyb_cls += 1
+                                    if corr_f:
+                                        re_hyb_corr += 1
+                                if part == "attack" and c_cls not in ("BENIGN-NOISE", "NEEDS-REVIEW"):
+                                    re_hyb_tp += 1
+                                if t_mit != "NONE" and c_mit == t_mit:
+                                    re_hyb_mitre += 1
+                            if part == "benign" and ((not c_fv) or c_cls != "BENIGN-NOISE"):
+                                re_hyb_fp += 1
+                    else:
+                        if full_replay_fields:
+                            if "smol_lora" in recomputed_models:
+                                slm = recomputed_models["smol_lora"]
+                                if (slm["fmt_cnt"], slm["cls_cnt"], slm["fp"], slm["tp_cnt"], slm["corr_cnt"], slm["mitre_cnt"]) != (
+                                    re_smol_fmt, re_smol_cls, re_smol_fp, re_smol_tp, re_smol_corr, re_smol_mitre
+                                ):
+                                    errors.append("phase5 smol_lora aggregate counts do not match per_sample_decisions replay inputs")
+                            if "gemma_lora" in recomputed_models:
+                                glm = recomputed_models["gemma_lora"]
+                                if (glm["fmt_cnt"], glm["cls_cnt"], glm["fp"], glm["tp_cnt"], glm["corr_cnt"], glm["mitre_cnt"]) != (
+                                    re_gemma_fmt, re_gemma_cls, re_gemma_fp, re_gemma_tp, re_gemma_corr, re_gemma_mitre
+                                ):
+                                    errors.append("phase5 gemma_lora aggregate counts do not match per_sample_decisions replay inputs")
+                            if (hyb_cls, hyb_fp, hyb_tp, hyb_corr_cnt, hyb_mitre_cnt) != (
+                                re_hyb_cls, re_hyb_fp, re_hyb_tp, re_hyb_corr, re_hyb_mitre
+                            ):
+                                errors.append(
+                                    f"phase5 hybrid aggregate counts mismatch per_sample_decisions replay: "
+                                    f"stored={(hyb_cls, hyb_fp, hyb_tp, hyb_corr_cnt, hyb_mitre_cnt)} "
+                                    f"recomputed={(re_hyb_cls, re_hyb_fp, re_hyb_tp, re_hyb_corr, re_hyb_mitre)}"
+                                )
             if raw_hyb is not None and "smol_lora" in recomputed_models and "gemma_lora" in recomputed_models:
                 smol_raw = recomputed_models["smol_lora"].get("raw_samples")
                 gemma_raw = recomputed_models["gemma_lora"].get("raw_samples")
@@ -1824,20 +1949,29 @@ def independent_recompute_phase5_comparison(
                 if dup_labels:
                     errors.append(f"Phase 5 Markdown report {report_rel} contains duplicate metric rows: {dup_labels}")
 
-                # Enforce strict first-cell uniqueness for ALL Phase 5 comparison and hot-swap rows
-                # including backticked model labels ([39]).
+                # Enforce strict ordered table headers + first-cell metric identity uniqueness ([33], [37], [39]).
+                comp_header = [
+                    "Tier / Model", "Format Compliance", "Class Accuracy", "Benign Error (Rate)",
+                    "Correlated Accuracy", "MITRE Accuracy", "Explanation Quality",
+                    "Peak RSS (Delta)", "P50 Latency", "Mean Latency",
+                ]
+                hs_header = ["Operation", "Backend", "Measured Latency"]
                 first_cell_counts: dict[str, int] = {}
+                row_to_headers: dict[str, list[list[str]]] = {}
                 table_headers_seen: list[list[str]] = []
-                for _rline, rparts, hparts in _iter_gfm_table_body_rows(cleaned_lines):
+                for rline, rparts, hparts in _iter_gfm_table_body_rows(cleaned_lines):
                     table_headers_seen.append(hparts)
+                    row_to_headers.setdefault(rline, []).append(hparts)
                     lbl_key = re.sub(r"\s+", " ", rparts[0]).strip()
+                    if lbl_key.startswith("**Hybrid Escalation"):
+                        lbl_key = "**Hybrid Escalation**"
                     first_cell_counts[lbl_key] = first_cell_counts.get(lbl_key, 0) + 1
                 expected_unique_prefixes = (
                     "`SmolLM2-135M-Instruct` (Base)",
                     "`SmolLM2-135M-Instruct` (LoRA)",
                     "`google/gemma-2-2b-it` (Base)",
                     "`google/gemma-2-2b-it` (LoRA)",
-                    "**Hybrid Escalation",
+                    "**Hybrid Escalation**",
                     "PyTorch PEFT Additional Adapter Load",
                     "PyTorch PEFT Resident Adapter Switch",
                     "Sentinel Sidecar CLI Swap",
@@ -1849,36 +1983,52 @@ def independent_recompute_phase5_comparison(
                 if any("Benign FP (Rate)" in h for h in table_headers_seen):
                     errors.append(f"Phase 5 Markdown report {report_rel} uses deprecated ambiguous header 'Benign FP (Rate)'; expected 'Benign Error (Rate)'")
 
-                expected_md_rows: list[str] = []
+                expected_md_rows_with_hdr: list[tuple[str, list[str]]] = []
                 if None not in (peft_cold, sc_rollback, eff_hyb_p50) and raw_sc_swaps:
-                    expected_md_rows = [
-                        f"| `SmolLM2-135M-Instruct` (Base) | {sb['fmt_rate']:.4f} | {sb['acc']:.4f} ({sb['cls_cnt']}/{sb['ev_tot']}) | {sb['fp']} ({sb['fp_rate']:.4f}) | {sb['corr_acc']:.4f} | {sb['mitre_acc']:.4f} | {sb['qual']:.4f} | {sb['rss_after']:.2f} MB (+{sb['rss_delta']:.2f}) | {sb['p50']:.2f} ms | {sb['mean']:.2f} ms |",
-                        f"| `SmolLM2-135M-Instruct` (LoRA) | {sl['fmt_rate']:.4f} | {sl['acc']:.4f} ({sl['cls_cnt']}/{sl['ev_tot']}) | {sl['fp']} ({sl['fp_rate']:.4f}) | {sl['corr_acc']:.4f} | {sl['mitre_acc']:.4f} | {sl['qual']:.4f} | {sl['rss_after']:.2f} MB (+{sl['rss_delta']:.2f}) | {sl['p50']:.2f} ms | {sl['mean']:.2f} ms |",
-                        f"| `google/gemma-2-2b-it` (Base) | {gb['fmt_rate']:.4f} | {gb['acc']:.4f} ({gb['cls_cnt']}/{gb['ev_tot']}) | {gb['fp']} ({gb['fp_rate']:.4f}) | {gb['corr_acc']:.4f} | {gb['mitre_acc']:.4f} | {gb['qual']:.4f} | {gb['rss_after']:.2f} MB (+{gb['rss_delta']:.2f}) | {gb['p50']:.2f} ms | {gb['mean']:.2f} ms |",
-                        f"| `google/gemma-2-2b-it` (LoRA) | {gl['fmt_rate']:.4f} | {gl['acc']:.4f} ({gl['cls_cnt']}/{gl['ev_tot']}) | {gl['fp']} ({gl['fp_rate']:.4f}) | {gl['corr_acc']:.4f} | {gl['mitre_acc']:.4f} | {gl['qual']:.4f} | {gl['rss_after']:.2f} MB (+{gl['rss_delta']:.2f}) | {gl['p50']:.2f} ms | {gl['mean']:.2f} ms |",
-                        f"| **Hybrid Escalation (`{hybrid.get('policy', '')}`, {round(hyb_esc / hyb_tot, 4):.4f} escalated)** | — | **{round(hyb_cls / hyb_tot, 4):.4f} ({hyb_cls}/{hyb_tot})** | **{hyb_fp} ({round(hyb_fp / eval_benign, 4):.4f})** | **{round(hyb_corr_cnt / eval_corr, 4):.4f}** | **{round(hyb_mitre_cnt / mitre_app, 4):.4f}** | **{hyb_qual:.4f}** | Primary {sl['rss_after']:.2f} MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **{eff_hyb_p50:.2f} ms** | **{eff_hyb_mean:.2f} ms** |",
-                        f"| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `{hotswap.get('peft_backend', '')}` | {peft_cold:.2f} ms |",
-                        f"| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `{hotswap.get('peft_backend', '')}` | {eff_warm_swap:.4f} ms / {calc_smax:.4f} ms |",
-                        f"| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `{hotswap.get('sidecar_cli_backend', '')}` | {round(_nearest_rank_percentile(ss, 50.0), 2):.2f} ms / {round(max(ss), 2):.2f} ms |",
-                        f"| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `{hotswap.get('sidecar_cli_backend', '')}` | {sc_rollback:.2f} ms |",
+                    expected_md_rows_with_hdr = [
+                        (f"| `SmolLM2-135M-Instruct` (Base) | {sb['fmt_rate']:.4f} | {sb['acc']:.4f} ({sb['cls_cnt']}/{sb['ev_tot']}) | {sb['fp']} ({sb['fp_rate']:.4f}) | {sb['corr_acc']:.4f} | {sb['mitre_acc']:.4f} | {sb['qual']:.4f} | {sb['rss_after']:.2f} MB (+{sb['rss_delta']:.2f}) | {sb['p50']:.2f} ms | {sb['mean']:.2f} ms |", comp_header),
+                        (f"| `SmolLM2-135M-Instruct` (LoRA) | {sl['fmt_rate']:.4f} | {sl['acc']:.4f} ({sl['cls_cnt']}/{sl['ev_tot']}) | {sl['fp']} ({sl['fp_rate']:.4f}) | {sl['corr_acc']:.4f} | {sl['mitre_acc']:.4f} | {sl['qual']:.4f} | {sl['rss_after']:.2f} MB (+{sl['rss_delta']:.2f}) | {sl['p50']:.2f} ms | {sl['mean']:.2f} ms |", comp_header),
+                        (f"| `google/gemma-2-2b-it` (Base) | {gb['fmt_rate']:.4f} | {gb['acc']:.4f} ({gb['cls_cnt']}/{gb['ev_tot']}) | {gb['fp']} ({gb['fp_rate']:.4f}) | {gb['corr_acc']:.4f} | {gb['mitre_acc']:.4f} | {gb['qual']:.4f} | {gb['rss_after']:.2f} MB (+{gb['rss_delta']:.2f}) | {gb['p50']:.2f} ms | {gb['mean']:.2f} ms |", comp_header),
+                        (f"| `google/gemma-2-2b-it` (LoRA) | {gl['fmt_rate']:.4f} | {gl['acc']:.4f} ({gl['cls_cnt']}/{gl['ev_tot']}) | {gl['fp']} ({gl['fp_rate']:.4f}) | {gl['corr_acc']:.4f} | {gl['mitre_acc']:.4f} | {gl['qual']:.4f} | {gl['rss_after']:.2f} MB (+{gl['rss_delta']:.2f}) | {gl['p50']:.2f} ms | {gl['mean']:.2f} ms |", comp_header),
+                        (f"| **Hybrid Escalation (`{hybrid.get('policy', '')}`, {round(hyb_esc / hyb_tot, 4):.4f} escalated)** | — | **{round(hyb_cls / hyb_tot, 4):.4f} ({hyb_cls}/{hyb_tot})** | **{hyb_fp} ({round(hyb_fp / eval_benign, 4):.4f})** | **{round(hyb_corr_cnt / eval_corr, 4):.4f}** | **{round(hyb_mitre_cnt / mitre_app, 4):.4f}** | **{hyb_qual:.4f}** | Primary {sl['rss_after']:.2f} MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **{eff_hyb_p50:.2f} ms** | **{eff_hyb_mean:.2f} ms** |", comp_header),
+                        (f"| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `{hotswap.get('peft_backend', '')}` | {peft_cold:.2f} ms |", hs_header),
+                        (f"| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `{hotswap.get('peft_backend', '')}` | {eff_warm_swap:.4f} ms / {calc_smax:.4f} ms |", hs_header),
+                        (f"| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `{hotswap.get('sidecar_cli_backend', '')}` | {round(_nearest_rank_percentile(ss, 50.0), 2):.2f} ms / {round(max(ss), 2):.2f} ms |", hs_header),
+                        (f"| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `{hotswap.get('sidecar_cli_backend', '')}` | {sc_rollback:.2f} ms |", hs_header),
                     ]
-                for erow in expected_md_rows:
+                for erow, exp_hdr in expected_md_rows_with_hdr:
                     if erow not in published_rows:
                         errors.append(f"Phase 5 JSON/Markdown table parity error: expected row {erow!r} missing from {report_rel}")
-
-                # Validate LoRA training provenance lines when full training provenance fields are present ([42]).
-                for tr_lbl, tr_obj in (
-                    ("SmolLM2-135M-Instruct LoRA", sl.get("training")),
-                    ("google/gemma-2-2b-it LoRA", gl.get("training")),
-                ):
-                    if isinstance(tr_obj, dict) and all(k in tr_obj for k in ("epochs", "steps", "lora_r", "initial_loss", "final_loss", "train_seconds", "adapter_size_mb")):
-                        exp_prov = (
-                            f"- **{tr_lbl}:** {tr_obj['epochs']} epochs ({tr_obj['steps']} steps, `r={tr_obj['lora_r']}`), "
-                            f"loss `{float(tr_obj['initial_loss']):.4f}` -> `{float(tr_obj['final_loss']):.4f}` in "
-                            f"`{float(tr_obj['train_seconds']):.2f}s` (adapter `{float(tr_obj['adapter_size_mb']):.2f} MB`)"
+                    elif exp_hdr not in row_to_headers.get(erow, []):
+                        errors.append(
+                            f"Phase 5 JSON/Markdown column header mismatch for row {erow!r}: "
+                            f"expected headers {exp_hdr!r}, got {row_to_headers.get(erow)!r}"
                         )
-                        if exp_prov not in visible_text:
-                            errors.append(f"Phase 5 Markdown provenance mismatch for {tr_lbl}: expected line {exp_prov!r}")
+
+                # Validate LoRA training provenance lines strictly using _req_int / _req_num ([24], [32]).
+                for tr_lbl, tr_key, tr_obj in (
+                    ("SmolLM2-135M-Instruct LoRA", "smol_lora.training", sl.get("training")),
+                    ("google/gemma-2-2b-it LoRA", "gemma_lora.training", gl.get("training")),
+                ):
+                    need_prov = require_governed_fields or any(
+                        "LoRA Fine-Tuning Provenance" in cl for cl in cleaned_lines
+                    )
+                    if isinstance(tr_obj, dict) and (need_prov or any(k in tr_obj for k in ("lora_r", "initial_loss", "final_loss", "train_seconds", "adapter_size_mb"))):
+                        t_ep = _req_int(tr_obj, "epochs", errors, tr_key, min_val=1)
+                        t_st = _req_int(tr_obj, "steps", errors, tr_key, min_val=1)
+                        t_r = _req_int(tr_obj, "lora_r", errors, tr_key, min_val=1)
+                        t_il = _req_num(tr_obj, "initial_loss", errors, tr_key)
+                        t_fl = _req_num(tr_obj, "final_loss", errors, tr_key)
+                        t_sec = _req_num(tr_obj, "train_seconds", errors, tr_key)
+                        t_mb = _req_num(tr_obj, "adapter_size_mb", errors, tr_key)
+                        if None not in (t_ep, t_st, t_r, t_il, t_fl, t_sec, t_mb):
+                            exp_prov = (
+                                f"- **{tr_lbl}:** {t_ep} epochs ({t_st} steps, `r={t_r}`), "
+                                f"loss `{t_il:.4f}` -> `{t_fl:.4f}` in "
+                                f"`{t_sec:.2f}s` (adapter `{t_mb:.2f} MB`)"
+                            )
+                            if exp_prov not in visible_text:
+                                errors.append(f"Phase 5 Markdown provenance mismatch for {tr_lbl}: expected line {exp_prov!r}")
 
                 # Validate hardware metadata parity when present ([1]).
                 if all(k in meta for k in ("cpu_brand", "cpu_logical_cores", "torch_num_threads")):
@@ -1886,8 +2036,12 @@ def independent_recompute_phase5_comparison(
                     if hw_frag not in visible_text:
                         errors.append(f"Phase 5 Markdown hardware metadata mismatch: expected {hw_frag!r}")
 
-                # Validate a single visible `## Conclusion` section (ignoring HTML comments and code fences) ([26]).
-                conc_indices = [idx_c for idx_c, cl in enumerate(cleaned_lines) if re.fullmatch(r"##\s+Conclusion\s*", cl.strip())]
+                # Validate a single visible `## Conclusion` section including optional GFM closing hashes ([36]).
+                conc_indices = [
+                    idx_c
+                    for idx_c, cl in enumerate(cleaned_lines)
+                    if re.fullmatch(r" {0,3}##[ \t]+Conclusion(?:[ \t]+#+)?[ \t]*", cl)
+                ]
                 if len(conc_indices) != 1:
                     errors.append(f"Phase 5 Markdown report {report_rel} must have exactly one visible '## Conclusion' section, found {len(conc_indices)}")
                 else:

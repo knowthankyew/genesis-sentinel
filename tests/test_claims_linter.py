@@ -1000,18 +1000,67 @@ class TestClaimsLinter(unittest.TestCase):
     def test_independent_recompute_phase5_comparison_valid_and_tamper_guards(self):
         """Verify Phase 5 recomputation accepts valid derived math and rejects tampered metrics."""
 
-        def make_model_entry(
-            model_id: str,
-            trained: bool,
-            base_cls_correct: int,
-            fp: int,
-            corr_correct: int,
-            qual: float,
-            samples: list[float],
-            p50: float,
-            p99: float,
-            lmean: float,
-        ):
+        # Build coherent per-window truth + model verdicts and derive ALL model & hybrid aggregates ([23], [25]).
+        fixture_windows = [
+            # w0: benign primary-only, correct across all models
+            {
+                "id": "w0", "partition": "benign", "truth_class": "BENIGN-NOISE", "truth_sev": "LOW", "truth_mitre": "NONE",
+                "tier1_sev": "LOW", "inj": False, "correlated_case": False,
+                "smol_base": (True, "EXFIL-SUSPECT", "HIGH", "TA0010"),
+                "smol_lora": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "gemma_base": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "gemma_lora": (True, "BENIGN-NOISE", "LOW", "NONE"),
+            },
+            # w1: benign primary-only, Smol Base & Smol LoRA both miss? Keep w1 BENIGN-NOISE for sl so sl=0 fp & hybrid=0 fp!
+            # Instead let sl get 1/2 wrong? No: hybrid gets w1 unchanged from sl, so if w1 is BENIGN-NOISE for sl, both are 0 errors!
+            {
+                "id": "w1", "partition": "benign", "truth_class": "BENIGN-NOISE", "truth_sev": "LOW", "truth_mitre": "NONE",
+                "tier1_sev": "MEDIUM", "inj": False, "correlated_case": False,
+                "smol_base": (True, "RECON-SCAN", "MEDIUM", "TA0043"),
+                "smol_lora": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "gemma_base": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "gemma_lora": (True, "BENIGN-NOISE", "LOW", "NONE"),
+            },
+            # w2: HIGH Tier1 attack, escalated (Smol Base misses class, Smol LoRA misclassifies as NEEDS-REVIEW, Gemma LoRA succeeds)
+            {
+                "id": "w2", "partition": "attack", "truth_class": "AUTH-BRUTEFORCE", "truth_sev": "HIGH", "truth_mitre": "TA0006",
+                "tier1_sev": "HIGH", "inj": False, "correlated_case": False,
+                "smol_base": (True, "NEEDS-REVIEW", "MEDIUM", "NONE"),
+                "smol_lora": (True, "NEEDS-REVIEW", "MEDIUM", "NONE"),
+                "gemma_base": (True, "AUTH-BRUTEFORCE", "HIGH", "TA0006"),
+                "gemma_lora": (True, "AUTH-BRUTEFORCE", "HIGH", "TA0006"),
+            },
+            # w3: Correlated attack, escalated (Smol LoRA misclassifies as BENIGN-NOISE, Gemma LoRA succeeds)
+            {
+                "id": "w3", "partition": "attack", "truth_class": "EXFIL-SUSPECT", "truth_sev": "HIGH", "truth_mitre": "TA0010",
+                "tier1_sev": "MEDIUM", "inj": False, "correlated_case": True,
+                "smol_base": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "smol_lora": (True, "BENIGN-NOISE", "LOW", "NONE"),
+                "gemma_base": (True, "NEEDS-REVIEW", "MEDIUM", "NONE"),
+                "gemma_lora": (True, "EXFIL-SUSPECT", "HIGH", "TA0010"),
+            },
+        ]
+
+        def make_model_entry(model_id: str, slot_key: str, trained: bool, qual: float, samples: list[float]):
+            fmt_c = cls_c = fp_c = tp_c = corr_c = mit_c = 0
+            for w in fixture_windows:
+                fv, p_cls, _p_sev, p_mit = w[slot_key]
+                if fv:
+                    fmt_c += 1
+                    if p_cls == w["truth_class"]:
+                        cls_c += 1
+                        if w["correlated_case"]:
+                            corr_c += 1
+                    if w["partition"] == "attack" and p_cls not in ("BENIGN-NOISE", "NEEDS-REVIEW"):
+                        tp_c += 1
+                    if w["truth_mitre"] != "NONE" and p_mit == w["truth_mitre"]:
+                        mit_c += 1
+                if w["partition"] == "benign" and ((not fv) or p_cls != "BENIGN-NOISE"):
+                    fp_c += 1
+            s_sorted = sorted(samples)
+            p50 = s_sorted[(len(s_sorted) - 1) // 2]
+            p99 = s_sorted[-1]
+            lmean = round(sum(samples) / len(samples), 3)
             entry = {
                 "model_id": model_id,
                 "adapter_trained": trained,
@@ -1019,19 +1068,19 @@ class TestClaimsLinter(unittest.TestCase):
                 "rss_after_model_mb": 900.0,
                 "rss_delta_mb": 600.0,
                 "eval_total": 4,
-                "format_valid_count": 4,
-                "format_compliance_rate": 1.0,
-                "class_correct_count": base_cls_correct,
-                "class_accuracy": round(base_cls_correct / 4, 4),
-                "benign_fp_count": fp,
-                "benign_fp_rate": round(fp / 2, 4),
-                "attack_tp_count": 2,
-                "attack_fn_count": 0,
-                "attack_recall": 1.0,
-                "correlated_correct_count": corr_correct,
-                "correlated_accuracy": round(corr_correct / 1, 4),
-                "mitre_correct_count": 2,
-                "mitre_accuracy": 1.0,
+                "format_valid_count": fmt_c,
+                "format_compliance_rate": round(fmt_c / 4, 4),
+                "class_correct_count": cls_c,
+                "class_accuracy": round(cls_c / 4, 4),
+                "benign_fp_count": fp_c,
+                "benign_fp_rate": round(fp_c / 2, 4),
+                "attack_tp_count": tp_c,
+                "attack_fn_count": 2 - tp_c,
+                "attack_recall": round(tp_c / 2, 4),
+                "correlated_correct_count": corr_c,
+                "correlated_accuracy": round(corr_c / 1, 4),
+                "mitre_correct_count": mit_c,
+                "mitre_accuracy": round(mit_c / 2, 4),
                 "explanation_quality_avg": qual,
                 "latency_p50_ms": p50,
                 "latency_p99_ms": p99,
@@ -1048,21 +1097,57 @@ class TestClaimsLinter(unittest.TestCase):
                 }
             return entry
 
-        sb = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", False, 1, 1, 0, 0.4, [10.0, 20.0, 30.0, 40.0], 20.0, 40.0, 25.0)
-        sl = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", True, 2, 1, 0, 0.6, [12.0, 22.0, 32.0, 42.0], 22.0, 42.0, 27.0)
-        gb = make_model_entry("google/gemma-2-2b-it", False, 3, 0, 1, 0.7, [100.0, 200.0, 300.0, 400.0], 200.0, 400.0, 250.0)
-        gl = make_model_entry("google/gemma-2-2b-it", True, 4, 0, 1, 0.9, [110.0, 210.0, 310.0, 410.0], 210.0, 410.0, 260.0)
+        sb = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", "smol_base", False, 0.4, [10.0, 20.0, 30.0, 40.0])
+        sl = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", "smol_lora", True, 0.6, [12.0, 22.0, 32.0, 42.0])
+        gb = make_model_entry("google/gemma-2-2b-it", "gemma_base", False, 0.7, [100.0, 200.0, 300.0, 400.0])
+        gl = make_model_entry("google/gemma-2-2b-it", "gemma_lora", True, 0.9, [110.0, 210.0, 310.0, 410.0])
         sl["training"].update({"lora_r": 8, "initial_loss": 2.0, "final_loss": 0.4, "train_seconds": 12.5, "adapter_size_mb": 1.2})
         gl["training"].update({"lora_r": 8, "initial_loss": 1.8, "final_loss": 0.2, "train_seconds": 45.0, "adapter_size_mb": 6.4})
-        # Window 0 & 1 primary-only (12.0, 22.0); Window 2 & 3 escalated (32+310=342.0, 42+410=452.0).
-        hyb_samples = [12.0, 22.0, 342.0, 452.0]
+
+        per_decisions = []
+        esc_flags = []
+        hyb_samples = []
+        hyb_cls = hyb_fp = hyb_tp = hyb_corr = hyb_mitre = 0
+        for idx_w, w in enumerate(fixture_windows):
+            sfv, sc, ss, sm = w["smol_lora"]
+            gfv, gc, gs, gm = w["gemma_lora"]
+            esc = (
+                w["tier1_sev"] in ("HIGH", "CRITICAL")
+                or ss in ("HIGH", "CRITICAL")
+                or w["inj"]
+                or w["correlated_case"]
+                or sc == "NEEDS-REVIEW"
+            )
+            esc_flags.append(esc)
+            hyb_samples.append(round(sl["raw_samples_ms"][idx_w] + gl["raw_samples_ms"][idx_w], 3) if esc else sl["raw_samples_ms"][idx_w])
+            cfv, cc, _cs, cm = (gfv, gc, gs, gm) if esc else (sfv, sc, ss, sm)
+            if cfv:
+                if cc == w["truth_class"]:
+                    hyb_cls += 1
+                    if w["correlated_case"]:
+                        hyb_corr += 1
+                if w["partition"] == "attack" and cc not in ("BENIGN-NOISE", "NEEDS-REVIEW"):
+                    hyb_tp += 1
+                if w["truth_mitre"] != "NONE" and cm == w["truth_mitre"]:
+                    hyb_mitre += 1
+            if w["partition"] == "benign" and ((not cfv) or cc != "BENIGN-NOISE"):
+                hyb_fp += 1
+            per_decisions.append({
+                "id": w["id"], "partition": w["partition"], "truth_class": w["truth_class"],
+                "truth_sev": w["truth_sev"], "truth_mitre": w["truth_mitre"], "tier1_sev": w["tier1_sev"],
+                "inj": w["inj"], "correlated_case": w["correlated_case"],
+                "smol_format_valid": sfv, "smol_nonempty": True, "smol_class": sc, "smol_sev": ss, "smol_mitre": sm,
+                "gemma_format_valid": gfv, "gemma_nonempty": True, "gemma_class": gc, "gemma_sev": gs, "gemma_mitre": gm,
+                "escalated": esc,
+            })
+
         rec = (
             "In offline side-by-side holdout evaluation, Gemma-2B-IT LoRA improved holdout triage accuracy from "
-            "0.5000 (SmolLM2-135M-Instruct LoRA) to 1.0000, moved benign-cohort errors from 1 to 0, changed "
+            "0.5000 (SmolLM2-135M-Instruct LoRA) to 1.0000, moved benign-cohort errors from 0 to 0, changed "
             "multi-window correlation accuracy from 0.0000 to 1.0000, and moved explanation quality from 0.6000 "
             "to 0.9000. At P50 per-incident latency, Gemma-2B-IT took 210.00 ms vs 22.00 ms (9.55x slower on CPU), "
-            "while selective escalation routed 50.00% of alerts to Gemma-2B-IT for 1.0000 combined accuracy at "
-            "207.00 ms blended mean latency (20.38% faster mean turnaround than always running Gemma-2B-IT), "
+            "while selective escalation replay routed 50.00% of alerts to Gemma-2B-IT for 1.0000 combined accuracy at "
+            "207.00 ms blended replayed mean latency (20.38% faster replayed mean generation latency than always running Gemma-2B-IT), "
             "with resident PEFT hot-swaps completing in 4.1000 ms P50."
         )
         valid_payload = {
@@ -1085,27 +1170,25 @@ class TestClaimsLinter(unittest.TestCase):
             "hybrid_escalation": {
                 "policy": "high_critical",
                 "total_windows": 4,
-                "escalated_count": 2,
-                "primary_only_count": 2,
-                "escalation_rate": 0.5,
-                "class_correct_count": 4,
-                "class_accuracy": 1.0,
-                "benign_fp_count": 0,
-                "benign_fp_rate": 0.0,
-                "correlated_correct_count": 1,
-                "correlated_accuracy": 1.0,
-                "mitre_correct_count": 2,
-                "mitre_accuracy": 1.0,
+                "escalated_count": sum(1 for x in esc_flags if x),
+                "primary_only_count": sum(1 for x in esc_flags if not x),
+                "escalation_rate": round(sum(1 for x in esc_flags if x) / 4, 4),
+                "class_correct_count": hyb_cls,
+                "class_accuracy": round(hyb_cls / 4, 4),
+                "benign_fp_count": hyb_fp,
+                "benign_fp_rate": round(hyb_fp / 2, 4),
+                "attack_tp_count": hyb_tp,
+                "attack_fn_count": 2 - hyb_tp,
+                "attack_recall": round(hyb_tp / 2, 4),
+                "correlated_correct_count": hyb_corr,
+                "correlated_accuracy": round(hyb_corr / 1, 4),
+                "mitre_correct_count": hyb_mitre,
+                "mitre_accuracy": round(hyb_mitre / 2, 4),
                 "explanation_quality_avg": 0.9,
                 "blended_p50_ms": 22.0,
                 "blended_mean_ms": 207.0,
-                "per_sample_escalated": [False, False, True, True],
-                "per_sample_decisions": [
-                    {"id": "w0", "tier1_sev": "LOW", "primary_class": "BENIGN-NOISE", "primary_sev": "LOW", "inj": False, "correlated_case": False, "escalated": False},
-                    {"id": "w1", "tier1_sev": "MEDIUM", "primary_class": "BENIGN-NOISE", "primary_sev": "LOW", "inj": False, "correlated_case": False, "escalated": False},
-                    {"id": "w2", "tier1_sev": "HIGH", "primary_class": "AUTH-BRUTEFORCE", "primary_sev": "HIGH", "inj": False, "correlated_case": False, "escalated": True},
-                    {"id": "w3", "tier1_sev": "MEDIUM", "primary_class": "RECON-SCAN", "primary_sev": "MEDIUM", "inj": False, "correlated_case": True, "escalated": True},
-                ],
+                "per_sample_escalated": esc_flags,
+                "per_sample_decisions": per_decisions,
                 "raw_blended_samples_ms": hyb_samples,
             },
             "live_adapter_hotswap": {
@@ -1124,11 +1207,11 @@ class TestClaimsLinter(unittest.TestCase):
                 "zero_restart_verified": True,
             },
             "comparison": {
-                "lora_accuracy_gain_smol": 0.25,
-                "lora_accuracy_gain_gemma": 0.25,
-                "gemma_vs_smol_lora_accuracy_delta": 0.5,
-                "gemma_vs_smol_fp_reduction": 1,
-                "gemma_vs_smol_correlated_accuracy_delta": 1.0,
+                "lora_accuracy_gain_smol": round(sl["class_accuracy"] - sb["class_accuracy"], 4),
+                "lora_accuracy_gain_gemma": round(gl["class_accuracy"] - gb["class_accuracy"], 4),
+                "gemma_vs_smol_lora_accuracy_delta": round(gl["class_accuracy"] - sl["class_accuracy"], 4),
+                "gemma_vs_smol_fp_reduction": int(sl["benign_fp_count"] - gl["benign_fp_count"]),
+                "gemma_vs_smol_correlated_accuracy_delta": round(gl["correlated_accuracy"] - sl["correlated_accuracy"], 4),
                 "gemma_vs_smol_explanation_quality_delta": 0.3,
                 "gemma_vs_smol_p50_slowdown_x": 9.55,
                 "hybrid_vs_gemma_mean_turnaround_ratio": 0.7962,
@@ -1180,20 +1263,25 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("zero_restart_verified" in e for e in errs_b), errs_b)
             self.assertTrue(any("sentinel_sidecar_rollback_ms" in e for e in errs_b), errs_b)
 
-            # Reject inconsistent model counts (corr > cls or tp > fmt), non-high_critical policy,
-            # mismatched per_sample_decisions, and wrong post_rollback_adapter ([24], [27], [35]).
+            # Reject inconsistent model counts (corr > cls), non-high_critical policy,
+            # mismatched per_sample_decisions, wrong hybrid attack_recall, tampered hybrid replay counts,
+            # null training field, and wrong post_rollback_adapter ([24], [25], [28], [32], [35]).
             bad_inv = json.loads(json.dumps(valid_payload))
-            bad_inv["models"]["smol_base"]["correlated_correct_count"] = 2  # > class_correct_count(1), even though <= corr(1)? Make valid corr=2:
             bad_inv["dataset"]["eval_correlated_windows"] = 2
+            bad_inv["models"]["smol_base"]["correlated_correct_count"] = 2
             bad_inv["models"]["smol_base"]["correlated_accuracy"] = 1.0
             bad_inv["models"]["smol_lora"]["correlated_correct_count"] = 2
             bad_inv["models"]["smol_lora"]["correlated_accuracy"] = 1.0
+            bad_inv["models"]["smol_lora"]["training"]["initial_loss"] = None
             bad_inv["models"]["gemma_base"]["correlated_correct_count"] = 2
             bad_inv["models"]["gemma_base"]["correlated_accuracy"] = 1.0
             bad_inv["models"]["gemma_lora"]["correlated_correct_count"] = 2
             bad_inv["models"]["gemma_lora"]["correlated_accuracy"] = 1.0
             bad_inv["hybrid_escalation"]["policy"] = "always"
-            bad_inv["hybrid_escalation"]["per_sample_decisions"][0]["primary_sev"] = "HIGH"
+            bad_inv["hybrid_escalation"]["attack_recall"] = 2.0
+            bad_inv["hybrid_escalation"]["class_correct_count"] = 2
+            bad_inv["hybrid_escalation"]["class_accuracy"] = 0.5
+            bad_inv["hybrid_escalation"]["per_sample_decisions"][0]["smol_sev"] = "HIGH"
             bad_inv["live_adapter_hotswap"]["post_rollback_adapter"] = "artifacts/smol-v1/model_adapters"
             inv_path = Path(tmp) / "bad_inv.json"
             inv_path.write_text(json.dumps(bad_inv), encoding="utf-8")
@@ -1201,19 +1289,19 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok_inv)
             self.assertTrue(any("out of range" in e for e in errs_inv), errs_inv)
             self.assertTrue(any("policy must be 'high_critical'" in e for e in errs_inv), errs_inv)
+            self.assertTrue(any("attack_recall" in e for e in errs_inv), errs_inv)
             self.assertTrue(any("per_sample_decisions[0] mismatch" in e for e in errs_inv), errs_inv)
             self.assertTrue(any("post_rollback_adapter must equal" in e for e in errs_inv), errs_inv)
 
-            # Validate full Markdown report parity AND reject duplicate rows, HTML-commented conclusions,
-            # and tampered training provenance ([1], [26], [33], [39], [42]).
+            # Positive & negative Markdown checks ([1], [23], [26], [31], [32], [33], [36], [37], [39], [42]).
             md_path = Path(tmp) / "2026-11-26-phase5-comparison.md"
             md_lines = [
                 "- **Platform:** `Darwin x86_64` (`Test CPU`, `8` logical cores, `torch_threads=4`)",
                 "| Tier / Model | Format Compliance | Class Accuracy | Benign Error (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
                 "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-                "| `SmolLM2-135M-Instruct` (Base) | 1.0000 | 0.2500 (1/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.4000 | 900.00 MB (+600.00) | 20.00 ms | 25.00 ms |",
-                "| `SmolLM2-135M-Instruct` (LoRA) | 1.0000 | 0.5000 (2/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.6000 | 900.00 MB (+600.00) | 22.00 ms | 27.00 ms |",
-                "| `google/gemma-2-2b-it` (Base) | 1.0000 | 0.7500 (3/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.7000 | 900.00 MB (+600.00) | 200.00 ms | 250.00 ms |",
+                "| `SmolLM2-135M-Instruct` (Base) | 1.0000 | 0.0000 (0/4) | 2 (1.0000) | 0.0000 | 0.0000 | 0.4000 | 900.00 MB (+600.00) | 20.00 ms | 25.00 ms |",
+                "| `SmolLM2-135M-Instruct` (LoRA) | 1.0000 | 0.5000 (2/4) | 0 (0.0000) | 0.0000 | 0.0000 | 0.6000 | 900.00 MB (+600.00) | 22.00 ms | 27.00 ms |",
+                "| `google/gemma-2-2b-it` (Base) | 1.0000 | 0.7500 (3/4) | 0 (0.0000) | 0.0000 | 0.5000 | 0.7000 | 900.00 MB (+600.00) | 200.00 ms | 250.00 ms |",
                 "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |",
                 "| **Hybrid Escalation (`high_critical`, 0.5000 escalated)** | — | **1.0000 (4/4)** | **0 (0.0000)** | **1.0000** | **1.0000** | **0.9000** | Primary 900.00 MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **22.00 ms** | **207.00 ms** |",
                 "## LoRA Fine-Tuning Provenance",
@@ -1238,23 +1326,40 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(ok_m, errs_m)
 
             md_text_orig = md_path.read_text(encoding="utf-8")
-            md_path.write_text(md_text_orig.replace("210.00 ms", "999.00 ms"), encoding="utf-8")
-            ok_tm, errs_tm = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
-            self.assertFalse(ok_tm)
-            self.assertTrue(any("table parity error" in e for e in errs_tm), errs_tm)
+            # Swapped P50 Latency / Mean Latency header must fail even when body cells are untouched ([37]).
+            md_path.write_text(md_text_orig.replace("P50 Latency | Mean Latency", "Mean Latency | P50 Latency"), encoding="utf-8")
+            ok_hdr, errs_hdr = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_hdr)
+            self.assertTrue(any("column header mismatch" in e for e in errs_hdr), errs_hdr)
 
-            # Duplicate Gemma row + hidden HTML comment conclusion + visible Conclusion tamper + provenance tamper
-            dup_row = "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 999.00 ms | 260.00 ms |"
+            # Header prefixed with HTML comment on the same line must be treated as HTML block and fail parity ([31]).
+            md_path.write_text(md_text_orig.replace("| Tier / Model |", "<!-- note --> | Tier / Model |"), encoding="utf-8")
+            ok_cmt, errs_cmt = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_cmt)
+            self.assertTrue(any("table parity error" in e for e in errs_cmt), errs_cmt)
+
+            # Duplicate hybrid row with different rate, GFM `## Conclusion ##` duplicate, and provenance tamper ([33], [36], [42]).
+            dup_hyb = "| **Hybrid Escalation (`high_critical`, 0.9999 escalated)** | — | **1.0000 (4/4)** | **0 (0.0000)** | **1.0000** | **1.0000** | **0.9000** | Primary 900.00 MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **22.00 ms** | **207.00 ms** |"
             tampered_md = md_text_orig.replace(
-                "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |",
-                "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |\n" + dup_row,
-            ).replace("(4 steps,", "(40 steps,").replace(rec, "<!-- " + rec + " -->\nTampered conclusion prose.")
+                "| **Hybrid Escalation (`high_critical`, 0.5000 escalated)**",
+                dup_hyb + "\n| **Hybrid Escalation (`high_critical`, 0.5000 escalated)**",
+            ).replace("(4 steps,", "(40 steps,").replace("## Conclusion", "## Conclusion ##\n\nTampered.\n\n## Conclusion")
             md_path.write_text(tampered_md, encoding="utf-8")
             ok_td, errs_td = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
             self.assertFalse(ok_td)
-            self.assertTrue(any("duplicate row" in e for e in errs_td), errs_td)
+            self.assertTrue(any("duplicate row for '**Hybrid Escalation**'" in e for e in errs_td), errs_td)
             self.assertTrue(any("provenance mismatch" in e for e in errs_td), errs_td)
-            self.assertTrue(any("visible Conclusion section drifted" in e for e in errs_td), errs_td)
+            self.assertTrue(any("exactly one visible '## Conclusion'" in e for e in errs_td), errs_td)
+
+            # Verify null initial_loss triggers a clean validation error rather than TypeError ([32]).
+            null_loss = json.loads(json.dumps(with_md))
+            null_loss["models"]["smol_lora"]["training"]["initial_loss"] = None
+            null_loss_path = Path(tmp) / "null_loss.json"
+            null_loss_path.write_text(json.dumps(null_loss), encoding="utf-8")
+            md_path.write_text(md_text_orig, encoding="utf-8")
+            ok_nl, errs_nl = sync_docs.independent_recompute_phase5_comparison(null_loss_path, repo_root=Path(tmp))
+            self.assertFalse(ok_nl)
+            self.assertTrue(any("initial_loss" in e for e in errs_nl), errs_nl)
 
 
 if __name__ == "__main__":

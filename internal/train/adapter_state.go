@@ -58,6 +58,7 @@ type AdapterSlot struct {
 	AdapterPath string    `json:"adapter_path"`
 	DatasetHash string    `json:"dataset_hash,omitempty"`
 	ActivatedAt time.Time `json:"activated_at"`
+	OpSeq       uint64    `json:"op_seq,omitempty"`
 }
 
 // ActiveAdapter records the currently activated local LoRA adapter references for Tier 2
@@ -68,6 +69,8 @@ type ActiveAdapter struct {
 	AdapterPath        string       `json:"adapter_path,omitempty"`
 	DatasetHash        string       `json:"dataset_hash,omitempty"`
 	ActivatedAt        time.Time    `json:"activated_at,omitempty"`
+	PrimarySeq         uint64       `json:"primary_seq,omitempty"`
+	EscalationSeq      uint64       `json:"escalation_seq,omitempty"`
 	Escalation         *AdapterSlot `json:"escalation,omitempty"`
 	Previous           *AdapterSlot `json:"previous,omitempty"`
 	PreviousEscalation *AdapterSlot `json:"previous_escalation,omitempty"`
@@ -184,7 +187,8 @@ func validateAndNormalizeManifest(state *ActiveAdapter) error {
 		return fmt.Errorf("previous escalation snapshot: %w", err)
 	}
 
-	if state.AdapterPath == "" && state.Escalation == nil && state.Previous == nil && state.PreviousEscalation == nil {
+	if state.AdapterPath == "" && state.Escalation == nil && state.Previous == nil && state.PreviousEscalation == nil &&
+		state.PrimarySeq == 0 && state.EscalationSeq == 0 {
 		return fmt.Errorf("adapter_path is required")
 	}
 	return nil
@@ -402,12 +406,16 @@ func UpdateActiveAdapterSlotWithHash(dataDir, slot string, next AdapterSlot) (Ac
 				prevCopy := prev
 				cur.Previous = &prevCopy
 			}
+			cur.PrimarySeq++
+			next.OpSeq = cur.PrimarySeq
 			cur.SetPrimarySlot(next)
 		case SlotEscalation:
 			if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 			}
+			cur.EscalationSeq++
+			next.OpSeq = cur.EscalationSeq
 			nextCopy := next
 			cur.Escalation = &nextCopy
 		}
@@ -450,6 +458,8 @@ func RollbackActiveAdapterSlotExpected(dataDir, slot string, expected *AdapterSl
 			} else {
 				cur.Previous = nil
 			}
+			cur.PrimarySeq++
+			restored.OpSeq = cur.PrimarySeq
 			cur.SetPrimarySlot(restored)
 		case SlotEscalation:
 			if cur.PreviousEscalation == nil {
@@ -465,6 +475,8 @@ func RollbackActiveAdapterSlotExpected(dataDir, slot string, expected *AdapterSl
 			} else {
 				cur.PreviousEscalation = nil
 			}
+			cur.EscalationSeq++
+			restored.OpSeq = cur.EscalationSeq
 			restoredCopy := restored
 			cur.Escalation = &restoredCopy
 		}
@@ -506,6 +518,7 @@ func DeactivateActiveAdapterSlotWithHash(dataDir, slot string) (ActiveAdapter, [
 				prevCopy := prev
 				cur.Previous = &prevCopy
 				cur.ClearPrimarySlot()
+				cur.PrimarySeq++
 				changed = true
 			}
 		}
@@ -514,13 +527,15 @@ func DeactivateActiveAdapterSlotWithHash(dataDir, slot string) (ActiveAdapter, [
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 				cur.Escalation = nil
+				cur.EscalationSeq++
 				changed = true
 			}
 		}
 		if !changed {
 			return false, false, nil
 		}
-		remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil
+		remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
+			cur.PrimarySeq == 0 && cur.EscalationSeq == 0
 		return remove, true, nil
 	})
 	return updated, hash, changed, hasFile, err
@@ -536,7 +551,8 @@ func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, err
 
 // MirrorDaemonSlotToManifest synchronizes the local manifest's active slot to match a daemon's
 // authoritative AdapterStatusResponse after a remote or separate-directory operation.
-// Uses a monotonic ActivatedAt guard so delayed out-of-order responses cannot overwrite newer state.
+// Uses per-slot operation sequences (`OpSeq`) so rollbacks to older adapters are applied cleanly
+// while delayed activations and deactivations arrive out of order without regressing state.
 func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fallbackModel, fallbackAdapter, fallbackJob string) (ActiveAdapter, error) {
 	normSlot, err := NormalizeSlot(slot, false)
 	if err != nil {
@@ -547,6 +563,7 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 	jid := strings.TrimSpace(fallbackJob)
 	var dsHash string
 	var swappedAt time.Time
+	var incomingSeq uint64
 	if slotState != nil {
 		if strings.TrimSpace(slotState.BaseModel) != "" {
 			bm = strings.TrimSpace(slotState.BaseModel)
@@ -557,9 +574,46 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		}
 		dsHash = strings.TrimSpace(slotState.DatasetHash)
 		swappedAt = slotState.SwappedAt
+		incomingSeq = slotState.OpSeq
 	}
 	if ap == "" {
-		updated, _, err := DeactivateActiveAdapterSlot(dataDir, normSlot)
+		updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
+			var curSeq uint64
+			if normSlot == SlotEscalation {
+				curSeq = cur.EscalationSeq
+			} else {
+				curSeq = cur.PrimarySeq
+			}
+			if incomingSeq > 0 && incomingSeq <= curSeq {
+				return false, false, nil
+			}
+			if normSlot == SlotEscalation {
+				if cur.Escalation != nil {
+					prevCopy := *cur.Escalation
+					cur.PreviousEscalation = &prevCopy
+					cur.Escalation = nil
+				}
+				if incomingSeq > cur.EscalationSeq {
+					cur.EscalationSeq = incomingSeq
+				} else {
+					cur.EscalationSeq++
+				}
+			} else {
+				if prev, ok := cur.PrimarySlot(); ok {
+					prevCopy := prev
+					cur.Previous = &prevCopy
+					cur.ClearPrimarySlot()
+				}
+				if incomingSeq > cur.PrimarySeq {
+					cur.PrimarySeq = incomingSeq
+				} else {
+					cur.PrimarySeq++
+				}
+			}
+			remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
+				cur.PrimarySeq == 0 && cur.EscalationSeq == 0
+			return remove, true, nil
+		})
 		return updated, err
 	}
 	next := AdapterSlot{
@@ -568,6 +622,7 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		AdapterPath: ap,
 		DatasetHash: dsHash,
 		ActivatedAt: swappedAt,
+		OpSeq:       incomingSeq,
 	}
 	if err := validateAdapterSlotStruct(&next); err != nil {
 		return ActiveAdapter{}, err
@@ -578,22 +633,42 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 	updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, exists bool) (bool, bool, error) {
 		switch normSlot {
 		case SlotPrimary:
-			if existing, ok := cur.PrimarySlot(); ok && !existing.ActivatedAt.IsZero() && next.ActivatedAt.Before(existing.ActivatedAt) {
+			if incomingSeq > 0 {
+				if incomingSeq <= cur.PrimarySeq {
+					return false, false, nil
+				}
+			} else if existing, ok := cur.PrimarySlot(); ok && !existing.ActivatedAt.IsZero() && next.ActivatedAt.Before(existing.ActivatedAt) {
 				return false, false, nil
 			}
 			if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
 				prevCopy := prev
 				cur.Previous = &prevCopy
 			}
+			if incomingSeq > cur.PrimarySeq {
+				cur.PrimarySeq = incomingSeq
+			} else {
+				cur.PrimarySeq++
+			}
+			next.OpSeq = cur.PrimarySeq
 			cur.SetPrimarySlot(next)
 		case SlotEscalation:
-			if cur.Escalation != nil && !cur.Escalation.ActivatedAt.IsZero() && next.ActivatedAt.Before(cur.Escalation.ActivatedAt) {
+			if incomingSeq > 0 {
+				if incomingSeq <= cur.EscalationSeq {
+					return false, false, nil
+				}
+			} else if cur.Escalation != nil && !cur.Escalation.ActivatedAt.IsZero() && next.ActivatedAt.Before(cur.Escalation.ActivatedAt) {
 				return false, false, nil
 			}
 			if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 			}
+			if incomingSeq > cur.EscalationSeq {
+				cur.EscalationSeq = incomingSeq
+			} else {
+				cur.EscalationSeq++
+			}
+			next.OpSeq = cur.EscalationSeq
 			nextCopy := next
 			cur.Escalation = &nextCopy
 		}
@@ -638,6 +713,7 @@ type SlotStatus struct {
 	DatasetHash         string    `json:"dataset_hash,omitempty"`
 	InferenceURL        string    `json:"inference_url,omitempty"`
 	SwappedAt           time.Time `json:"swapped_at,omitempty"`
+	OpSeq               uint64    `json:"op_seq,omitempty"`
 	HasRollback         bool      `json:"has_rollback"`
 	PreviousBaseModel   string    `json:"previous_base_model,omitempty"`
 	PreviousAdapterPath string    `json:"previous_adapter_path,omitempty"`
@@ -727,7 +803,11 @@ func doDaemonAdapterRequest(ctx context.Context, method, sentinelHTTP, authToken
 	client := security.NewLoopbackHTTPClient(10*time.Second, allowRemote, true)
 	resp, err := client.Do(req)
 	if err != nil {
-		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter: %w", method, redactedTarget, security.SanitizeURLError(err))
+		safeErr := security.SanitizeURLError(err)
+		if method != http.MethodGet {
+			return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter request outcome could not be confirmed (daemon state may have changed; inspect `sentinel adapter status` before retrying): %w", method, redactedTarget, safeErr)
+		}
+		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter: %w", method, redactedTarget, safeErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
 

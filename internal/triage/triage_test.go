@@ -753,6 +753,22 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 	if !inj || len(sigs) == 0 {
 		t.Fatalf("expected injection detection from hostile correlated window, inj=%v sigs=%v", inj, sigs)
 	}
+
+	// Small maxPromptBytes must allocate current-event template/sample BEFORE optional correlated summaries ([9]).
+	smallPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:           "auth-svc",
+		Level:             "WARN",
+		Template:          "UNIQUE_CURRENT_TEMPLATE failed login for admin",
+		SampleLine:        "UNIQUE_CURRENT_SAMPLE src=203.0.113.99 user=admin",
+		Count:             9,
+		CorrelatedWindows: []string{"priorA(RECON,MEDIUM,cnt=5)", "priorB(EXFIL,HIGH,cnt=8)", "priorC(SCAN,LOW,cnt=3)", "priorD(PRIV,HIGH,cnt=2)"},
+	}, 540)
+	if err != nil {
+		t.Fatalf("small prompt BuildTriagePromptChecked failed: %v", err)
+	}
+	if !strings.Contains(smallPrompt, "UNIQUE_CURRENT_TEMPLATE") || !strings.Contains(smallPrompt, "UNIQUE_CURRENT_SAMPLE") {
+		t.Fatalf("expected current event template & sample preserved before optional correlated history, got:\n%s", smallPrompt)
+	}
 }
 
 func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
@@ -806,5 +822,31 @@ func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
 	setResp(HealthStatus{Status: "degraded", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: true})
 	if _, err := client.VerifyHealth(context.Background(), model.ModelGemma22BIT); err == nil {
 		t.Fatal("expected degraded status to fail VerifyHealth")
+	}
+
+	// Redirecting /healthz to another origin must be blocked without leaking Authorization or X-API-Key ([15]).
+	var leakCount atomic.Int32
+	sinkSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sinkSrv.Close()
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sinkSrv.URL+"/healthz", http.StatusTemporaryRedirect)
+	}))
+	defer redirSrv.Close()
+	redirClient, err := NewClient(ClientOptions{
+		BaseURL:   redirSrv.URL,
+		BaseModel: model.ModelGemma22BIT,
+		APIKey:    "health-secret",
+	})
+	if err != nil {
+		t.Fatalf("NewClient redir: %v", err)
+	}
+	if _, err := redirClient.VerifyHealth(context.Background(), model.ModelGemma22BIT); err == nil {
+		t.Fatal("expected /healthz redirect to second origin to fail")
+	}
+	if leakCount.Load() != 0 {
+		t.Fatalf("expected redirect target to receive 0 requests and no credentials, got %d", leakCount.Load())
 	}
 }

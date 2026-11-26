@@ -271,6 +271,14 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
 	pipe.ConfigureAdapterSyncPolicy(hasStartupManifest, startupManifestHash, adapterPathExplicit, escalationAdapterExplicit, primaryLoadedFromDisk, escalationLoadedFromDisk)
+	pinPrimary, pinEsc := "", ""
+	if baseModelExplicit {
+		pinPrimary = cfg.BaseModel
+	}
+	if escalationModelExplicit {
+		pinEsc = cfg.EscalationBaseModel
+	}
+	pipe.SetExplicitBaseModels(pinPrimary, pinEsc)
 	pipe.EnableAsyncTriage(0)
 	defer pipe.Close()
 	pipe.AttachSegReader(segReader)

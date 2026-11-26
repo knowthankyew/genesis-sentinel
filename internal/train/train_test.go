@@ -271,6 +271,56 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	if err != nil || gotM.AdapterPath != "artifacts/newer/model_adapters" {
 		t.Fatalf("expected newer mirrored adapter preserved, got %+v err=%v", gotM, err)
 	}
+
+	// Verify OpSeq handles rollback to an adapter with an older ActivatedAt AND blocks out-of-order
+	// deactivation / activation messages ([10], [11]).
+	seqDir := t.TempDir()
+	tA := newerTS.Add(-10 * time.Minute)
+	tB := newerTS.Add(-2 * time.Minute)
+	if _, err := MirrorDaemonSlotToManifest(seqDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/seq-A/model_adapters", SwappedAt: tA, OpSeq: 1,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror A(seq=1): %v", err)
+	}
+	if _, err := MirrorDaemonSlotToManifest(seqDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/seq-B/model_adapters", SwappedAt: tB, OpSeq: 2,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror B(seq=2): %v", err)
+	}
+	// Rollback restores A with A's older ActivatedAt=tA, but OpSeq=3 > 2 must succeed!
+	if _, err := MirrorDaemonSlotToManifest(seqDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/seq-A/model_adapters", SwappedAt: tA, OpSeq: 3,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror rollback A(seq=3): %v", err)
+	}
+	gotSeq, _, err := LoadActiveAdapter(seqDir)
+	if err != nil || gotSeq.AdapterPath != "artifacts/seq-A/model_adapters" || gotSeq.PrimarySeq != 3 {
+		t.Fatalf("expected OpSeq=3 rollback to restore A, got %+v err=%v", gotSeq, err)
+	}
+	// Deactivation at seq=4 must NOT be undone by delayed activation at seq=3, and delayed deactivate seq=2
+	// cannot clear a newer seq=4 slot (or re-enabled seq=5).
+	if _, err := MirrorDaemonSlotToManifest(seqDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "", OpSeq: 4,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror deactivate(seq=4): %v", err)
+	}
+	if _, err := MirrorDaemonSlotToManifest(seqDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/seq-A/model_adapters", SwappedAt: tB, OpSeq: 3,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror stale activate(seq=3): %v", err)
+	}
+	gotDeact, existsDeact, err := LoadActiveAdapter(seqDir)
+	if err != nil || !existsDeact || gotDeact.AdapterPath != "" || gotDeact.PrimarySeq != 4 {
+		t.Fatalf("expected deactivated seq=4 preserved against stale seq=3 activation, got %+v err=%v", gotDeact, err)
+	}
+
+	// Transport/cancel error on mutating request warns operator to check status before retrying ([7]).
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, rbWarnErr := DaemonAdapterAction(cancelCtx, "http://127.0.0.1:1", "", AdapterSwapRequest{Slot: SlotPrimary, Action: ActionRollback}, false)
+	if rbWarnErr == nil || !strings.Contains(rbWarnErr.Error(), "sentinel adapter status") {
+		t.Fatalf("expected status-check warning on transport failure for mutating action, got %v", rbWarnErr)
+	}
 }
 
 func TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload(t *testing.T) {

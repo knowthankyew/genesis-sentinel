@@ -49,6 +49,7 @@ type slotRuntimeMeta struct {
 	jobID       string
 	datasetHash string
 	swappedAt   time.Time
+	opSeq       uint64
 	previous    *train.AdapterSlot
 }
 
@@ -136,6 +137,7 @@ func (p *Pipeline) initAdapterTracking() {
 			p.primaryMeta.swappedAt = ps.ActivatedAt
 		}
 	}
+	p.primaryMeta.opSeq = manifest.PrimarySeq
 	p.primaryMeta.previous = cloneSlotPtr(manifest.Previous)
 	if manifest.Escalation != nil && (p.escalationClient == nil || manifest.Escalation.AdapterPath == p.cfg.EscalationAdapterPath) {
 		p.escalationMeta.baseModel = manifest.Escalation.BaseModel
@@ -144,6 +146,7 @@ func (p *Pipeline) initAdapterTracking() {
 		p.escalationMeta.datasetHash = manifest.Escalation.DatasetHash
 		p.escalationMeta.swappedAt = manifest.Escalation.ActivatedAt
 	}
+	p.escalationMeta.opSeq = manifest.EscalationSeq
 	p.escalationMeta.previous = cloneSlotPtr(manifest.PreviousEscalation)
 	if clientMatchesDiskSlot(p.triageClient, psPtr) && clientMatchesDiskSlot(p.escalationClient, manifest.Escalation) {
 		p.lastSyncedManifest = hash
@@ -188,10 +191,93 @@ func (p *Pipeline) SetInitialSyncedManifestHash(hash [sha256.Size]byte) {
 	p.burnMu.Unlock()
 }
 
+// SetExplicitBaseModels pins explicit `--base-model` / `--escalation-base-model` CLI
+// choices so unrelated disk manifest changes never reload a skipped incompatible adapter ([6]).
+func (p *Pipeline) SetExplicitBaseModels(primaryModel, escalationModel string) {
+	p.burnMu.Lock()
+	p.adapterMu.Lock()
+	p.pinnedPrimaryModel = strings.TrimSpace(primaryModel)
+	p.pinnedEscalationModel = strings.TrimSpace(escalationModel)
+	p.adapterMu.Unlock()
+	p.burnMu.Unlock()
+}
+
 func (p *Pipeline) setSyncedManifestHashLocked(hash [sha256.Size]byte, hasFile bool) {
 	p.adapterMu.Lock()
 	p.lastSyncedManifest = hash
 	p.hasSyncedManifest = hasFile
+	p.adapterMu.Unlock()
+}
+
+func optionalSlotPtrEqual(a, b *train.AdapterSlot) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return slotsEqual(*a, *b)
+}
+
+func (p *Pipeline) syncHashIfSiblingMatchesLocked(hash [sha256.Size]byte, hasFile bool, modifiedSlot string, diskManifest train.ActiveAdapter) {
+	if !hasFile || modifiedSlot == train.SlotAll {
+		p.setSyncedManifestHashLocked(hash, hasFile)
+		return
+	}
+	p.adapterMu.Lock()
+	siblingSynced := true
+	if modifiedSlot == train.SlotPrimary {
+		if !p.escalationLockedByCLI {
+			es := diskManifest.Escalation
+			if es == nil {
+				if p.escalationClient != nil && p.escalationFromDisk && p.escalationClient.AdapterPath() != "" {
+					siblingSynced = false
+				}
+				if p.escalationMeta.adapterPath != "" || !optionalSlotPtrEqual(p.escalationMeta.previous, diskManifest.PreviousEscalation) {
+					siblingSynced = false
+				}
+			} else if p.pinnedEscalationModel == "" || strings.EqualFold(es.BaseModel, p.pinnedEscalationModel) {
+				if p.escalationClient != nil && (p.escalationClient.BaseModel() != es.BaseModel || p.escalationClient.AdapterPath() != es.AdapterPath) {
+					siblingSynced = false
+				}
+				if p.escalationMeta.baseModel != es.BaseModel ||
+					p.escalationMeta.adapterPath != es.AdapterPath ||
+					p.escalationMeta.jobID != es.JobID ||
+					!optionalSlotPtrEqual(p.escalationMeta.previous, diskManifest.PreviousEscalation) {
+					siblingSynced = false
+				}
+			}
+		}
+	} else if modifiedSlot == train.SlotEscalation {
+		if !p.primaryLockedByCLI {
+			ps, hasP := diskManifest.PrimarySlot()
+			if !hasP {
+				if p.triageClient != nil && p.primaryFromDisk && p.triageClient.AdapterPath() != "" {
+					siblingSynced = false
+				}
+				if p.primaryMeta.adapterPath != "" || !optionalSlotPtrEqual(p.primaryMeta.previous, diskManifest.Previous) {
+					siblingSynced = false
+				}
+			} else if p.pinnedPrimaryModel == "" || strings.EqualFold(ps.BaseModel, p.pinnedPrimaryModel) {
+				if p.triageClient != nil && (p.triageClient.BaseModel() != ps.BaseModel || p.triageClient.AdapterPath() != ps.AdapterPath) {
+					siblingSynced = false
+				}
+				if p.primaryMeta.baseModel != ps.BaseModel ||
+					p.primaryMeta.adapterPath != ps.AdapterPath ||
+					p.primaryMeta.jobID != ps.JobID ||
+					!optionalSlotPtrEqual(p.primaryMeta.previous, diskManifest.Previous) {
+					siblingSynced = false
+				}
+			}
+		}
+	}
+	if siblingSynced {
+		p.lastSyncedManifest = hash
+		p.hasSyncedManifest = true
+	} else {
+		p.lastSyncedManifest = [sha256.Size]byte{}
+		p.hasSyncedManifest = false
+	}
 	p.adapterMu.Unlock()
 }
 
@@ -563,7 +649,7 @@ func (p *Pipeline) applyVerdictToAlert(alert *emit.Alert, nextTier, baseSeverity
 	alert.Message = fmt.Sprintf("%s triage=[%s] %s", alert.Message, verdict.Label, truncateSummary(explanation, 160))
 }
 
-func (p *Pipeline) refreshUnchangedSlotMetaLocked(slot string, meta *train.AdapterSlot, diskPrev *train.AdapterSlot) {
+func (p *Pipeline) refreshUnchangedSlotMetaLocked(slot string, meta *train.AdapterSlot, diskPrev *train.AdapterSlot, opSeq uint64) {
 	p.adapterMu.Lock()
 	defer p.adapterMu.Unlock()
 	target := &p.primaryMeta
@@ -585,6 +671,7 @@ func (p *Pipeline) refreshUnchangedSlotMetaLocked(slot string, meta *train.Adapt
 		target.datasetHash = ""
 		target.swappedAt = time.Time{}
 	}
+	target.opSeq = opSeq
 	target.previous = cloneSlotPtr(diskPrev)
 }
 
@@ -612,27 +699,31 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 
 		swappedAny := false
 		cancelAsync := false
-		if !lockPrimary && p.triageClient != nil && primaryDisk && p.triageClient.AdapterPath() != "" {
-			curModel := p.triageClient.BaseModel()
-			curAdapter := p.triageClient.AdapterPath()
-			p.triageClient.ResetAdapter()
-			p.adapterEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotPrimary, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{})
-		} else if !lockPrimary && primaryDisk {
-			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, nil)
+		if !lockPrimary {
+			if p.triageClient != nil && primaryDisk && p.triageClient.AdapterPath() != "" {
+				curModel := p.triageClient.BaseModel()
+				curAdapter := p.triageClient.AdapterPath()
+				p.triageClient.ResetAdapterToBase(p.cfg.BaseModel)
+				p.adapterEpoch.Add(1)
+				cancelAsync = true
+				swappedAny = true
+				p.recordSwapLocked(train.SlotPrimary, "auto_reload", p.triageClient.BaseModel(), "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{}, 0, 0)
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, nil, 0)
+			}
 		}
-		if !lockEsc && p.escalationClient != nil && escDisk && p.escalationClient.AdapterPath() != "" {
-			curModel := p.escalationClient.BaseModel()
-			curAdapter := p.escalationClient.AdapterPath()
-			p.escalationClient.ResetAdapter()
-			p.escalationEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotEscalation, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{})
-		} else if !lockEsc && escDisk {
-			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, nil)
+		if !lockEsc {
+			if p.escalationClient != nil && escDisk && p.escalationClient.AdapterPath() != "" {
+				curModel := p.escalationClient.BaseModel()
+				curAdapter := p.escalationClient.AdapterPath()
+				p.escalationClient.ResetAdapterToBase(p.cfg.EscalationBaseModel)
+				p.escalationEpoch.Add(1)
+				cancelAsync = true
+				swappedAny = true
+				p.recordSwapLocked(train.SlotEscalation, "auto_reload", p.escalationClient.BaseModel(), "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{}, 0, 0)
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, nil, 0)
+			}
 		}
 		p.adapterMu.Lock()
 		if !lockPrimary {
@@ -657,6 +748,8 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 	unchanged := p.hasSyncedManifest && p.lastSyncedManifest == curHash
 	lockPrimary := p.primaryLockedByCLI
 	lockEsc := p.escalationLockedByCLI
+	pinPrimary := p.pinnedPrimaryModel
+	pinEsc := p.pinnedEscalationModel
 	primaryDisk := p.primaryFromDisk
 	escDisk := p.escalationFromDisk
 	p.adapterMu.Unlock()
@@ -664,22 +757,25 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 		return false, nil
 	}
 
-	// Pre-validate non-CLI-locked slot pairs before mutating either runtime client so a
-	// manifest issue never leaves half-applied slot updates.
 	ps, hasPrimary := manifest.PrimarySlot()
-	if !lockPrimary && hasPrimary && p.triageClient != nil {
+	skipPrimary := lockPrimary || (pinPrimary != "" && hasPrimary && !strings.EqualFold(ps.BaseModel, pinPrimary))
+	skipEsc := lockEsc || (pinEsc != "" && manifest.Escalation != nil && !strings.EqualFold(manifest.Escalation.BaseModel, pinEsc))
+
+	// Pre-validate non-pinned slot pairs before mutating either runtime client using the exact
+	// validators shared with Client.SetModelAndAdapter so commit setters cannot fail mid-update ([16]).
+	if !skipPrimary && hasPrimary && p.triageClient != nil {
 		if _, err := model.ValidateBaseModel(ps.BaseModel); err != nil {
 			return false, err
 		}
-		if _, err := model.ValidateAdapterPath(ps.AdapterPath); err != nil {
+		if _, err := triage.ValidateAdapterPath(ps.AdapterPath); err != nil {
 			return false, err
 		}
 	}
-	if !lockEsc && manifest.Escalation != nil && p.escalationClient != nil {
+	if !skipEsc && manifest.Escalation != nil && p.escalationClient != nil {
 		if _, err := model.ValidateBaseModel(manifest.Escalation.BaseModel); err != nil {
 			return false, err
 		}
-		if _, err := model.ValidateAdapterPath(manifest.Escalation.AdapterPath); err != nil {
+		if _, err := triage.ValidateAdapterPath(manifest.Escalation.AdapterPath); err != nil {
 			return false, err
 		}
 	}
@@ -687,7 +783,7 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 	swappedAny := false
 	cancelAsync := false
 
-	if !lockPrimary {
+	if !skipPrimary {
 		if hasPrimary {
 			if p.triageClient != nil {
 				curModel := p.triageClient.BaseModel()
@@ -699,15 +795,15 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 					p.adapterEpoch.Add(1)
 					cancelAsync = true
 					swappedAny = true
-					p.recordSwapLocked(train.SlotPrimary, "auto_reload", ps.BaseModel, ps.AdapterPath, ps.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, ps)
+					p.recordSwapLocked(train.SlotPrimary, "auto_reload", ps.BaseModel, ps.AdapterPath, ps.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, ps, manifest.PrimarySeq, manifest.EscalationSeq)
 				} else {
-					p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous)
+					p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous, manifest.PrimarySeq)
 				}
 				p.adapterMu.Lock()
 				p.primaryFromDisk = true
 				p.adapterMu.Unlock()
 			} else {
-				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous)
+				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous, manifest.PrimarySeq)
 				p.adapterMu.Lock()
 				p.primaryFromDisk = false
 				p.adapterMu.Unlock()
@@ -716,26 +812,26 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 			if (primaryDisk || manifest.Previous != nil) && p.triageClient.AdapterPath() != "" {
 				curModel := p.triageClient.BaseModel()
 				curAdapter := p.triageClient.AdapterPath()
-				p.triageClient.ResetAdapter()
+				p.triageClient.ResetAdapterToBase(p.cfg.BaseModel)
 				p.adapterEpoch.Add(1)
 				cancelAsync = true
 				swappedAny = true
-				p.recordSwapLocked(train.SlotPrimary, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+				p.recordSwapLocked(train.SlotPrimary, "auto_reload", p.triageClient.BaseModel(), "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{}, manifest.PrimarySeq, manifest.EscalationSeq)
 			} else {
-				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous)
+				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous, manifest.PrimarySeq)
 			}
 			p.adapterMu.Lock()
 			p.primaryFromDisk = false
 			p.adapterMu.Unlock()
 		} else {
-			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous)
+			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous, manifest.PrimarySeq)
 			p.adapterMu.Lock()
 			p.primaryFromDisk = false
 			p.adapterMu.Unlock()
 		}
 	}
 
-	if !lockEsc {
+	if !skipEsc {
 		if manifest.Escalation != nil {
 			es := *manifest.Escalation
 			if p.escalationClient != nil {
@@ -748,15 +844,15 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 					p.escalationEpoch.Add(1)
 					cancelAsync = true
 					swappedAny = true
-					p.recordSwapLocked(train.SlotEscalation, "auto_reload", es.BaseModel, es.AdapterPath, es.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, es)
+					p.recordSwapLocked(train.SlotEscalation, "auto_reload", es.BaseModel, es.AdapterPath, es.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, es, manifest.PrimarySeq, manifest.EscalationSeq)
 				} else {
-					p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation)
+					p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation, manifest.EscalationSeq)
 				}
 				p.adapterMu.Lock()
 				p.escalationFromDisk = true
 				p.adapterMu.Unlock()
 			} else {
-				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation)
+				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation, manifest.EscalationSeq)
 				p.adapterMu.Lock()
 				p.escalationFromDisk = false
 				p.adapterMu.Unlock()
@@ -765,19 +861,19 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 			if (escDisk || manifest.PreviousEscalation != nil) && p.escalationClient.AdapterPath() != "" {
 				curModel := p.escalationClient.BaseModel()
 				curAdapter := p.escalationClient.AdapterPath()
-				p.escalationClient.ResetAdapter()
+				p.escalationClient.ResetAdapterToBase(p.cfg.EscalationBaseModel)
 				p.escalationEpoch.Add(1)
 				cancelAsync = true
 				swappedAny = true
-				p.recordSwapLocked(train.SlotEscalation, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+				p.recordSwapLocked(train.SlotEscalation, "auto_reload", p.escalationClient.BaseModel(), "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{}, manifest.PrimarySeq, manifest.EscalationSeq)
 			} else {
-				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation)
+				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation, manifest.EscalationSeq)
 			}
 			p.adapterMu.Lock()
 			p.escalationFromDisk = false
 			p.adapterMu.Unlock()
 		} else {
-			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation)
+			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation, manifest.EscalationSeq)
 			p.adapterMu.Lock()
 			p.escalationFromDisk = false
 			p.adapterMu.Unlock()
@@ -810,6 +906,7 @@ func (p *Pipeline) recordSwapLocked(
 	hasDiskManifest bool,
 	diskPrevPrimary, diskPrevEsc *train.AdapterSlot,
 	newSlotMeta train.AdapterSlot,
+	diskPrimarySeq, diskEscSeq uint64,
 ) {
 	now := time.Now().UTC()
 	p.adapterSwapsTotal.Add(1)
@@ -819,6 +916,7 @@ func (p *Pipeline) recordSwapLocked(
 	defer p.adapterMu.Unlock()
 
 	if slot == train.SlotPrimary || slot == train.SlotAll {
+		priorMeta := p.primaryMeta
 		p.primaryMeta.baseModel = baseModel
 		p.primaryMeta.adapterPath = adapterPath
 		p.primaryMeta.jobID = newSlotMeta.JobID
@@ -832,17 +930,40 @@ func (p *Pipeline) recordSwapLocked(
 		}
 		if hasDiskManifest {
 			p.primaryMeta.previous = cloneSlotPtr(diskPrevPrimary)
-		} else if action != train.ActionRollback && prevAdapter != "" && prevAdapter != adapterPath {
-			p.primaryMeta.previous = &train.AdapterSlot{
-				BaseModel:   prevModel,
-				AdapterPath: prevAdapter,
-				ActivatedAt: now,
+			p.primaryMeta.opSeq = diskPrimarySeq
+		} else {
+			p.primaryMeta.opSeq++
+			if action != train.ActionRollback {
+				oldAdapter := priorMeta.adapterPath
+				oldModel := priorMeta.baseModel
+				if oldAdapter == "" {
+					oldAdapter = prevAdapter
+					oldModel = prevModel
+				}
+				if oldAdapter != "" && oldAdapter != adapterPath {
+					oldTS := priorMeta.swappedAt
+					if oldTS.IsZero() {
+						oldTS = now
+					}
+					if oldModel == "" {
+						oldModel = baseModel
+					}
+					p.primaryMeta.previous = &train.AdapterSlot{
+						JobID:       priorMeta.jobID,
+						BaseModel:   oldModel,
+						AdapterPath: oldAdapter,
+						DatasetHash: priorMeta.datasetHash,
+						ActivatedAt: oldTS,
+					}
+				}
 			}
 		}
 		p.primaryLockedByCLI = false
+		p.pinnedPrimaryModel = ""
 		p.primaryFromDisk = hasDiskManifest && action != train.ActionDeactivate && strings.TrimSpace(adapterPath) != ""
 	}
 	if slot == train.SlotEscalation || slot == train.SlotAll {
+		priorMeta := p.escalationMeta
 		p.escalationMeta.baseModel = baseModel
 		p.escalationMeta.adapterPath = adapterPath
 		p.escalationMeta.jobID = newSlotMeta.JobID
@@ -856,14 +977,36 @@ func (p *Pipeline) recordSwapLocked(
 		}
 		if hasDiskManifest {
 			p.escalationMeta.previous = cloneSlotPtr(diskPrevEsc)
-		} else if action != train.ActionRollback && prevAdapter != "" && prevAdapter != adapterPath {
-			p.escalationMeta.previous = &train.AdapterSlot{
-				BaseModel:   prevModel,
-				AdapterPath: prevAdapter,
-				ActivatedAt: now,
+			p.escalationMeta.opSeq = diskEscSeq
+		} else {
+			p.escalationMeta.opSeq++
+			if action != train.ActionRollback {
+				oldAdapter := priorMeta.adapterPath
+				oldModel := priorMeta.baseModel
+				if oldAdapter == "" {
+					oldAdapter = prevAdapter
+					oldModel = prevModel
+				}
+				if oldAdapter != "" && oldAdapter != adapterPath {
+					oldTS := priorMeta.swappedAt
+					if oldTS.IsZero() {
+						oldTS = now
+					}
+					if oldModel == "" {
+						oldModel = baseModel
+					}
+					p.escalationMeta.previous = &train.AdapterSlot{
+						JobID:       priorMeta.jobID,
+						BaseModel:   oldModel,
+						AdapterPath: oldAdapter,
+						DatasetHash: priorMeta.datasetHash,
+						ActivatedAt: oldTS,
+					}
+				}
 			}
 		}
 		p.escalationLockedByCLI = false
+		p.pinnedEscalationModel = ""
 		p.escalationFromDisk = hasDiskManifest && action != train.ActionDeactivate && strings.TrimSpace(adapterPath) != ""
 	}
 
@@ -933,6 +1076,7 @@ func (p *Pipeline) snapshotSlotStatusLocked(slot string) *train.SlotStatus {
 		DatasetHash:  datasetHash,
 		InferenceURL: url,
 		SwappedAt:    meta.swappedAt,
+		OpSeq:        meta.opSeq,
 	}
 	if meta.previous != nil {
 		st.HasRollback = true
@@ -1013,7 +1157,9 @@ func (p *Pipeline) buildAdapterStatusResponseLocked(statusLabel, slot, action st
 			resp.DataDir = truncateAuditField(resp.DataDir, maxSwapAuditFieldBytes*4)
 			resp.AdapterPath = truncateAuditField(resp.AdapterPath, maxSwapAuditFieldBytes*4)
 			resp.BaseModel = truncateAuditField(resp.BaseModel, maxSwapAuditFieldBytes*2)
+			resp.HealthStatus = truncateAuditField(resp.HealthStatus, maxSwapAuditFieldBytes)
 			resp.HealthBaseModel = truncateAuditField(resp.HealthBaseModel, maxSwapAuditFieldBytes*2)
+			resp.HealthBackend = truncateAuditField(resp.HealthBackend, maxSwapAuditFieldBytes)
 			for _, slotSt := range []*train.SlotStatus{resp.Primary, resp.Escalation} {
 				if slotSt == nil {
 					continue
@@ -1023,6 +1169,19 @@ func (p *Pipeline) buildAdapterStatusResponseLocked(statusLabel, slot, action st
 				slotSt.PreviousBaseModel = truncateAuditField(slotSt.PreviousBaseModel, maxSwapAuditFieldBytes*2)
 				slotSt.PreviousAdapterPath = truncateAuditField(slotSt.PreviousAdapterPath, maxSwapAuditFieldBytes*4)
 			}
+		}
+	}
+	if rawFinal, err := json.Marshal(resp); err != nil || len(rawFinal)+1 > train.MaxAdapterResponseBytes {
+		return train.AdapterStatusResponse{
+			Status:            statusLabel,
+			Slot:              slot,
+			Action:            action,
+			BaseModel:         truncateAuditField(resp.BaseModel, maxSwapAuditFieldBytes),
+			AdapterPath:       truncateAuditField(resp.AdapterPath, maxSwapAuditFieldBytes*2),
+			TriageEnabled:     resp.TriageEnabled,
+			EscalationEnabled: resp.EscalationEnabled,
+			Verified:          verified,
+			AdapterSwapsTotal: resp.AdapterSwapsTotal,
 		}
 	}
 	return resp
@@ -1291,9 +1450,9 @@ func (p *Pipeline) handleAdapterActivate(w http.ResponseWriter, r *http.Request,
 	}
 	p.asyncMu.Unlock()
 
-	p.recordSwapLocked(slot, train.ActionActivate, baseModel, cleanAdapter, slotState.JobID, prevModel, prevAdapter, req.Verify, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, slotState)
+	p.recordSwapLocked(slot, train.ActionActivate, baseModel, cleanAdapter, slotState.JobID, prevModel, prevAdapter, req.Verify, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, slotState, diskManifest.PrimarySeq, diskManifest.EscalationSeq)
 	if hasDiskManifest {
-		p.setSyncedManifestHashLocked(writtenHash, true)
+		p.syncHashIfSiblingMatchesLocked(writtenHash, true, slot, diskManifest)
 	}
 	resp := p.buildAdapterStatusResponseLocked("activated", slot, train.ActionActivate, req.Verify, health)
 	p.burnMu.Unlock()
@@ -1415,7 +1574,19 @@ func (p *Pipeline) handleAdapterRollback(w http.ResponseWriter, r *http.Request,
 				return
 			}
 			restored = *p.escalationMeta.previous
-			if p.escalationClient != nil && p.escalationClient.AdapterPath() != "" {
+			if p.escalationMeta.adapterPath != "" {
+				ts := p.escalationMeta.swappedAt
+				if ts.IsZero() {
+					ts = time.Now().UTC()
+				}
+				p.escalationMeta.previous = &train.AdapterSlot{
+					JobID:       p.escalationMeta.jobID,
+					BaseModel:   p.escalationMeta.baseModel,
+					AdapterPath: p.escalationMeta.adapterPath,
+					DatasetHash: p.escalationMeta.datasetHash,
+					ActivatedAt: ts,
+				}
+			} else if p.escalationClient != nil && p.escalationClient.AdapterPath() != "" {
 				p.escalationMeta.previous = &train.AdapterSlot{
 					JobID:       p.escalationMeta.jobID,
 					BaseModel:   p.escalationClient.BaseModel(),
@@ -1440,7 +1611,19 @@ func (p *Pipeline) handleAdapterRollback(w http.ResponseWriter, r *http.Request,
 				return
 			}
 			restored = *p.primaryMeta.previous
-			if p.triageClient != nil && p.triageClient.AdapterPath() != "" {
+			if p.primaryMeta.adapterPath != "" {
+				ts := p.primaryMeta.swappedAt
+				if ts.IsZero() {
+					ts = time.Now().UTC()
+				}
+				p.primaryMeta.previous = &train.AdapterSlot{
+					JobID:       p.primaryMeta.jobID,
+					BaseModel:   p.primaryMeta.baseModel,
+					AdapterPath: p.primaryMeta.adapterPath,
+					DatasetHash: p.primaryMeta.datasetHash,
+					ActivatedAt: ts,
+				}
+			} else if p.triageClient != nil && p.triageClient.AdapterPath() != "" {
 				p.primaryMeta.previous = &train.AdapterSlot{
 					JobID:       p.primaryMeta.jobID,
 					BaseModel:   p.triageClient.BaseModel(),
@@ -1518,9 +1701,9 @@ func (p *Pipeline) handleAdapterRollback(w http.ResponseWriter, r *http.Request,
 	}
 	p.asyncMu.Unlock()
 
-	p.recordSwapLocked(slot, train.ActionRollback, restored.BaseModel, restored.AdapterPath, restored.JobID, prevModel, prevAdapter, verify, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, restored)
+	p.recordSwapLocked(slot, train.ActionRollback, restored.BaseModel, restored.AdapterPath, restored.JobID, prevModel, prevAdapter, verify, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, restored, diskManifest.PrimarySeq, diskManifest.EscalationSeq)
 	if hasDiskManifest {
-		p.setSyncedManifestHashLocked(writtenHash, true)
+		p.syncHashIfSiblingMatchesLocked(writtenHash, true, slot, diskManifest)
 	}
 	resp := p.buildAdapterStatusResponseLocked("rolled_back", slot, train.ActionRollback, verify, health)
 	p.burnMu.Unlock()
@@ -1549,23 +1732,26 @@ func (p *Pipeline) handleAdapterDeactivate(w http.ResponseWriter, slot string) {
 
 	var prevModel, prevAdapter string
 	if slot == train.SlotPrimary || slot == train.SlotAll {
+		nextBase := ""
 		if p.triageClient != nil {
 			prevModel = p.triageClient.BaseModel()
 			prevAdapter = p.triageClient.AdapterPath()
-			p.triageClient.ResetAdapter()
+			p.triageClient.ResetAdapterToBase(p.cfg.BaseModel)
+			nextBase = p.triageClient.BaseModel()
 		}
 		p.adapterEpoch.Add(1)
-		p.recordSwapLocked(train.SlotPrimary, train.ActionDeactivate, prevModel, "", "", prevModel, prevAdapter, false, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, train.AdapterSlot{})
+		p.recordSwapLocked(train.SlotPrimary, train.ActionDeactivate, nextBase, "", "", prevModel, prevAdapter, false, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, train.AdapterSlot{}, diskManifest.PrimarySeq, diskManifest.EscalationSeq)
 	}
 	if slot == train.SlotEscalation || slot == train.SlotAll {
-		var escPrevModel, escPrevAdapter string
+		var escPrevModel, escPrevAdapter, escNextBase string
 		if p.escalationClient != nil {
 			escPrevModel = p.escalationClient.BaseModel()
 			escPrevAdapter = p.escalationClient.AdapterPath()
-			p.escalationClient.ResetAdapter()
+			p.escalationClient.ResetAdapterToBase(p.cfg.EscalationBaseModel)
+			escNextBase = p.escalationClient.BaseModel()
 		}
 		p.escalationEpoch.Add(1)
-		p.recordSwapLocked(train.SlotEscalation, train.ActionDeactivate, escPrevModel, "", "", escPrevModel, escPrevAdapter, false, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, train.AdapterSlot{})
+		p.recordSwapLocked(train.SlotEscalation, train.ActionDeactivate, escNextBase, "", "", escPrevModel, escPrevAdapter, false, hasDiskManifest, diskManifest.Previous, diskManifest.PreviousEscalation, train.AdapterSlot{}, diskManifest.PrimarySeq, diskManifest.EscalationSeq)
 	}
 
 	p.asyncMu.Lock()
@@ -1575,7 +1761,7 @@ func (p *Pipeline) handleAdapterDeactivate(w http.ResponseWriter, slot string) {
 	p.asyncMu.Unlock()
 
 	if hasDiskManifest {
-		p.setSyncedManifestHashLocked(writtenHash, hasFile)
+		p.syncHashIfSiblingMatchesLocked(writtenHash, hasFile, slot, diskManifest)
 	}
 	resp := p.buildAdapterStatusResponseLocked("deactivated", slot, train.ActionDeactivate, false, triage.HealthStatus{})
 	p.burnMu.Unlock()

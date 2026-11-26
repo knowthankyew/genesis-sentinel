@@ -12,6 +12,7 @@ measured independently without memory contamination across models.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import http.server
 import json
@@ -530,6 +531,7 @@ def run_eval_pass(model, tokenizer, model_id: str, eval_rows: list[dict], max_ne
             "pred_sev": parsed["severity"],
             "pred_mitre": parsed["mitre"],
             "format_valid": parsed["format_valid"],
+            "nonempty": bool((raw_gen or "").strip()),
             "explanation": parsed["explanation"],
             "keywords": list(row.get("keywords", ())),
             "explanation_quality": qual,
@@ -915,22 +917,34 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
         escalated_flags.append(bool(needs_esc))
         decision_inputs.append({
             "id": sr["id"],
+            "partition": sr["partition"],
+            "truth_class": sr["truth_class"],
+            "truth_sev": sr["truth_sev"],
+            "truth_mitre": sr["truth_mitre"],
             "tier1_sev": sr["tier1_sev"],
-            "primary_class": sr["pred_class"],
-            "primary_sev": sr["pred_sev"],
             "inj": bool(sr["inj"]),
             "correlated_case": bool(sr["correlated_case"]),
+            "smol_format_valid": bool(sr["format_valid"]),
+            "smol_nonempty": bool(sr.get("nonempty", True)),
+            "smol_class": sr["pred_class"],
+            "smol_sev": sr["pred_sev"],
+            "smol_mitre": sr["pred_mitre"],
+            "gemma_format_valid": bool(gr["format_valid"]),
+            "gemma_nonempty": bool(gr.get("nonempty", True)),
+            "gemma_class": gr["pred_class"],
+            "gemma_sev": gr["pred_sev"],
+            "gemma_mitre": gr["pred_mitre"],
             "escalated": bool(needs_esc),
         })
         if needs_esc:
             escalated_count += 1
-            if gr["format_valid"]:
+            # Match Go runtime escalation callback in internal/pipeline/adapter_hotswap.go:
+            # escalation Verdict applies whenever escalation returns a non-empty completion (escErr == nil),
+            # failing closed to NEEDS-REVIEW inside ParseCompletion if fields are malformed ([35]).
+            if gr.get("nonempty", True) or not sr["format_valid"]:
                 chosen = dict(gr)
-            elif sr["format_valid"]:
-                # Mirror runtime fallback: retain valid primary verdict if escalation output fails validation.
-                chosen = dict(sr)
             else:
-                chosen = dict(gr)
+                chosen = dict(sr)
             lat = round(sr["latency_ms"] + gr["latency_ms"], 3)
         else:
             chosen = dict(sr)
@@ -1218,19 +1232,19 @@ def build_conclusion_recommendation(
         p50_phrase = f"{gemma_p50_ms:.2f} ms (matched {smol_p50_ms:.2f} ms)"
 
     if hybrid_mean_ms < gemma_mean_ms:
-        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster mean turnaround than always running {gemma_label}"
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster replayed mean generation latency than always running {gemma_label}"
     elif hybrid_mean_ms > gemma_mean_ms:
-        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower mean turnaround than always running {gemma_label}"
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower replayed mean generation latency than always running {gemma_label}"
     else:
-        turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
+        turnaround_phrase = f"matched replayed mean generation latency vs always running {gemma_label}"
 
     return (
         f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign-cohort errors "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
-        f"{p50_phrase}, while selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
-        f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended mean latency "
+        f"{p50_phrase}, while selective escalation replay routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
+        f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended replayed mean latency "
         f"({turnaround_phrase}), with resident PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
     )
 
@@ -1252,34 +1266,44 @@ def _detect_cpu_brand() -> str:
 
 
 def _atomic_publish_pair(path_a: Path, content_a: str, path_b: Path, content_b: str) -> None:
-    """Write both files to temp siblings first and roll back the first swap if the second fails."""
+    """Serialize paired report replacement and roll back the first swap if the second fails ([22], [27])."""
     path_a.parent.mkdir(parents=True, exist_ok=True)
     path_b.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path_a.parent / ".phase5_report_publish.lock"
     tmp_a = path_a.parent / f".{path_a.name}.{os.getpid()}.tmp"
     tmp_b = path_b.parent / f".{path_b.name}.{os.getpid()}.tmp"
     bak_a = path_a.parent / f".{path_a.name}.{os.getpid()}.bak"
-    had_a = path_a.exists()
-    replaced_a = False
-    try:
-        tmp_a.write_text(content_a, encoding="utf-8")
-        tmp_b.write_text(content_b, encoding="utf-8")
-        if had_a:
-            bak_a.write_bytes(path_a.read_bytes())
-        os.replace(tmp_a, path_a)
-        replaced_a = True
-        os.replace(tmp_b, path_b)
-        if bak_a.exists():
-            bak_a.unlink(missing_ok=True)
-    except Exception:
-        if replaced_a:
-            if had_a and bak_a.exists():
-                os.replace(bak_a, path_a)
-            elif not had_a:
-                path_a.unlink(missing_ok=True)
-        tmp_a.unlink(missing_ok=True)
-        tmp_b.unlink(missing_ok=True)
-        bak_a.unlink(missing_ok=True)
-        raise
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            had_a = path_a.exists()
+            replaced_a = False
+            committed = False
+            try:
+                tmp_a.write_text(content_a, encoding="utf-8")
+                tmp_b.write_text(content_b, encoding="utf-8")
+                if had_a:
+                    bak_a.write_bytes(path_a.read_bytes())
+                os.replace(tmp_a, path_a)
+                replaced_a = True
+                os.replace(tmp_b, path_b)
+                committed = True
+            except Exception:
+                if replaced_a and not committed:
+                    if had_a and bak_a.exists():
+                        os.replace(bak_a, path_a)
+                    elif not had_a:
+                        path_a.unlink(missing_ok=True)
+                tmp_a.unlink(missing_ok=True)
+                tmp_b.unlink(missing_ok=True)
+                if not committed:
+                    bak_a.unlink(missing_ok=True)
+                raise
+            # Post-commit backup cleanup failure raises directly without reverting committed pair.
+            if bak_a.exists():
+                bak_a.unlink()
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def run_worker_subprocess(phase: str, adapter_dir: Path, worker_out: Path, args: argparse.Namespace) -> dict:
@@ -1311,7 +1335,7 @@ def main() -> int:
     parser.add_argument("--worker-out", type=Path, default=Path("worker.json"), help="Worker JSON output path")
     parser.add_argument("--train-epochs-smol", type=int, default=10, help="Epochs for SmolLM2 LoRA fine-tuning")
     parser.add_argument("--train-epochs-gemma", type=int, default=2, help="Epochs for Gemma 2 2B IT LoRA fine-tuning")
-    parser.add_argument("--sentinel-bin", type=Path, default=Path("bin/sentinel"), help="Built Sentinel CLI binary for live sidecar hot-swap timing")
+    parser.add_argument("--sentinel-bin", type=Path, default=None, help="Optional explicit Sentinel CLI binary for live sidecar timing (builds clean HEAD by default)")
     parser.add_argument("--out-json", type=Path, default=Path("docs/benchmarks/phase5_gemma_comparison.json"), help="Output comparison JSON path")
     parser.add_argument("--out-md", type=Path, default=Path("docs/benchmarks/2026-11-26-phase5-comparison.md"), help="Output comparison Markdown report path")
     args = parser.parse_args()
@@ -1335,12 +1359,17 @@ def main() -> int:
         raise ValueError(f"--out-md must resolve inside repository root {REPO_ROOT}: {out_md_abs}") from exc
 
     train_records, eval_rows = build_phase5_corpora()
-    custom_sentinel_bin = args.sentinel_bin != Path("bin/sentinel")
     explicit_sentinel_bin: Path | None = None
-    if custom_sentinel_bin:
+    recorded_bin_flag = ""
+    if args.sentinel_bin is not None:
         explicit_sentinel_bin = (REPO_ROOT / args.sentinel_bin) if not args.sentinel_bin.is_absolute() else args.sentinel_bin
         if not explicit_sentinel_bin.is_file():
             raise FileNotFoundError(f"Sentinel binary not found at {explicit_sentinel_bin}; build it first")
+        try:
+            rel_bin = explicit_sentinel_bin.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+            recorded_bin_flag = f" --sentinel-bin {rel_bin}"
+        except ValueError:
+            recorded_bin_flag = " --sentinel-bin <custom-sentinel-bin>"
 
     try:
         git_rev = subprocess.check_output(
@@ -1376,6 +1405,7 @@ def main() -> int:
             subprocess.run(
                 ["go", "build", "-o", str(sentinel_bin), "./cmd/sentinel"],
                 cwd=str(REPO_ROOT),
+                env={**os.environ, "GOTOOLCHAIN": "local"},
                 check=True,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1457,7 +1487,7 @@ def main() -> int:
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "git_commit": git_rev,
             "report_markdown": report_rel,
-            "command": f"python scripts/eval_phase5_models.py --train-epochs-smol {args.train_epochs_smol} --train-epochs-gemma {args.train_epochs_gemma}",
+            "command": f"python scripts/eval_phase5_models.py --train-epochs-smol {args.train_epochs_smol} --train-epochs-gemma {args.train_epochs_gemma}{recorded_bin_flag}",
             "offline_mode": True,
             "execution_device": "cpu",
             "dtype": "float32",

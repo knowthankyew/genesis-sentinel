@@ -627,7 +627,7 @@ func TestPipelinePhase5ReviewEdgeCasesAndHardening(t *testing.T) {
 		pNoURL.recordSwapLocked(train.SlotPrimary, train.ActionActivate, model.ModelSmolLM2135MInstruct,
 			"artifacts/s1/model_adapters", strings.Repeat("J", 12*1024), "", "", false, false, nil, nil, train.AdapterSlot{
 				JobID: strings.Repeat("J", 12*1024), BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/s1/model_adapters",
-			})
+			}, 0, 0)
 	}
 	recHist := httptest.NewRecorder()
 	pNoURL.HandleAdapter(recHist, httptest.NewRequest(http.MethodGet, "/adapter", nil))
@@ -889,9 +889,9 @@ func TestPipelinePhase5Round2Invariants(t *testing.T) {
 			t.Fatalf("seed rbDir: %v", err)
 		}
 	}
-	var seenHealth bool
+	var seenHealth atomic.Bool
 	hSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenHealth = true
+		seenHealth.Store(true)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"Healthy","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","backend":"mock"}`))
 	}))
@@ -914,8 +914,129 @@ func TestPipelinePhase5Round2Invariants(t *testing.T) {
 	reqStaleRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback","verify":true}`))
 	reqStaleRB.Header.Set("Content-Type", "application/json")
 	pRB.HandleAdapter(recStaleRB, reqStaleRB)
-	if recStaleRB.Code != http.StatusConflict || seenHealth {
+	if recStaleRB.Code != http.StatusConflict || seenHealth.Load() {
 		t.Fatalf("expected immediate 409 before /healthz when disk rollback target vanished, code=%d seenHealth=%v",
-			recStaleRB.Code, seenHealth)
+			recStaleRB.Code, seenHealth.Load())
+	}
+}
+
+func TestPipelinePhase5Round3Invariants(t *testing.T) {
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+
+	// 1. Explicit --base-model pin ignores incompatible disk manifest primary even when an
+	// unrelated escalation update changes the manifest hash ([6]).
+	pinDir := t.TempDir()
+	_, pinHash, err := train.UpdateActiveAdapterSlotWithHash(pinDir, train.SlotPrimary, train.AdapterSlot{
+		JobID: "j-smol", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/smol-skip/model_adapters",
+	})
+	if err != nil {
+		t.Fatalf("seed pinDir: %v", err)
+	}
+	cfgPin := config.DefaultConfig()
+	cfgPin.DataDir = pinDir
+	cfgPin.TriageMode = "http"
+	cfgPin.InferenceAddr = "http://127.0.0.1:8000"
+	cfgPin.BaseModel = model.ModelGemma22BIT
+	cfgPin.AdapterPath = ""
+	cfgPin.EscalationMode = "http"
+	cfgPin.EscalationInferenceAddr = "http://127.0.0.1:8001"
+	pPin := New(cfgPin, ruleEng, emit.NopSink{}, "file")
+	pPin.ConfigureAdapterSyncPolicy(true, pinHash, false, false, false, false)
+	pPin.SetExplicitBaseModels(model.ModelGemma22BIT, "")
+
+	if _, err := train.UpdateActiveAdapterSlot(pinDir, train.SlotEscalation, train.AdapterSlot{
+		JobID: "j-esc-pin", BaseModel: model.ModelGemma22BIT, AdapterPath: "artifacts/esc-pin/model_adapters",
+	}); err != nil {
+		t.Fatalf("update escalation on pinDir: %v", err)
+	}
+	reloadedPin, err := pPin.SyncActiveAdapterFromDisk()
+	if err != nil || !reloadedPin {
+		t.Fatalf("expected escalation reload while skipping mismatched primary, reloaded=%v err=%v", reloadedPin, err)
+	}
+	if pPin.TriageClient().BaseModel() != model.ModelGemma22BIT || pPin.TriageClient().AdapterPath() != "" ||
+		pPin.EscalationClient().AdapterPath() != "artifacts/esc-pin/model_adapters" {
+		t.Fatalf("expected pinned primary model preserved and escalation swapped, primary=(%q,%q) esc=%q",
+			pPin.TriageClient().BaseModel(), pPin.TriageClient().AdapterPath(), pPin.EscalationClient().AdapterPath())
+	}
+
+	// 2. Single-slot POST /adapter swap does NOT suppress a pending external sibling update ([12]),
+	// AND clearing an alternate-model primary restores configured cfg.BaseModel ([19]).
+	sibDir := t.TempDir()
+	cfgSib := config.DefaultConfig()
+	cfgSib.DataDir = sibDir
+	cfgSib.TriageMode = "http"
+	cfgSib.InferenceAddr = "http://127.0.0.1:8000"
+	cfgSib.BaseModel = model.ModelSmolLM2135MInstruct
+	cfgSib.EscalationMode = "http"
+	cfgSib.EscalationInferenceAddr = "http://127.0.0.1:8001"
+	cfgSib.EscalationBaseModel = model.ModelGemma22BIT
+	pSib := New(cfgSib, ruleEng, emit.NopSink{}, "file")
+
+	// External writer updates escalation from E1 -> E2 on disk before primary swap runs via POST /adapter.
+	if _, err := train.UpdateActiveAdapterSlot(sibDir, train.SlotEscalation, train.AdapterSlot{
+		JobID: "j-e2", BaseModel: model.ModelGemma22BIT, AdapterPath: "artifacts/e2-pending/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed sibling E2: %v", err)
+	}
+	recPri := httptest.NewRecorder()
+	reqPri := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(
+		`{"slot":"primary","base_model":"HuggingFaceTB/SmolLM2-360M-Instruct","adapter_path":"artifacts/p-360/model_adapters"}`))
+	reqPri.Header.Set("Content-Type", "application/json")
+	pSib.HandleAdapter(recPri, reqPri)
+	if recPri.Code != http.StatusOK {
+		t.Fatalf("primary swap failed: %d %s", recPri.Code, recPri.Body.String())
+	}
+	if sw, err := pSib.SyncActiveAdapterFromDisk(); err != nil || !sw || pSib.EscalationClient().AdapterPath() != "artifacts/e2-pending/model_adapters" {
+		t.Fatalf("expected pending external escalation E2 to reconcile on next sync, sw=%v err=%v esc=%q",
+			sw, err, pSib.EscalationClient().AdapterPath())
+	}
+
+	// Deactivate primary (currently targeting alternate base model 360M) -> restores configured 135M base-only ([19]).
+	recDelPri := httptest.NewRecorder()
+	pSib.HandleAdapter(recDelPri, httptest.NewRequest(http.MethodDelete, "/adapter?slot=primary", nil))
+	if recDelPri.Code != http.StatusOK || pSib.TriageClient().BaseModel() != model.ModelSmolLM2135MInstruct || pSib.TriageClient().AdapterPath() != "" {
+		t.Fatalf("expected DELETE primary to restore configured base model %s, got (%q,%q) code=%d",
+			model.ModelSmolLM2135MInstruct, pSib.TriageClient().BaseModel(), pSib.TriageClient().AdapterPath(), recDelPri.Code)
+	}
+
+	// 3. Diskless + inference-off activation preserves full displaced metadata for rollback ([14]),
+	// AND oversized HealthBackend (70 KiB) stays strictly bounded <= MaxAdapterResponseBytes ([17]).
+	cfgOff := config.DefaultConfig()
+	cfgOff.DataDir = ""
+	cfgOff.TriageMode = "off"
+	pOff := New(cfgOff, ruleEng, emit.NopSink{}, "file")
+	for _, payload := range []string{
+		`{"slot":"primary","job_id":"job-off-1","dataset_hash":"sha256:off1","adapter_path":"artifacts/off-v1/model_adapters"}`,
+		`{"slot":"primary","job_id":"job-off-2","dataset_hash":"sha256:off2","adapter_path":"artifacts/off-v2/model_adapters"}`,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		pOff.HandleAdapter(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("diskless+off swap failed: %d", rec.Code)
+		}
+	}
+	recOffRB := httptest.NewRecorder()
+	reqOffRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback"}`))
+	reqOffRB.Header.Set("Content-Type", "application/json")
+	pOff.HandleAdapter(recOffRB, reqOffRB)
+	if recOffRB.Code != http.StatusOK {
+		t.Fatalf("expected diskless+off rollback to succeed, got %d: %s", recOffRB.Code, recOffRB.Body.String())
+	}
+	var rbOffResp train.AdapterStatusResponse
+	_ = json.Unmarshal(recOffRB.Body.Bytes(), &rbOffResp)
+	if rbOffResp.AdapterPath != "artifacts/off-v1/model_adapters" || rbOffResp.JobID != "job-off-1" ||
+		rbOffResp.Primary == nil || rbOffResp.Primary.DatasetHash != "sha256:off1" {
+		t.Fatalf("expected full displaced v1 metadata restored when inference=off, got %+v", rbOffResp)
+	}
+
+	// Oversized 70 KiB HealthBackend in buildAdapterStatusResponseLocked must stay <= MaxAdapterResponseBytes ([17]).
+	bigHealth := triage.HealthStatus{Status: "Healthy", BaseModel: model.ModelSmolLM2135MInstruct, Backend: strings.Repeat("B", 70*1024)}
+	boundedResp := pOff.buildAdapterStatusResponseLocked("activated", train.SlotPrimary, train.ActionActivate, true, bigHealth)
+	boundedRaw, err := json.Marshal(boundedResp)
+	if err != nil || len(boundedRaw)+1 > train.MaxAdapterResponseBytes {
+		t.Fatalf("expected 70 KiB HealthBackend response bounded <= %d bytes, got len=%d err=%v",
+			train.MaxAdapterResponseBytes, len(boundedRaw)+1, err)
 	}
 }
