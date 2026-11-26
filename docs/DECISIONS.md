@@ -92,3 +92,15 @@ This document records the foundational architectural decisions and trade-offs ma
   - Eliminates HTTP/JSON/Python overhead from the hot real-time log scanning path.
   - Accepts minimal intentional duplication (~120 lines of pure math guarded by cross-repo parity tests) in exchange for raw throughput and single-binary operational simplicity.
   - Preserves MIT clean-room provenance and full integration with FTaaS's existing surprisal preflight pipeline.
+
+---
+
+## ADR 8: Dual-Slot Escalation Routing & Live Zero-Downtime Adapter Hot-Swap (Phase 5)
+
+* **Context:** `ml/src/FtaaSService.Inference` loads a single base model weights instance per worker process (returning HTTP `409` on base-model mismatches) while hot-swapping up to 5 cached PEFT LoRA adapters via `set_adapter`. Meanwhile, `SmolLM2-135M-Instruct` runs comfortably in a small memory footprint for routine log triage, whereas `google/gemma-2-2b-it` offers stronger multi-window correlation and semantic reasoning at higher memory and CPU latency cost.
+* **Decision:**
+  1. **Dual-Slot Separation (`primary` + `escalation`):** Keep `primary` (`triage_mode=http`, `:8000` `SmolLM2-Instruct`) handling routine anomalies, and route `HIGH`/`CRITICAL`, prompt-injection, `NEEDS-REVIEW`, primary-fallback, or multi-window correlated alerts to `escalation` (`escalation_mode=http`, `:8001` `google/gemma-2-2b-it`) on demand. Deterministic Tier 0/1 severity remains a fail-closed floor, while Gemma may override false positives introduced by the smaller primary model.
+  2. **Transactional Live Hot-Swap & Rollback:** Serialize `/adapter` (`GET`/`POST`/`DELETE`), `burn`, and manifest disk synchronization under `burnMu.Lock()`. Persist previous primary and escalation snapshots into `active-adapter.json` before mutating live clients, support optional `/healthz` preflight checks (`verify=true`) and dynamic client initialization (`enable=true`), and bump slot epochs + cancel in-flight async inference so retired adapters never publish stale verdicts.
+* **Consequences:**
+  - Operators swap, verify, roll back, or deactivate primary or escalation LoRA adapters live via `sentinel adapter` or automatic `active-adapter.json` disk watching with zero daemon restarts and zero dropped `.seg` frames.
+  - Both single-slot SmolLM2 edge deployments (`escalation_mode=off`) and hybrid Gemma 2 2B IT reasoning deployments share one unified binary and configuration surface.

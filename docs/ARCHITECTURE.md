@@ -1,6 +1,6 @@
 <!-- diagram-meta
 last-validated: 2026-11-26
-validated-commit: 87c7cc0
+validated-commit: 67706a9
 covers: [cmd/, internal/]
 -->
 
@@ -21,20 +21,21 @@ flowchart TD
 
     subgraph SentinelCore["Genesis Sentinel Sidecar (Pure Go Stdlib)"]
         Entry["CLI Entrypoint & Replay Bench<br/><code>cmd/sentinel/main.go</code> &bull; <code>cmd/sentinel-bench/main.go</code>"]
-        CLI["Subcommand Router<br/><code>internal/cli/cli.go</code> &bull; <code>internal/cli/watch.go</code> &bull; <code>internal/cli/scan.go</code> &bull; <code>internal/cli/feedback.go</code> &bull; <code>internal/cli/train.go</code>"]
+        CLI["Subcommand Router<br/><code>internal/cli/cli.go</code> &bull; <code>internal/cli/watch.go</code> &bull; <code>internal/cli/scan.go</code> &bull; <code>internal/cli/feedback.go</code> &bull; <code>internal/cli/train.go</code> &bull; <code>internal/cli/adapter.go</code>"]
         Cfg["Config & Invariant Guard<br/><code>internal/config/config.go</code>"]
         Sec["Loopback, Auth & Prompt Sanitizer<br/><code>internal/security/security.go</code>"]
         Types["Tier Contracts & Model Allowlist<br/><code>internal/model/types.go</code>"]
         T0["Tier 0: Ingest, Drain Templates & Rules<br/><code>internal/ingest/segreader.go</code> &bull; <code>internal/template/drain.go</code> &bull; <code>internal/rules/engine.go</code>"]
-        Pipe["Orchestrator & Alert Sink<br/><code>internal/pipeline/pipeline.go</code> &bull; <code>internal/emit/genesis_sink.go</code>"]
+        Pipe["Orchestrator & Dual-Slot Hot-Swap<br/><code>internal/pipeline/pipeline.go</code> &bull; <code>internal/pipeline/adapter_hotswap.go</code> &bull; <code>internal/emit/genesis_sink.go</code>"]
         T1["Tier 1: Laplace-LK Log Surprisal<br/><code>internal/surprisal/math.go</code> &bull; <code>internal/surprisal/features.go</code> &bull; <code>internal/surprisal/engine.go</code> &bull; <code>internal/surprisal/baseline.go</code> &bull; <code>internal/surprisal/http_client.go</code>"]
-        T2["Tier 2: LoRA Triage, Redacted Feedback & FTaaS Client<br/><code>internal/triage/taxonomy.go</code> &bull; <code>internal/triage/client.go</code> &bull; <code>internal/feedback/redact.go</code> &bull; <code>internal/feedback/store.go</code> &bull; <code>internal/train/ftaas_client.go</code>"]
+        T2["Tier 2: LoRA Triage, Escalation & FTaaS Client<br/><code>internal/triage/taxonomy.go</code> &bull; <code>internal/triage/client.go</code> &bull; <code>internal/feedback/redact.go</code> &bull; <code>internal/feedback/store.go</code> &bull; <code>internal/train/ftaas_client.go</code> &bull; <code>internal/train/adapter_state.go</code>"]
     end
 
     subgraph MLHost["Event-Driven FTaaS / ml (127.0.0.1)"]
         SurpSvc["surprisal-service (:5200)<br/>Preflight Ablation & Parity"]
-        FTaaS["FTaaS API & PyTorch Worker (:5100)<br/>SmolLM2-Instruct LoRA (Ph. 3) / Gemma 2B (Ph. 5)"]
-        Infer["Local Inference Engine (:8000)<br/>Dynamic LoRA / Edge ONNX"]
+        FTaaS["FTaaS API & PyTorch Worker (:5100)<br/>SmolLM2-Instruct & Gemma 2B LoRA"]
+        Infer["Primary Inference (:8000)<br/>SmolLM2-Instruct + Hot-Swap LoRA"]
+        EscInfer["Escalation Inference (:8001)<br/>Gemma 2 2B IT + Hot-Swap LoRA"]
     end
 
     Entry --> CLI --> Cfg --> Sec
@@ -46,19 +47,21 @@ flowchart TD
     T1 <-->|"Optional Loopback Parity"| SurpSvc
     T1 -->|"Anomalous / Flagged Windows"| Sec
     Sec -->|"Sanitized Framed Prompt"| T2
-    T2 <-->|"Local Loopback Triage"| Infer
+    T2 <-->|"Primary Routine Triage"| Infer
+    T2 <-->|"High/Critical/Correlated Escalation"| EscInfer
     T2 -->|"Structured Alert (Alert-Only)"| GenSink
     T2 -->|"Redacted Feedback JSONL"| FTaaS
     FTaaS <-->|"Dataset Preflight Ablation"| SurpSvc
-    FTaaS -.->|"Refreshed LoRA Adapter"| Infer
+    FTaaS -.->|"Refreshed Dual-Slot LoRA"| Infer
+    FTaaS -.->|"Escalation Gemma LoRA"| EscInfer
 ```
 
 ---
 
-## 2. Implemented Subsystems (Phases 0–4)
+## 2. Implemented Subsystems (Phases 0–5)
 
-1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/feedback.go`, `internal/cli/train.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
-   - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `stats`, `burn`, `data`, `config`, `version`, `help`).
+1. **CLI & Configuration Hierarchy (`cmd/sentinel/main.go`, `internal/cli/cli.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/feedback.go`, `internal/cli/train.go`, `internal/cli/adapter.go`, `internal/cli/stats.go`, `internal/cli/burn.go`, `internal/config/config.go`):**
+   - Mirrors Genesis's single-binary subcommand router (`watch`, `scan`, `feedback`, `train`, `adapter`, `stats`, `burn`, `data`, `config`, `version`, `help`).
    - Merges compiled safe defaults (`DefaultMaxMemMB` = <!-- claim:default_max_mem_mb -->256 MB<!-- /claim -->, `DefaultWindowSec` = <!-- claim:default_window_sec -->10s<!-- /claim -->) -> `sentinel.json` -> `SENTINEL_*` environment variables -> CLI flags.
    - Surfaces Sentinel's local data directory (`~/.genesis-sentinel/` by default) transparently via startup banners and `sentinel data path | status | open` without requiring hidden-folder configuration, and redacts sensitive auth tokens automatically in `sentinel config`.
 2. **Domain Contracts & Model Governance (`internal/model/types.go`):**
@@ -87,6 +90,11 @@ flowchart TD
 8. **Phase 4 Adversarial Hardening, Replay Benchmark Harness & Operational Units (`cmd/sentinel-bench/main.go`, `internal/pipeline/adversarial_test.go`, `scripts/eval_embedding_comparison.py`, `deploy/`):**
    - Hardens `internal/security.SanitizeUntrustedLogText` by normalizing unsafe ASCII/C1/BiDi controls before delimiter detection and neutralization (preventing control-split token reassembly), adding Llama/Mistral `[INST]`/`<<SYS>>` and `<s>`/`</s>` tags plus case-insensitive `BEGIN/END_UNTRUSTED_LOG_TELEMETRY` fence-spoofing checks; adds a per-leaf Drain cluster cap (`maxLeafClusters = 128`) against single-leaf quadratic flood DoS, adaptive buffered reads in `SegReader`, and `regexp/syntax`-derived bounded ASCII literal prefilters (with automatic Unicode fallback) in `internal/rules/engine.go`.
    - Provides `cmd/sentinel-bench` (pure Go stdlib) to emit machine-readable `docs/benchmarks/empirical_benchmarks.json` and Markdown reports (`docs/benchmarks/YYYY-MM-DD-<commit>.md`) validated mathematically by `scripts/sync_docs.py` (`independent_recompute_metrics`) and `scripts/audit-claims.py`, plus an isolated offline `sentence-transformers/all-MiniLM-L6-v2` semantic embedding comparison (`scripts/eval_embedding_comparison.py`) and hardened `launchd`, `systemd`, `Dockerfile`, and `docker-compose.example.yml` operational templates under `deploy/`.
+9. **Phase 5 Gemma 2 2B IT Escalation, Multi-Window Correlation & Live Dual-Slot Hot-Swap (`internal/pipeline/adapter_hotswap.go`, `internal/train/adapter_state.go`, `internal/cli/adapter.go`, `scripts/eval_phase5_models.py`):**
+   - Adds optional second-stage reasoning escalation (`escalation_mode=http` targeting loopback `:8001` with <!-- claim:phase5_base_model -->`google/gemma-2-2b-it`<!-- /claim -->) governed by configurable policies (`high_critical`, `strict`, `always`) so routine Tier 2 traffic stays on `SmolLM2-Instruct` while `HIGH`/`CRITICAL`, injection-flagged, `NEEDS-REVIEW`, low-confidence, primary-fallback, or multi-window correlated alerts escalate on demand without blocking Tier 0/1 alert emission.
+   - Maintains a bounded per-service multi-window correlator (`serviceCorrelator`, 600s TTL, capped at 64 services and 4 windows per service, wiped atomically by `sentinel burn`) that attaches sanitized prior window context (`CorrelatedWindows` -> `correlated=` inside `BEGIN_UNTRUSTED_LOG_TELEMETRY`) while preserving higher Tier 0/1 severity floors and allowing Gemma escalation to refine or suppress primary-tier false positives.
+   - Extends `active-adapter.json` (`UpdateActiveAdapterSlot`, `RollbackActiveAdapterSlot`, `DeactivateActiveAdapterSlot`) and `/adapter` (`GET` inspection + swap history, `POST` with `slot`, `action`, preflight `/healthz` model check `verify`, and dynamic client creation `enable`, `DELETE` deactivation back to base-only) alongside periodic automatic disk reload (`auto_reload_adapter`, `SyncActiveAdapterFromDisk`) and the `sentinel adapter` CLI (`status`, `swap`, `rollback`, `deactivate`, `history`).
+   - Adds `scripts/eval_phase5_models.py` for isolated offline fine-tuning and side-by-side comparison of `SmolLM2-135M-Instruct` vs `google/gemma-2-2b-it` LoRA adapters (`docs/benchmarks/phase5_gemma_comparison.json`), checked mathematically by `independent_recompute_phase5_comparison`.
 
 ---
 

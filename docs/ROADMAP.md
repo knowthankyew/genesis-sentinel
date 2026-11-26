@@ -116,13 +116,14 @@ flowchart LR
 
 ---
 
-### Phase 5: Gemma 2 2B IT Reasoning-Tier Upgrade
+### Phase 5: Gemma 2 2B IT Reasoning-Tier Upgrade & Live Dual-Slot Hot-Swap (Completed)
 - **Goal**: Graduate the proven SmolLM2 architecture to higher-capacity reasoning without changing upstream Tier 0, Tier 1, or feedback contracts.
 - **Deliverables**:
-  - Train a `google/gemma-2-2b-it` LoRA adapter through FTaaS using the exact same curated JSONL datasets accumulated during Phases 3–4 (weights are already cached locally in `~/.cache/huggingface/hub/models--google--gemma-2-2b-it`).
-  - **Optional Escalation Routing**: Keep SmolLM2 handling routine Tier 2 triage (~310 MB RAM) and escalate only `HIGH`/`CRITICAL` alerts or multi-window correlation requests to `Gemma 2 2B IT` on demand (keeping steady-state RAM comfortable on 16 GB hosts).
-  - Comparative benchmark report (`SmolLM2` vs `Gemma 2 2B IT`) measuring triage accuracy, explanation quality, false-positive reduction, memory footprint, and latency per incident.
-- **Exit Gate**: Side-by-side empirical comparison committed under `docs/benchmarks/` demonstrating measurable triage improvement justifying Gemma's memory/latency footprint for escalation use cases.
+  - Trained and evaluated real local `google/gemma-2-2b-it` and `SmolLM2-135M-Instruct` LoRA adapters offline using the curated Sentinel security triage dataset structure (`scripts/eval_phase5_models.py`, cached local Hugging Face weights).
+  - **Selective Escalation Routing & Multi-Window Correlation (`internal/pipeline/adapter_hotswap.go`, `internal/config/config.go`):** Keeps SmolLM2 handling routine Tier 2 triage (`:8000`) while escalating `HIGH`/`CRITICAL`, injection-flagged, `NEEDS-REVIEW`, primary-fallback, or multi-window correlated alerts (`serviceCorrelator`, 600s TTL) to `google/gemma-2-2b-it` (`:8001`) on demand (`high_critical`, `strict`, `always` policies).
+  - **Live Zero-Downtime Adapter Hot-Swap (`internal/train/adapter_state.go`, `internal/cli/adapter.go`):** Upgraded `/adapter` (`GET`/`POST`/`DELETE`) and `active-adapter.json` to dual-slot tracking with automatic rollback snapshots, `/healthz` base-model preflight verification (`--verify`), dynamic slot activation (`--enable`), periodic disk auto-reload (`auto_reload_adapter`), and the `sentinel adapter` CLI (`status`, `swap`, `rollback`, `deactivate`, `history`).
+  - Comparative benchmark report (`SmolLM2` vs `Gemma 2 2B IT` + hybrid selective escalation + live hot-swap latency) committed under `docs/benchmarks/`.
+- **Exit Gate**: Side-by-side empirical comparison committed under `docs/benchmarks/` (`docs/benchmarks/phase5_gemma_comparison.json` & `docs/benchmarks/2026-11-26-phase5-comparison.md`), refreshed `empirical_benchmarks.json`, and clean pass across unit, race, adversarial, SBOM, and claims-audit gates.
 
 ---
 

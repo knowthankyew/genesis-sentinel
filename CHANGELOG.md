@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0-phase5] - 2026-11-26
+
+### Added
+- **On-Demand `google/gemma-2-2b-it` Escalation Routing & Multi-Window Correlation (`internal/pipeline/adapter_hotswap.go`, `internal/config/config.go`, `internal/triage/taxonomy.go`):** Added dual-slot local inference routing (`escalation_mode=http`, `--escalation-inference-http`, `--escalation-base-model`, `--escalation-policy high_critical|strict|always`, `--escalation-timeout`) so routine Tier 2 triage remains on `SmolLM2-Instruct` while `HIGH`/`CRITICAL`, prompt-injection, `NEEDS-REVIEW`, primary-fallback, low-confidence, or multi-window correlated alerts escalate to `google/gemma-2-2b-it` with sanitized `correlated=` telemetry framing and `triage_escalated` / `triage_primary_*` alert provenance.
+- **Dual-Slot Live Adapter Hot-Swap, Preflight Check, Rollback & CLI (`internal/train/adapter_state.go`, `internal/pipeline/adapter_hotswap.go`, `internal/cli/adapter.go`):** Extended `active-adapter.json` and `/adapter` (`GET`, `POST`, `DELETE`) to manage independent `primary` and `escalation` slots with reversible prior-adapter rollback snapshots, `/healthz` base-model preflight validation (`verify=true`), dynamic client activation (`enable=true`), periodic zero-restart disk reload (`auto_reload_adapter`), stale in-flight verdict discard across both slot epochs, and the `sentinel adapter` command suite (`status`, `swap`, `rollback`, `deactivate`, `history`).
+- **Offline `SmolLM2` vs `Gemma 2 2B IT` & Live Hot-Swap Benchmark (`scripts/eval_phase5_models.py`, `scripts/sync_docs.py`):** Added isolated subprocess LoRA training and comparative holdout evaluation (`SmolLM2-135M-Instruct` Base/LoRA vs `google/gemma-2-2b-it` Base/LoRA + selective `high_critical` escalation + PEFT/Sentinel live hot-swap benchmark), backed by `docs/benchmarks/phase5_gemma_comparison.json`, `docs/benchmarks/2026-11-26-phase5-comparison.md`, and automated mathematical recomputation (`independent_recompute_phase5_comparison`).
+
+### Changed
+- **Adapter Path Governance & Manifest Confinement (`internal/model/types.go`, `internal/feedback/alerts_journal.go`, `internal/cli/watch.go`, `internal/cli/scan.go`, `internal/cli/train.go`):** Unified relative `ValidateAdapterPath` checks in `internal/model`, scrubbed escalation/correlation strings in `alerts.jsonl`, added `--slot`, `--verify`, and `--enable` support to `sentinel train`, added `--escalation-*` and `--auto-reload-adapter` flags to `watch` and `scan`, and bumped CLI version to `0.6.0-phase5`.
+
+---
+
 ## [0.5.0-phase4] - 2026-11-25
 
 ### Added

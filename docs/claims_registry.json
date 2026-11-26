@@ -412,6 +412,118 @@
       "format_rule": "+{value:.2f} MB",
       "used_in": ["README.md"],
       "description": "Measured RSS overhead of loading cached all-MiniLM-L6-v2 weights"
+    },
+    "p5_smol_lora_acc": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.class_accuracy",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Holdout 8-class triage accuracy for SmolLM2-135M-Instruct LoRA"
+    },
+    "p5_gemma_lora_acc": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.class_accuracy",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Holdout 8-class triage accuracy for google/gemma-2-2b-it LoRA"
+    },
+    "p5_smol_lora_fp": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.benign_fp_count",
+      "format_rule": "{value} FP",
+      "used_in": ["README.md"],
+      "description": "Benign false positives on holdout benign traps for SmolLM2-135M-Instruct LoRA"
+    },
+    "p5_gemma_lora_fp": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.benign_fp_count",
+      "format_rule": "{value} FP",
+      "used_in": ["README.md"],
+      "description": "Benign false positives on holdout benign traps for google/gemma-2-2b-it LoRA"
+    },
+    "p5_smol_corr_acc": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.correlated_accuracy",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Multi-window correlation accuracy for SmolLM2-135M-Instruct LoRA"
+    },
+    "p5_gemma_corr_acc": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.correlated_accuracy",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Multi-window correlation accuracy for google/gemma-2-2b-it LoRA"
+    },
+    "p5_smol_qual": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.explanation_quality_avg",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Average deterministic explanation quality score for SmolLM2-135M-Instruct LoRA"
+    },
+    "p5_gemma_qual": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.explanation_quality_avg",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Average deterministic explanation quality score for google/gemma-2-2b-it LoRA"
+    },
+    "p5_smol_p50_ms": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.latency_p50_ms",
+      "format_rule": "{value:.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Median P50 CPU per-incident latency for SmolLM2-135M-Instruct LoRA"
+    },
+    "p5_gemma_p50_ms": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.latency_p50_ms",
+      "format_rule": "{value:.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Median P50 CPU per-incident latency for google/gemma-2-2b-it LoRA"
+    },
+    "p5_smol_rss_mb": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.smol_lora.rss_after_model_mb",
+      "format_rule": "{value:.2f} MB",
+      "used_in": ["README.md"],
+      "description": "Isolated subprocess peak RSS (CPU float32) for SmolLM2-135M-Instruct LoRA inference"
+    },
+    "p5_gemma_rss_mb": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "models.gemma_lora.rss_after_model_mb",
+      "format_rule": "{value:.2f} MB",
+      "used_in": ["README.md"],
+      "description": "Isolated subprocess peak RSS (CPU float32) for google/gemma-2-2b-it LoRA inference"
+    },
+    "p5_hybrid_acc": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "hybrid_escalation.class_accuracy",
+      "format_rule": "{value:.4f}",
+      "used_in": ["README.md"],
+      "description": "Combined triage accuracy under selective high_critical escalation"
+    },
+    "p5_peft_warm_swap_ms": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "live_adapter_hotswap.peft_warm_swap_p50_ms",
+      "format_rule": "{value:.4f} ms",
+      "used_in": ["README.md"],
+      "description": "Cached PyTorch PEFT warm adapter switch P50 latency"
+    },
+    "p5_sidecar_swap_ms": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "live_adapter_hotswap.sentinel_sidecar_verify_swap_p50_ms",
+      "format_rule": "{value:.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Sentinel sidecar /healthz preflight-checked swap P50 latency"
+    },
+    "p5_sidecar_rollback_ms": {
+      "source_artifact": "docs/benchmarks/phase5_gemma_comparison.json",
+      "json_path": "live_adapter_hotswap.sentinel_sidecar_rollback_ms",
+      "format_rule": "{value:.2f} ms",
+      "used_in": ["README.md"],
+      "description": "Sentinel sidecar /healthz preflight-checked rollback latency"
     }
   }
 }
