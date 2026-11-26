@@ -6,7 +6,7 @@
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-success.svg)](docs/DECISIONS.md)
 [![Stage: Phase 5 Complete](https://img.shields.io/badge/Stage-Phase%205%20Complete-brightgreen.svg)](docs/ROADMAP.md)
 
-**Genesis Sentinel** (<!-- claim:sentinel_version -->`v0.5.0-phase4`<!-- /claim -->) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with on-demand `google/gemma-2-2b-it` reasoning escalation and zero-downtime live adapter hot-swap, loopback-only by default (zero external network egress unless explicitly overridden).
+**Genesis Sentinel** (<!-- claim:sentinel_version -->`v0.6.0-phase5`<!-- /claim -->) is a standalone, pure-Go standard library sidecar for Project Genesis that scans local logs for malicious activity, anomalous bursts, and operator-defined interesting traffic—combining deterministic rules, information-theoretic Laplace-LK surprisal scoring, and locally trained FTaaS LoRA adapters with on-demand `google/gemma-2-2b-it` reasoning escalation and zero-downtime live adapter hot-swap, loopback-only by default (zero external network egress unless explicitly overridden).
 
 > **Current Status (Phase 5 Complete — Gemma 2 2B IT Escalation & Live Adapter Hot-Swap):** All Phases 0–5 deliverables are implemented and race-tested: the Genesis Bridge (buffered lossless `.seg` CRC32 tailer + `/query` fallback), Tier 0 Drain-style template collapser with single-leaf anti-DoS bounds and RE2 syntax literal prefilters, Tier 1 pure-Go Laplace-LK log surprisal engine, Tier 2 **SmolLM2-Instruct + on-demand `google/gemma-2-2b-it` escalation routing** with bounded multi-window service correlation, **dual-slot zero-downtime live adapter hot-swap/rollback (`sentinel adapter`, `/adapter`, automatic disk reload)**, **adversarial hostile-log test suite**, **pure-Go replay benchmark harness (`cmd/sentinel-bench`)**, **side-by-side SmolLM2 vs Gemma 2 2B IT LoRA evaluation (`scripts/eval_phase5_models.py`)**, and **independent claims math recomputation**. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -45,17 +45,17 @@ Project Genesis can ingest over one million lines per second in RAM, while local
 
 ## Empirical Benchmarks (Phases 4–5)
 
-Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-26-67706a9.md](docs/benchmarks/2026-11-26-67706a9.md)).
+Measured via `cmd/sentinel-bench` on a 100,000-line Track A CRC32 `.seg` corpus, a full-capacity 2,000-case Laplace-LK rolling baseline, a 200-window labeled synthetic evaluation, and live loopback CPU inference against `HuggingFaceTB/SmolLM2-135M-Instruct` (see full hardware metadata and breakdown in [docs/benchmarks/2026-11-26-4d4f79c.md](docs/benchmarks/2026-11-26-4d4f79c.md)).
 
 <!-- BEGIN_EMPIRICAL -->
 | Benchmark Gate | Target | Measured Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->88,346.40 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
+| **Tier 0+1 `.seg` Replay Throughput** | <!-- claim:bench_tier0_target_lps -->>= 50,000 lines/sec<!-- /claim --> | **<!-- claim:bench_tier0_throughput_lps -->85,346.01 lines/sec<!-- /claim -->** (<!-- claim:bench_tier0_collapse_ratio -->403.23x<!-- /claim --> collapse) | <!-- claim:bench_tier0_throughput_status -->PASSED<!-- /claim --> |
 | **Lossless `.seg` Ingestion** | <!-- claim:bench_tier0_dropped_target -->0 dropped<!-- /claim --> | **<!-- claim:bench_tier0_lines_read -->100,000 read<!-- /claim -->** / <!-- claim:bench_tier0_lines_dropped -->0 dropped<!-- /claim --> | <!-- claim:bench_tier0_lossless_status -->PASSED<!-- /claim --> |
-| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 46.128 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 88.996 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
+| **Tier 1 Laplace-LK Surprisal Latency** | <!-- claim:bench_tier1_p99_target_us -->< 2,000 us<!-- /claim --> | **<!-- claim:bench_tier1_p50_us -->P50 48.827 us<!-- /claim -->** / **<!-- claim:bench_tier1_p99_us -->P99 144.213 us<!-- /claim -->** | <!-- claim:bench_tier1_p99_status -->PASSED<!-- /claim --> |
 | **Synthetic Detection Accuracy (Tier 0+1)** | <!-- claim:bench_detection_f1_target -->F1 >= 0.90<!-- /claim --> | **<!-- claim:bench_detection_f1 -->F1 1.0000<!-- /claim -->** (<!-- claim:bench_detection_tp -->TP=100<!-- /claim -->, <!-- claim:bench_detection_fp -->FP=0<!-- /claim -->) | <!-- claim:bench_detection_f1_status -->PASSED<!-- /claim --> |
-| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,051.98 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,279.62 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
-| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->4.54 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->16.88 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
+| **Tier 2 Live SmolLM2-135M-Instruct Triage** | Fail-closed safety | **<!-- claim:bench_tier2_p50_ms -->P50 3,375.24 ms<!-- /claim -->** / **<!-- claim:bench_tier2_p99_ms -->P99 3,573.74 ms<!-- /claim -->** (<!-- claim:bench_tier2_inj_enforced -->3<!-- /claim -->/<!-- claim:bench_tier2_inj_tested -->3<!-- /claim --> safe non-benign) | <!-- claim:bench_tier2_override_status -->PASSED<!-- /claim --> |
+| **Memory Footprint (Sampled Heap & RSS)** | Heap <!-- claim:bench_mem_ceiling_mb --><= 256 MB<!-- /claim --> | Sampled heap peak **<!-- claim:bench_mem_heap_peak_mb -->5.54 MB<!-- /claim -->** / RSS peak **<!-- claim:bench_mem_rss_peak_mb -->17.27 MB<!-- /claim -->** | <!-- claim:bench_mem_heap_status -->PASSED<!-- /claim --> |
 | **Adversarial Hostile-Log Self-Checks** | All pass | **<!-- claim:bench_adv_passed -->9<!-- /claim -->/<!-- claim:bench_adv_total -->9<!-- /claim -->** passed | <!-- claim:bench_adv_status -->PASSED<!-- /claim --> |
 <!-- END_EMPIRICAL -->
 
@@ -140,7 +140,7 @@ make build
 * [Security Policy & Hostile-Log Threat Model](SECURITY.md)
 * [Governance & Third-Party Attribution Notice](NOTICE.md)
 * [Contributing Guidelines](CONTRIBUTING.md)
-* [Empirical Benchmark Report (Phases 4–5)](docs/benchmarks/2026-11-26-67706a9.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
+* [Empirical Benchmark Report (Phases 4–5)](docs/benchmarks/2026-11-26-4d4f79c.md) & [JSON Artifact](docs/benchmarks/empirical_benchmarks.json)
 * [Phase 5 Model Comparison (`SmolLM2` vs `Gemma 2 2B IT`) & Hot-Swap Report](docs/benchmarks/2026-11-26-phase5-comparison.md) & [JSON Artifact](docs/benchmarks/phase5_gemma_comparison.json)
 * [Semantic Embedding Tradeoff Experiment](docs/benchmarks/embedding_comparison.json)
 * **Operational Service Units:** [macOS `launchd` plist](deploy/launchd/com.knowthankyew.genesis-sentinel.plist) &bull; [Linux `systemd` unit](deploy/systemd/genesis-sentinel.service) &bull; [Docker Compose example](deploy/docker-compose.example.yml) &bull; [Dockerfile](Dockerfile)
