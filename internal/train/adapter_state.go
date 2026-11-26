@@ -536,6 +536,7 @@ func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, err
 
 // MirrorDaemonSlotToManifest synchronizes the local manifest's active slot to match a daemon's
 // authoritative AdapterStatusResponse after a remote or separate-directory operation.
+// Uses a monotonic ActivatedAt guard so delayed out-of-order responses cannot overwrite newer state.
 func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fallbackModel, fallbackAdapter, fallbackJob string) (ActiveAdapter, error) {
 	normSlot, err := NormalizeSlot(slot, false)
 	if err != nil {
@@ -561,13 +562,44 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		updated, _, err := DeactivateActiveAdapterSlot(dataDir, normSlot)
 		return updated, err
 	}
-	return UpdateActiveAdapterSlot(dataDir, normSlot, AdapterSlot{
+	next := AdapterSlot{
 		JobID:       jid,
 		BaseModel:   bm,
 		AdapterPath: ap,
 		DatasetHash: dsHash,
 		ActivatedAt: swappedAt,
+	}
+	if err := validateAdapterSlotStruct(&next); err != nil {
+		return ActiveAdapter{}, err
+	}
+	if next.ActivatedAt.IsZero() {
+		next.ActivatedAt = time.Now().UTC()
+	}
+	updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, exists bool) (bool, bool, error) {
+		switch normSlot {
+		case SlotPrimary:
+			if existing, ok := cur.PrimarySlot(); ok && !existing.ActivatedAt.IsZero() && next.ActivatedAt.Before(existing.ActivatedAt) {
+				return false, false, nil
+			}
+			if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
+				prevCopy := prev
+				cur.Previous = &prevCopy
+			}
+			cur.SetPrimarySlot(next)
+		case SlotEscalation:
+			if cur.Escalation != nil && !cur.Escalation.ActivatedAt.IsZero() && next.ActivatedAt.Before(cur.Escalation.ActivatedAt) {
+				return false, false, nil
+			}
+			if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
+				prevCopy := *cur.Escalation
+				cur.PreviousEscalation = &prevCopy
+			}
+			nextCopy := next
+			cur.Escalation = &nextCopy
+		}
+		return false, true, nil
 	})
+	return updated, err
 }
 
 // AdapterSwapRequest configures a live adapter operation via POST /adapter.
@@ -701,17 +733,17 @@ func doDaemonAdapterRequest(ctx context.Context, method, sentinelHTTP, authToken
 
 	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxActiveAdapterBytes+1))
 	if readErr != nil {
-		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter response could not be confirmed: %w", method, redactedTarget, readErr)
+		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter response could not be confirmed (daemon state may have changed; inspect `sentinel adapter status` before retrying): %w", method, redactedTarget, readErr)
 	}
 	if len(respBody) > maxActiveAdapterBytes {
-		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter response exceeded %d-byte limit", method, redactedTarget, maxActiveAdapterBytes)
+		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter response exceeded %d-byte limit (daemon state may have changed; inspect `sentinel adapter status` before retrying)", method, redactedTarget, maxActiveAdapterBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter returned HTTP %d: %s", method, redactedTarget, resp.StatusCode, compactErrBody(respBody, authToken))
 	}
 	var out AdapterStatusResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter returned invalid JSON response", method, redactedTarget)
+		return AdapterStatusResponse{}, redactedTarget, fmt.Errorf("%s %s/adapter returned invalid JSON response (daemon state may have changed; inspect `sentinel adapter status` before retrying)", method, redactedTarget)
 	}
 	return out, redactedTarget, nil
 }
@@ -728,12 +760,25 @@ func DaemonAdapterAction(ctx context.Context, sentinelHTTP, authToken string, re
 	if err != nil {
 		return AdapterStatusResponse{}, err
 	}
-	switch strings.TrimSpace(out.Status) {
-	case "activated", "rolled_back", "deactivated":
-		return out, nil
-	default:
-		return AdapterStatusResponse{}, fmt.Errorf("POST %s/adapter returned unexpected status %q", redactedTarget, out.Status)
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action == "" {
+		action = ActionActivate
 	}
+	var wantStatus string
+	switch action {
+	case ActionActivate:
+		wantStatus = "activated"
+	case ActionRollback:
+		wantStatus = "rolled_back"
+	case ActionDeactivate:
+		wantStatus = "deactivated"
+	default:
+		return AdapterStatusResponse{}, fmt.Errorf("unsupported adapter action %q", req.Action)
+	}
+	if strings.TrimSpace(out.Status) != wantStatus {
+		return AdapterStatusResponse{}, fmt.Errorf("POST %s/adapter returned unexpected status %q for action %q (expected %q)", redactedTarget, out.Status, action, wantStatus)
+	}
+	return out, nil
 }
 
 // DeactivateDaemonAdapter deactivates the active adapter for slot ("primary", "escalation", or "all")
@@ -743,8 +788,14 @@ func DeactivateDaemonAdapter(ctx context.Context, sentinelHTTP, authToken, slot 
 	if err != nil {
 		return AdapterStatusResponse{}, err
 	}
-	out, _, err := doDaemonAdapterRequest(ctx, http.MethodDelete, sentinelHTTP, authToken, "slot="+url.QueryEscape(normSlot), nil, allowRemote)
-	return out, err
+	out, redactedTarget, err := doDaemonAdapterRequest(ctx, http.MethodDelete, sentinelHTTP, authToken, "slot="+url.QueryEscape(normSlot), nil, allowRemote)
+	if err != nil {
+		return AdapterStatusResponse{}, err
+	}
+	if strings.TrimSpace(out.Status) != "deactivated" {
+		return AdapterStatusResponse{}, fmt.Errorf("DELETE %s/adapter returned unexpected status %q (expected \"deactivated\")", redactedTarget, out.Status)
+	}
+	return out, nil
 }
 
 // NotifyDaemonAdapter hot-reloads the active LoRA adapter on a running `sentinel watch`

@@ -173,6 +173,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	var adapterManifestMismatchMsg string
 	var startupManifestHash [32]byte
 	var hasStartupManifest bool
+	var primaryLoadedFromDisk bool
+	var escalationLoadedFromDisk bool
 	if cfg.DataDir != "" {
 		active, diskHash, exists, loadErr := train.LoadActiveAdapterWithHash(cfg.DataDir)
 		if loadErr != nil {
@@ -186,6 +188,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 						active.AdapterPath, active.BaseModel, cfg.BaseModel)
 				} else {
 					cfg.AdapterPath = active.AdapterPath
+					primaryLoadedFromDisk = true
 					if !baseModelExplicit && active.BaseModel != "" {
 						cfg.BaseModel = active.BaseModel
 					}
@@ -197,6 +200,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 						active.Escalation.AdapterPath, active.Escalation.BaseModel, cfg.EscalationBaseModel))
 				} else {
 					cfg.EscalationAdapterPath = active.Escalation.AdapterPath
+					escalationLoadedFromDisk = true
 					if !escalationModelExplicit && active.Escalation.BaseModel != "" {
 						cfg.EscalationBaseModel = active.Escalation.BaseModel
 					}
@@ -266,9 +270,7 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
-	if hasStartupManifest {
-		pipe.SetInitialSyncedManifestHash(startupManifestHash)
-	}
+	pipe.ConfigureAdapterSyncPolicy(hasStartupManifest, startupManifestHash, adapterPathExplicit, escalationAdapterExplicit, primaryLoadedFromDisk, escalationLoadedFromDisk)
 	pipe.EnableAsyncTriage(0)
 	defer pipe.Close()
 	pipe.AttachSegReader(segReader)

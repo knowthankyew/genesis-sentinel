@@ -761,6 +761,10 @@ func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
 		resp HealthStatus
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-API-Key") != "health-secret" || r.Header.Get("Authorization") != "Bearer health-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		mu.Lock()
 		snapshot := resp
 		mu.Unlock()
@@ -772,6 +776,7 @@ func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		BaseURL:   srv.URL,
 		BaseModel: model.ModelGemma22BIT,
+		APIKey:    "health-secret",
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

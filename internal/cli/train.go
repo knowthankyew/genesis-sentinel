@@ -244,6 +244,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 		if _, actErr := activateSlotWithOptionalDaemon(
 			ctx,
 			cfg.DataDir,
+			*dataDir != "",
 			normSlot,
 			slotState,
 			strings.TrimSpace(*sentinelHTTP),
@@ -415,6 +416,7 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 	out, err := activateSlotWithOptionalDaemon(
 		context.Background(),
 		cfg.DataDir,
+		*dataDir != "",
 		normSlot,
 		slotState,
 		strings.TrimSpace(*sentinelHTTP),

@@ -221,9 +221,9 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		t.Fatal("expected SaveActiveAdapter to reject oversized manifest exceeding maxActiveAdapterBytes")
 	}
 
-	// Verify SaveActiveAdapter does not mutate caller-owned Escalation/Previous pointers.
+	// Verify SaveActiveAdapter does not mutate caller-owned Escalation/Previous pointers (even trimmable fields).
 	callerEsc := &AdapterSlot{
-		JobID:       "esc-job",
+		JobID:       "  esc-job  ",
 		BaseModel:   model.ModelGemma22BIT,
 		AdapterPath: "../escape",
 	}
@@ -233,8 +233,43 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 		AdapterPath: "artifacts/p1/model_adapters",
 		Escalation:  callerEsc,
 	})
-	if err == nil || callerEsc.JobID != "esc-job" || callerEsc.AdapterPath != "../escape" || !callerEsc.ActivatedAt.IsZero() {
+	if err == nil || callerEsc.JobID != "  esc-job  " || callerEsc.AdapterPath != "../escape" || !callerEsc.ActivatedAt.IsZero() {
 		t.Fatalf("expected failed SaveActiveAdapter without mutating caller pointers, err=%v callerEsc=%+v", err, callerEsc)
+	}
+
+	// Verify DaemonAdapterAction rejects mismatched action acknowledgements (e.g. "activated" on rollback).
+	mismatchSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"activated"}`))
+	}))
+	defer mismatchSrv.Close()
+	if _, err := DaemonAdapterAction(context.Background(), mismatchSrv.URL, "", AdapterSwapRequest{
+		Slot:   SlotPrimary,
+		Action: ActionRollback,
+	}, false); err == nil || !strings.Contains(err.Error(), "expected \"rolled_back\"") {
+		t.Fatalf("expected rollback status mismatch error, got %v", err)
+	}
+	if _, err := DeactivateDaemonAdapter(context.Background(), mismatchSrv.URL, "", SlotPrimary, false); err == nil || !strings.Contains(err.Error(), "deactivated") {
+		t.Fatalf("expected deactivate status mismatch error, got %v", err)
+	}
+
+	// Verify MirrorDaemonSlotToManifest rejects out-of-order older mirror timestamps.
+	mirrorDir := t.TempDir()
+	newerTS := time.Now().UTC()
+	olderTS := newerTS.Add(-5 * time.Minute)
+	if _, err := MirrorDaemonSlotToManifest(mirrorDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/newer/model_adapters", SwappedAt: newerTS,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror newer failed: %v", err)
+	}
+	if _, err := MirrorDaemonSlotToManifest(mirrorDir, SlotPrimary, &SlotStatus{
+		BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/older/model_adapters", SwappedAt: olderTS,
+	}, "", "", ""); err != nil {
+		t.Fatalf("Mirror older failed: %v", err)
+	}
+	gotM, _, err := LoadActiveAdapter(mirrorDir)
+	if err != nil || gotM.AdapterPath != "artifacts/newer/model_adapters" {
+		t.Fatalf("expected newer mirrored adapter preserved, got %+v err=%v", gotM, err)
 	}
 }
 

@@ -31,9 +31,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import peft  # noqa: E402
 import torch  # noqa: E402
@@ -377,6 +377,18 @@ class SingleLineStopCriteria(StoppingCriteria):
         return False
 
 
+DEFAULT_SEVERITY_FOR_CLASS = {
+    "BENIGN-NOISE": "LOW",
+    "RECON-SCAN": "MEDIUM",
+    "AUTH-BRUTEFORCE": "HIGH",
+    "INJECTION-ATTEMPT": "CRITICAL",
+    "EXFIL-SUSPECT": "HIGH",
+    "PRIV-ESC": "CRITICAL",
+    "POLICY-ANOMALY": "MEDIUM",
+    "NEEDS-REVIEW": "MEDIUM",
+}
+
+
 def parse_sentinel_completion(raw_completion: str) -> dict:
     """Mirror internal/triage/taxonomy.go fail-closed first-line verdict parser."""
     first_line = ""
@@ -400,24 +412,31 @@ def parse_sentinel_completion(raw_completion: str) -> dict:
     sev_match = re.search(r"\bseverity=(LOW|MEDIUM|HIGH|CRITICAL)\b", rest, flags=re.IGNORECASE)
     severity = sev_match.group(1).upper() if sev_match else None
 
-    mitre_match = re.search(r"\bmitre=(NONE|TA\d{4}(?:\.\d+)?)\b", rest, flags=re.IGNORECASE)
-    mitre = mitre_match.group(1).upper() if mitre_match else None
+    mitre_raw_match = re.search(r"\bmitre=([^\s,;]+)", rest, flags=re.IGNORECASE)
+    mitre = None
+    mitre_valid = False
+    if mitre_raw_match:
+        mitre_tok = mitre_raw_match.group(1).upper().strip()
+        if re.fullmatch(r"NONE|(?:TA\d{4}|T\d{4})(?:\.\d+)?", mitre_tok):
+            mitre = mitre_tok
+            mitre_valid = True
 
     exp_match = re.search(r"\bexplanation=(.+)$", rest, flags=re.IGNORECASE)
     explanation = exp_match.group(1).strip() if exp_match else ""
     explanation = explanation.replace("<|im_end|>", "").replace("<end_of_turn>", "").strip()
 
+    default_sev = DEFAULT_SEVERITY_FOR_CLASS.get(label, "MEDIUM")
     format_valid = bool(
         matched_tag
         and severity in VALID_SEVERITIES
-        and mitre_match is not None
+        and mitre_valid
         and len(explanation) >= 6
     )
     return {
         "raw_first_line": first_line[:240],
         "matched_tag": matched_tag,
         "label": label,
-        "severity": severity or "MEDIUM",
+        "severity": severity or default_sev,
         "mitre": mitre or "NONE",
         "explanation": explanation,
         "format_valid": format_valid,
@@ -511,6 +530,8 @@ def run_eval_pass(model, tokenizer, model_id: str, eval_rows: list[dict], max_ne
             "pred_sev": parsed["severity"],
             "pred_mitre": parsed["mitre"],
             "format_valid": parsed["format_valid"],
+            "explanation": parsed["explanation"],
+            "keywords": list(row.get("keywords", ())),
             "explanation_quality": qual,
             "latency_ms": elapsed_ms,
         })
@@ -876,17 +897,31 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
     combined: list[dict] = []
     blended_ms: list[float] = []
     escalated_flags: list[bool] = []
+    decision_inputs: list[dict] = []
     escalated_count = 0
 
     for sr, gr in zip(smol_rows, gemma_rows):
+        # Mirror Go `internal/pipeline/adapter_hotswap.go` (`escalationReason`) under `high_critical`:
+        # Triggered on HIGH/CRITICAL severity (Tier 0/1 or primary), prompt injection, multi-window
+        # correlation, or canonical NEEDS-REVIEW. Bare `[BENIGN-NOISE]` defaults to LOW via
+        # `DEFAULT_SEVERITY_FOR_CLASS` and does NOT escalate routine MEDIUM windows in either Go or Python.
         needs_esc = (
             sr["tier1_sev"] in ("HIGH", "CRITICAL")
             or sr["pred_sev"] in ("HIGH", "CRITICAL")
-            or sr["inj"]
-            or sr["correlated_case"]
+            or bool(sr["inj"])
+            or bool(sr["correlated_case"])
             or sr["pred_class"] == "NEEDS-REVIEW"
         )
         escalated_flags.append(bool(needs_esc))
+        decision_inputs.append({
+            "id": sr["id"],
+            "tier1_sev": sr["tier1_sev"],
+            "primary_class": sr["pred_class"],
+            "primary_sev": sr["pred_sev"],
+            "inj": bool(sr["inj"]),
+            "correlated_case": bool(sr["correlated_case"]),
+            "escalated": bool(needs_esc),
+        })
         if needs_esc:
             escalated_count += 1
             if gr["format_valid"]:
@@ -908,6 +943,20 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
         if SEVERITY_RANK.get(chosen["tier1_sev"], 0) > SEVERITY_RANK.get(chosen["pred_sev"], 0):
             chosen["pred_sev"] = chosen["tier1_sev"]
 
+        # Re-score explanation alignment against the post-override runtime verdict ([31]).
+        chosen["explanation_quality"] = score_explanation_quality(
+            {
+                "format_valid": chosen["format_valid"],
+                "label": chosen["pred_class"],
+                "severity": chosen["pred_sev"],
+                "explanation": chosen.get("explanation", ""),
+            },
+            {
+                "truth_class": chosen["truth_class"],
+                "truth_sev": chosen["truth_sev"],
+                "keywords": chosen.get("keywords", ()),
+            },
+        )
         chosen["latency_ms"] = lat
         combined.append(chosen)
         blended_ms.append(lat)
@@ -937,6 +986,7 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
         "blended_p50_ms": summary["latency_p50_ms"],
         "blended_mean_ms": summary["latency_mean_ms"],
         "per_sample_escalated": escalated_flags,
+        "per_sample_decisions": decision_inputs,
         "raw_blended_samples_ms": blended_ms,
     }
 
@@ -948,11 +998,18 @@ def _run_adapter_cli_timed(cmd: list[str], label: str, timeout_sec: float = 15.0
             cmd,
             check=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"{label} timed out after {timeout_sec}s") from exc
+        err_out = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+        suffix = f": {err_out}" if err_out else ""
+        raise RuntimeError(f"{label} timed out after {timeout_sec}s{suffix}") from exc
+    except subprocess.CalledProcessError as exc:
+        err_out = (exc.stderr or "").strip()
+        suffix = f": {err_out}" if err_out else ""
+        raise RuntimeError(f"{label} failed with exit code {exc.returncode}{suffix}") from exc
     return round((time.perf_counter() - t0) * 1000.0, 2)
 
 
@@ -965,10 +1022,15 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
     seg_dir = tmp_dir / "genesis-segs"
     data_dir.mkdir(parents=True, exist_ok=True)
     seg_dir.mkdir(parents=True, exist_ok=True)
+    watch_stderr_log = tmp_dir / "watch_stderr.log"
 
     active_state = {"model": SMOL_MODEL_ID}
 
     class MockInfHandler(http.server.BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2.0)
+
         def do_GET(self):
             if self.path == "/healthz":
                 body = json.dumps({
@@ -987,17 +1049,9 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
             self.end_headers()
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", "0"))
-            _ = self.rfile.read(length)
-            body = json.dumps({
-                "baseModel": active_state["model"],
-                "completion": "[BENIGN-NOISE] severity=LOW mitre=NONE explanation=ok",
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_response(405)
+            self.send_header("Allow", "GET")
             self.end_headers()
-            self.wfile.write(body)
 
         def log_message(self, format, *args):
             return
@@ -1013,27 +1067,29 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
         watch_port = _find_free_port()
         tcp_port = _find_free_port()
         watch_url = f"http://127.0.0.1:{watch_port}"
-        proc = subprocess.Popen(
-            [
-                str(sentinel_bin),
-                "watch",
-                "--http", f"127.0.0.1:{watch_port}",
-                "--data-dir", str(data_dir),
-                "--genesis-data-dir", str(seg_dir),
-                "--genesis-tcp", f"127.0.0.1:{tcp_port}",
-                "--triage-mode", "http",
-                "--inference-http", f"http://127.0.0.1:{inf_port}",
-                "--base-model", SMOL_MODEL_ID,
-                "--dry-run",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with open(watch_stderr_log, "w", encoding="utf-8") as stderr_fh:
+            proc = subprocess.Popen(
+                [
+                    str(sentinel_bin),
+                    "watch",
+                    "--http", f"127.0.0.1:{watch_port}",
+                    "--data-dir", str(data_dir),
+                    "--genesis-data-dir", str(seg_dir),
+                    "--genesis-tcp", f"127.0.0.1:{tcp_port}",
+                    "--triage-mode", "http",
+                    "--inference-http", f"http://127.0.0.1:{inf_port}",
+                    "--base-model", SMOL_MODEL_ID,
+                    "--dry-run",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_fh,
+            )
 
         ready = False
         for _ in range(50):
             if proc.poll() is not None:
-                raise RuntimeError(f"sentinel watch sidecar exited early with code {proc.returncode}")
+                diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
+                raise RuntimeError(f"sentinel watch sidecar exited early with code {proc.returncode}: {diag.strip()}")
             try:
                 with no_proxy_opener.open(f"{watch_url}/healthz", timeout=0.5) as resp:
                     if resp.status == 200:
@@ -1042,7 +1098,8 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
             except Exception:
                 time.sleep(0.05)
         if not ready:
-            raise RuntimeError("sentinel watch sidecar failed to become ready for live hot-swap test")
+            diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
+            raise RuntimeError(f"sentinel watch sidecar failed to become ready for live hot-swap test: {diag.strip()}")
 
         swap_latencies: list[float] = []
         for idx in range(5):
@@ -1162,7 +1219,7 @@ def build_conclusion_recommendation(
         turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
 
     return (
-        f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign false positives "
+        f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign-cohort errors "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
@@ -1170,6 +1227,53 @@ def build_conclusion_recommendation(
         f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended mean latency "
         f"({turnaround_phrase}), with resident PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
     )
+
+
+def _detect_cpu_brand() -> str:
+    if platform.system() == "Darwin":
+        try:
+            brand = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            ).strip()
+            if brand:
+                return brand
+        except Exception:
+            pass
+    return platform.processor() or platform.machine()
+
+
+def _atomic_publish_pair(path_a: Path, content_a: str, path_b: Path, content_b: str) -> None:
+    """Write both files to temp siblings first and roll back the first swap if the second fails."""
+    path_a.parent.mkdir(parents=True, exist_ok=True)
+    path_b.parent.mkdir(parents=True, exist_ok=True)
+    tmp_a = path_a.parent / f".{path_a.name}.{os.getpid()}.tmp"
+    tmp_b = path_b.parent / f".{path_b.name}.{os.getpid()}.tmp"
+    bak_a = path_a.parent / f".{path_a.name}.{os.getpid()}.bak"
+    had_a = path_a.exists()
+    replaced_a = False
+    try:
+        tmp_a.write_text(content_a, encoding="utf-8")
+        tmp_b.write_text(content_b, encoding="utf-8")
+        if had_a:
+            bak_a.write_bytes(path_a.read_bytes())
+        os.replace(tmp_a, path_a)
+        replaced_a = True
+        os.replace(tmp_b, path_b)
+        if bak_a.exists():
+            bak_a.unlink(missing_ok=True)
+    except Exception:
+        if replaced_a:
+            if had_a and bak_a.exists():
+                os.replace(bak_a, path_a)
+            elif not had_a:
+                path_a.unlink(missing_ok=True)
+        tmp_a.unlink(missing_ok=True)
+        tmp_b.unlink(missing_ok=True)
+        bak_a.unlink(missing_ok=True)
+        raise
 
 
 def run_worker_subprocess(phase: str, adapter_dir: Path, worker_out: Path, args: argparse.Namespace) -> dict:
@@ -1209,20 +1313,28 @@ def main() -> int:
     if args.worker:
         return run_worker_phase(args)
 
-    if args.train_epochs_smol <= 0 or args.train_epochs_gemma <= 0:
+    if args.train_epochs_smol < 2 or args.train_epochs_gemma <= 0:
         raise ValueError(
-            f"Epoch counts must be positive integers, got smol={args.train_epochs_smol}, gemma={args.train_epochs_gemma}"
+            f"Epoch counts must satisfy smol>=2 (for v1/v2 adapter snapshots) and gemma>=1, "
+            f"got smol={args.train_epochs_smol}, gemma={args.train_epochs_gemma}"
         )
 
     out_json_abs = (REPO_ROOT / args.out_json) if not args.out_json.is_absolute() else args.out_json
     out_md_abs = (REPO_ROOT / args.out_md) if not args.out_md.is_absolute() else args.out_md
     if out_json_abs.resolve() == out_md_abs.resolve():
         raise ValueError(f"--out-json and --out-md must not resolve to the same file: {out_json_abs.resolve()}")
+    try:
+        report_rel = out_md_abs.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"--out-md must resolve inside repository root {REPO_ROOT}: {out_md_abs}") from exc
 
     train_records, eval_rows = build_phase5_corpora()
-    sentinel_bin = (REPO_ROOT / args.sentinel_bin) if not args.sentinel_bin.is_absolute() else args.sentinel_bin
-    if not sentinel_bin.is_file():
-        raise FileNotFoundError(f"Sentinel binary not found at {sentinel_bin}; run `make build` first")
+    custom_sentinel_bin = args.sentinel_bin != Path("bin/sentinel")
+    explicit_sentinel_bin: Path | None = None
+    if custom_sentinel_bin:
+        explicit_sentinel_bin = (REPO_ROOT / args.sentinel_bin) if not args.sentinel_bin.is_absolute() else args.sentinel_bin
+        if not explicit_sentinel_bin.is_file():
+            raise FileNotFoundError(f"Sentinel binary not found at {explicit_sentinel_bin}; build it first")
 
     try:
         git_rev = subprocess.check_output(
@@ -1252,6 +1364,22 @@ def main() -> int:
         tmp_dir = Path(td)
         adapter_dir = tmp_dir / "adapters"
         adapter_dir.mkdir(parents=True, exist_ok=True)
+        if explicit_sentinel_bin is None:
+            sentinel_bin = tmp_dir / "sentinel"
+            print(f"Building fresh Sentinel CLI from clean HEAD ({git_rev}) for live sidecar benchmark...", file=sys.stderr, flush=True)
+            subprocess.run(
+                ["go", "build", "-o", str(sentinel_bin), "./cmd/sentinel"],
+                cwd=str(REPO_ROOT),
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+            binary_source = f"go build ./cmd/sentinel @ {git_rev}"
+        else:
+            sentinel_bin = explicit_sentinel_bin
+            binary_source = f"explicit:{args.sentinel_bin.as_posix()}"
+        sentinel_sha256 = hashlib.sha256(sentinel_bin.read_bytes()).hexdigest()[:16]
 
         print("Running isolated worker 1/6: SmolLM2-135M-Instruct (Base)...", file=sys.stderr, flush=True)
         smol_base = run_worker_subprocess("smol_base", adapter_dir, tmp_dir / "smol_base.json", args)
@@ -1314,10 +1442,9 @@ def main() -> int:
         warm_swap_ms=round(pct(peft_warm_sorted, 50), 4),
     )
 
-    try:
-        report_rel = out_md_abs.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
-    except ValueError:
-        report_rel = args.out_md.as_posix()
+    cpu_brand = _detect_cpu_brand()
+    cpu_cores = os.cpu_count() or 1
+    torch_threads = int(torch.get_num_threads())
 
     out_data = {
         "metadata": {
@@ -1329,9 +1456,14 @@ def main() -> int:
             "execution_device": "cpu",
             "dtype": "float32",
             "platform": f"{platform.system()} {platform.machine()}",
+            "cpu_brand": cpu_brand,
+            "cpu_logical_cores": cpu_cores,
+            "torch_num_threads": torch_threads,
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
             "peft_version": peft.__version__,
+            "sentinel_binary_source": binary_source,
+            "sentinel_binary_sha256_prefix": sentinel_sha256,
             "isolated_subprocess_per_model": True,
             "warmup_samples_excluded": 1,
             "sample_inclusion_rule": "all_post_warmup_holdout_windows_in_order",
@@ -1390,14 +1522,11 @@ def main() -> int:
     if PERSONAL_PATH_RE.search(encoded):
         raise RuntimeError("Refusing to write Phase 5 JSON containing personal host path")
 
-    out_json_abs.parent.mkdir(parents=True, exist_ok=True)
-    out_json_abs.write_text(encoded, encoding="utf-8")
-
     md = render_phase5_markdown(out_data)
     if PERSONAL_PATH_RE.search(md):
         raise RuntimeError("Refusing to write Phase 5 Markdown report containing personal host path")
-    out_md_abs.parent.mkdir(parents=True, exist_ok=True)
-    out_md_abs.write_text(md, encoding="utf-8")
+
+    _atomic_publish_pair(out_json_abs, encoded, out_md_abs, md)
 
     print(f"Wrote {args.out_json} and {args.out_md}")
     print(rec)
@@ -1418,13 +1547,13 @@ def render_phase5_markdown(d: dict) -> str:
         "",
         f"- **Date:** {meta['date']}",
         f"- **Commit:** `{meta['git_commit']}`",
-        f"- **Platform:** `{meta['platform']}` | `Python {meta['python_version']}` | `torch {meta['torch_version']}` | `peft {meta['peft_version']}` | `{meta['execution_device']} {meta['dtype']}`",
-        f"- **Dataset:** {ds['train_records']} balanced training windows ({ds['train_classes']} classes) / {ds['eval_total_windows']} unseen holdout windows ({ds['eval_benign_windows']} benign FP traps, {ds['eval_attack_windows']} attacks incl. {ds['eval_correlated_windows']} correlated chains & {ds['eval_injection_windows']} injections, {ds['eval_needs_review_windows']} ambiguous)",
-        f"- **Isolation:** `{meta['rss_measurement_method']}` across fresh subprocesses per model (`warmup_samples_excluded={meta['warmup_samples_excluded']}`)",
+        f"- **Platform:** `{meta['platform']}` (`{meta['cpu_brand']}`, `{meta['cpu_logical_cores']}` logical cores, `torch_threads={meta['torch_num_threads']}`) | `Python {meta['python_version']}` | `torch {meta['torch_version']}` | `peft {meta['peft_version']}` | `{meta['execution_device']} {meta['dtype']}`",
+        f"- **Dataset:** {ds['train_records']} balanced training windows ({ds['train_classes']} classes) / {ds['eval_total_windows']} unseen holdout windows ({ds['eval_benign_windows']} benign-cohort windows: 1 LOW control + 4 Tier-1 FP traps, {ds['eval_attack_windows']} attacks incl. {ds['eval_correlated_windows']} correlated chains & {ds['eval_injection_windows']} injections, {ds['eval_needs_review_windows']} ambiguous)",
+        f"- **Isolation:** `{meta['rss_measurement_method']}` across fresh subprocesses per model (`warmup_samples_excluded={meta['warmup_samples_excluded']}`, binary `{meta['sentinel_binary_source']}` sha256=`{meta['sentinel_binary_sha256_prefix']}`)",
         "",
         "## Side-by-Side Triage Accuracy, Quality, Footprint & Latency",
         "",
-        "| Tier / Model | Format Compliance | Class Accuracy | Benign FP (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
+        "| Tier / Model | Format Compliance | Class Accuracy | Benign Error (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         f"| `SmolLM2-135M-Instruct` (Base) | {sb['format_compliance_rate']:.4f} | {sb['class_accuracy']:.4f} ({sb['class_correct_count']}/{sb['eval_total']}) | {sb['benign_fp_count']} ({sb['benign_fp_rate']:.4f}) | {sb['correlated_accuracy']:.4f} | {sb['mitre_accuracy']:.4f} | {sb['explanation_quality_avg']:.4f} | {sb['rss_after_model_mb']:.2f} MB (+{sb['rss_delta_mb']:.2f}) | {sb['latency_p50_ms']:.2f} ms | {sb['latency_mean_ms']:.2f} ms |",
         f"| `SmolLM2-135M-Instruct` (LoRA) | {sl['format_compliance_rate']:.4f} | {sl['class_accuracy']:.4f} ({sl['class_correct_count']}/{sl['eval_total']}) | {sl['benign_fp_count']} ({sl['benign_fp_rate']:.4f}) | {sl['correlated_accuracy']:.4f} | {sl['mitre_accuracy']:.4f} | {sl['explanation_quality_avg']:.4f} | {sl['rss_after_model_mb']:.2f} MB (+{sl['rss_delta_mb']:.2f}) | {sl['latency_p50_ms']:.2f} ms | {sl['latency_mean_ms']:.2f} ms |",

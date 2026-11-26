@@ -474,16 +474,8 @@ def _is_gfm_delimiter_row(cells: list[str]) -> bool:
     return len(cells) >= 2 and all(re.fullmatch(r":?-{1,}:?", c) is not None for c in cells)
 
 
-def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[str], list[str]]:
-    """
-    Strip CommonMark fenced code blocks (backticks and tildes >= 3), 4-space/tab indented code
-    blocks (before scanning for HTML comments), raw HTML blocks (Type 1 <pre>/<script>/<style>/
-    <textarea>, Type 3 <? ... ?>, Type 5 <![CDATA[...]]>, and Type 6 block tags), and HTML
-    comments (including unclosed '<!--' through EOF), then collect rendered body rows strictly
-    from valid GFM tables (header row immediately followed by a matching-column delimiter row,
-    supporting optional outer pipes, 1-cell body rows, and honoring GFM column-width truncation).
-    Returns (published_table_rows, seen_bold_labels, duplicate_bold_labels).
-    """
+def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
+    """Strip fences, indented code, raw HTML blocks, and HTML comments, preserving line indices."""
     cleaned_lines: list[str] = []
     fence_char: str | None = None
     fence_len = 0
@@ -616,10 +608,11 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
         cleaned = "".join(out_parts)
         cleaned_lines.append(cleaned)
         can_start_indented_code = cleaned.strip() == ""
+    return cleaned_lines
 
-    rows: set[str] = set()
-    seen_labels: set[str] = set()
-    dup_labels: list[str] = []
+
+def _iter_gfm_table_body_rows(cleaned_lines: list[str]):
+    """Yield (rendered_line, rendered_parts, table_header_parts) for every visible GFM body row."""
     i = 0
     total_lines = len(cleaned_lines)
     while i < total_lines:
@@ -641,16 +634,30 @@ def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[
                     else:
                         rendered_parts = parts
                         rendered_line = line
-                    rows.add(rendered_line)
-                    if rendered_parts[0].startswith("**") and rendered_parts[0].endswith("**"):
-                        lbl = rendered_parts[0]
-                        if lbl in seen_labels:
-                            dup_labels.append(lbl)
-                        else:
-                            seen_labels.add(lbl)
+                    yield rendered_line, rendered_parts, hdr[1]
                     i += 1
                 continue
         i += 1
+
+
+def _extract_published_markdown_table_rows(md_text: str) -> tuple[set[str], set[str], list[str]]:
+    """
+    Strip CommonMark fenced/indented code, raw HTML blocks, and HTML comments, then collect
+    rendered body rows strictly from valid GFM tables.
+    Returns (published_table_rows, seen_bold_labels, duplicate_bold_labels).
+    """
+    cleaned_lines = _strip_markdown_non_visible_regions(md_text)
+    rows: set[str] = set()
+    seen_labels: set[str] = set()
+    dup_labels: list[str] = []
+    for rendered_line, rendered_parts, _hdr_parts in _iter_gfm_table_body_rows(cleaned_lines):
+        rows.add(rendered_line)
+        if rendered_parts[0].startswith("**") and rendered_parts[0].endswith("**"):
+            lbl = rendered_parts[0]
+            if lbl in seen_labels:
+                dup_labels.append(lbl)
+            else:
+                seen_labels.add(lbl)
     return rows, seen_labels, dup_labels
 
 
@@ -1354,7 +1361,7 @@ def _format_expected_phase5_recommendation(
         turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
 
     return (
-        f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign false positives "
+        f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign-cohort errors "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
@@ -1483,10 +1490,15 @@ def independent_recompute_phase5_comparison(
             errors.append(f"phase5 {key} class_correct_count ({cls_cnt}) exceeds format_valid_count ({fmt_cnt})")
         if fp_cnt > eval_benign:
             errors.append(f"phase5 {key} benign_fp_count ({fp_cnt}) exceeds eval_benign_windows ({eval_benign})")
+        if tp_cnt > fmt_cnt:
+            errors.append(f"phase5 {key} attack_tp_count ({tp_cnt}) exceeds format_valid_count ({fmt_cnt})")
         if tp_cnt + fn_cnt != eval_attack:
             errors.append(f"phase5 {key} attack tp+fn ({tp_cnt + fn_cnt}) != eval_attack_windows ({eval_attack})")
-        if corr_cnt > eval_corr or corr_cnt > fmt_cnt:
-            errors.append(f"phase5 {key} correlated_correct_count ({corr_cnt}) out of range (corr={eval_corr}, fmt={fmt_cnt})")
+        if corr_cnt > eval_corr or corr_cnt > fmt_cnt or corr_cnt > cls_cnt:
+            errors.append(
+                f"phase5 {key} correlated_correct_count ({corr_cnt}) out of range "
+                f"(corr={eval_corr}, fmt={fmt_cnt}, cls={cls_cnt})"
+            )
         if mitre_cnt > mitre_app or mitre_cnt > fmt_cnt:
             errors.append(f"phase5 {key} mitre_correct_count ({mitre_cnt}) out of range (app={mitre_app}, fmt={fmt_cnt})")
         if not (0.0 <= qual_avg <= 1.0):
@@ -1557,7 +1569,10 @@ def independent_recompute_phase5_comparison(
             "training": tr_sec,
         }
 
-    # Hybrid escalation validation
+    # Hybrid escalation validation ([24])
+    hyb_policy = hybrid.get("policy")
+    if hyb_policy != "high_critical":
+        errors.append(f"phase5 hybrid_escalation.policy must be 'high_critical', got {hyb_policy!r}")
     hyb_tot = _req_int(hybrid, "total_windows", errors, "hybrid_escalation", min_val=1)
     hyb_esc = _req_int(hybrid, "escalated_count", errors, "hybrid_escalation", min_val=0)
     hyb_pri = _req_int(hybrid, "primary_only_count", errors, "hybrid_escalation", min_val=0)
@@ -1610,17 +1625,45 @@ def independent_recompute_phase5_comparison(
             errors.append(
                 f"phase5 hybrid per_sample_escalated true count ({sum(1 for x in esc_flags if x)}) != escalated_count ({hyb_esc})"
             )
-        elif raw_hyb is not None and "smol_lora" in recomputed_models and "gemma_lora" in recomputed_models:
-            smol_raw = recomputed_models["smol_lora"].get("raw_samples")
-            gemma_raw = recomputed_models["gemma_lora"].get("raw_samples")
-            if isinstance(smol_raw, list) and isinstance(gemma_raw, list) and len(smol_raw) == eval_total and len(gemma_raw) == eval_total:
-                for idx_h, (flag, h_ms, s_ms, g_ms) in enumerate(zip(esc_flags, raw_hyb, smol_raw, gemma_raw)):
-                    exp_ms = round(float(s_ms) + float(g_ms), 3) if flag else float(s_ms)
-                    if abs(float(h_ms) - exp_ms) > 0.002:
-                        errors.append(
-                            f"phase5 hybrid_escalation.raw_blended_samples_ms[{idx_h}] ({h_ms}) does not match component sum ({exp_ms}, escalated={flag})"
+        else:
+            if require_governed_fields or "per_sample_decisions" in hybrid:
+                decisions = hybrid.get("per_sample_decisions")
+                if not isinstance(decisions, list) or len(decisions) != eval_total or not all(isinstance(x, dict) for x in decisions):
+                    errors.append(f"phase5 hybrid_escalation.per_sample_decisions must contain {eval_total} objects")
+                else:
+                    for idx_d, (dec_row, flag) in enumerate(zip(decisions, esc_flags)):
+                        t1_sev = dec_row.get("tier1_sev")
+                        p_sev = dec_row.get("primary_sev")
+                        p_cls = dec_row.get("primary_class")
+                        inj_f = dec_row.get("inj")
+                        corr_f = dec_row.get("correlated_case")
+                        if not isinstance(inj_f, bool) or not isinstance(corr_f, bool) or not isinstance(dec_row.get("escalated"), bool):
+                            errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid boolean flags")
+                            break
+                        recomp_esc = (
+                            t1_sev in ("HIGH", "CRITICAL")
+                            or p_sev in ("HIGH", "CRITICAL")
+                            or inj_f
+                            or corr_f
+                            or p_cls == "NEEDS-REVIEW"
                         )
-                        break
+                        if recomp_esc != bool(flag) or dec_row["escalated"] != bool(flag):
+                            errors.append(
+                                f"phase5 hybrid per_sample_decisions[{idx_d}] mismatch: recomputed={recomp_esc}, "
+                                f"decision={dec_row['escalated']}, flag={flag}"
+                            )
+                            break
+            if raw_hyb is not None and "smol_lora" in recomputed_models and "gemma_lora" in recomputed_models:
+                smol_raw = recomputed_models["smol_lora"].get("raw_samples")
+                gemma_raw = recomputed_models["gemma_lora"].get("raw_samples")
+                if isinstance(smol_raw, list) and isinstance(gemma_raw, list) and len(smol_raw) == eval_total and len(gemma_raw) == eval_total:
+                    for idx_h, (flag, h_ms, s_ms, g_ms) in enumerate(zip(esc_flags, raw_hyb, smol_raw, gemma_raw)):
+                        exp_ms = round(float(s_ms) + float(g_ms), 3) if flag else float(s_ms)
+                        if abs(float(h_ms) - exp_ms) > 0.002:
+                            errors.append(
+                                f"phase5 hybrid_escalation.raw_blended_samples_ms[{idx_h}] ({h_ms}) does not match component sum ({exp_ms}, escalated={flag})"
+                            )
+                            break
 
         if raw_hyb is not None:
             sorted_h = sorted(raw_hyb)
@@ -1674,8 +1717,11 @@ def independent_recompute_phase5_comparison(
                 errors.append(f"phase5 adapter_swaps_recorded ({swaps_rec!r}) < expected swap+rollback operations ({len(raw_sc_swaps) + 1})")
         if require_governed_fields or "post_rollback_adapter" in hotswap:
             post_rb = hotswap.get("post_rollback_adapter")
-            if not isinstance(post_rb, str) or not post_rb.strip():
-                errors.append("phase5 live_adapter_hotswap.post_rollback_adapter must be non-empty when zero_restart_verified=true")
+            expected_post_rb = "artifacts/smol-v2/model_adapters" if len(raw_sc_swaps) % 2 == 1 else "artifacts/smol-v1/model_adapters"
+            if not isinstance(post_rb, str) or post_rb.strip() != expected_post_rb:
+                errors.append(
+                    f"phase5 live_adapter_hotswap.post_rollback_adapter must equal {expected_post_rb!r}, got {post_rb!r}"
+                )
     else:
         errors.append("phase5 live_adapter_hotswap.raw_sidecar_verify_swap_ms must be a non-empty positive array")
 
@@ -1772,9 +1818,37 @@ def independent_recompute_phase5_comparison(
                     return False, [f"Failed to read {report_rel}: {exc}"]
                 if _has_personal_host_path_text(md_text):
                     errors.append(f"Phase 5 Markdown report {report_rel} contains leaked personal host path")
+                cleaned_lines = _strip_markdown_non_visible_regions(md_text)
+                visible_text = "\n".join(cleaned_lines)
                 published_rows, _, dup_labels = _extract_published_markdown_table_rows(md_text)
                 if dup_labels:
                     errors.append(f"Phase 5 Markdown report {report_rel} contains duplicate metric rows: {dup_labels}")
+
+                # Enforce strict first-cell uniqueness for ALL Phase 5 comparison and hot-swap rows
+                # including backticked model labels ([39]).
+                first_cell_counts: dict[str, int] = {}
+                table_headers_seen: list[list[str]] = []
+                for _rline, rparts, hparts in _iter_gfm_table_body_rows(cleaned_lines):
+                    table_headers_seen.append(hparts)
+                    lbl_key = re.sub(r"\s+", " ", rparts[0]).strip()
+                    first_cell_counts[lbl_key] = first_cell_counts.get(lbl_key, 0) + 1
+                expected_unique_prefixes = (
+                    "`SmolLM2-135M-Instruct` (Base)",
+                    "`SmolLM2-135M-Instruct` (LoRA)",
+                    "`google/gemma-2-2b-it` (Base)",
+                    "`google/gemma-2-2b-it` (LoRA)",
+                    "**Hybrid Escalation",
+                    "PyTorch PEFT Additional Adapter Load",
+                    "PyTorch PEFT Resident Adapter Switch",
+                    "Sentinel Sidecar CLI Swap",
+                    "Sentinel Sidecar CLI Rollback",
+                )
+                for lbl_key, cnt in first_cell_counts.items():
+                    if cnt > 1 and any(lbl_key.startswith(pref) for pref in expected_unique_prefixes):
+                        errors.append(f"Phase 5 Markdown report {report_rel} contains duplicate row for {lbl_key!r} ({cnt} occurrences)")
+                if any("Benign FP (Rate)" in h for h in table_headers_seen):
+                    errors.append(f"Phase 5 Markdown report {report_rel} uses deprecated ambiguous header 'Benign FP (Rate)'; expected 'Benign Error (Rate)'")
+
                 expected_md_rows: list[str] = []
                 if None not in (peft_cold, sc_rollback, eff_hyb_p50) and raw_sc_swaps:
                     expected_md_rows = [
@@ -1791,8 +1865,43 @@ def independent_recompute_phase5_comparison(
                 for erow in expected_md_rows:
                     if erow not in published_rows:
                         errors.append(f"Phase 5 JSON/Markdown table parity error: expected row {erow!r} missing from {report_rel}")
-                if cmp_sec.get("recommendation", "") not in md_text:
-                    errors.append(f"Phase 5 Markdown report {report_rel} conclusion drifted from JSON comparison.recommendation")
+
+                # Validate LoRA training provenance lines when full training provenance fields are present ([42]).
+                for tr_lbl, tr_obj in (
+                    ("SmolLM2-135M-Instruct LoRA", sl.get("training")),
+                    ("google/gemma-2-2b-it LoRA", gl.get("training")),
+                ):
+                    if isinstance(tr_obj, dict) and all(k in tr_obj for k in ("epochs", "steps", "lora_r", "initial_loss", "final_loss", "train_seconds", "adapter_size_mb")):
+                        exp_prov = (
+                            f"- **{tr_lbl}:** {tr_obj['epochs']} epochs ({tr_obj['steps']} steps, `r={tr_obj['lora_r']}`), "
+                            f"loss `{float(tr_obj['initial_loss']):.4f}` -> `{float(tr_obj['final_loss']):.4f}` in "
+                            f"`{float(tr_obj['train_seconds']):.2f}s` (adapter `{float(tr_obj['adapter_size_mb']):.2f} MB`)"
+                        )
+                        if exp_prov not in visible_text:
+                            errors.append(f"Phase 5 Markdown provenance mismatch for {tr_lbl}: expected line {exp_prov!r}")
+
+                # Validate hardware metadata parity when present ([1]).
+                if all(k in meta for k in ("cpu_brand", "cpu_logical_cores", "torch_num_threads")):
+                    hw_frag = f"(`{meta['cpu_brand']}`, `{meta['cpu_logical_cores']}` logical cores, `torch_threads={meta['torch_num_threads']}`)"
+                    if hw_frag not in visible_text:
+                        errors.append(f"Phase 5 Markdown hardware metadata mismatch: expected {hw_frag!r}")
+
+                # Validate a single visible `## Conclusion` section (ignoring HTML comments and code fences) ([26]).
+                conc_indices = [idx_c for idx_c, cl in enumerate(cleaned_lines) if re.fullmatch(r"##\s+Conclusion\s*", cl.strip())]
+                if len(conc_indices) != 1:
+                    errors.append(f"Phase 5 Markdown report {report_rel} must have exactly one visible '## Conclusion' section, found {len(conc_indices)}")
+                else:
+                    body_lines: list[str] = []
+                    for cl in cleaned_lines[conc_indices[0] + 1 :]:
+                        if re.match(r"^#{1,6}\s+", cl.strip()):
+                            break
+                        if cl.strip():
+                            body_lines.append(cl.strip())
+                    rendered_conc = " ".join(body_lines)
+                    if rendered_conc != cmp_sec.get("recommendation", ""):
+                        errors.append(
+                            f"Phase 5 Markdown report {report_rel} visible Conclusion section drifted from JSON comparison.recommendation"
+                        )
 
     if not errors and validated_json_cache is not None:
         validated_json_cache[phase5_json_path.resolve()] = data

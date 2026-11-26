@@ -152,6 +152,30 @@ func (p *Pipeline) initAdapterTracking() {
 	p.adapterMu.Unlock()
 }
 
+// ConfigureAdapterSyncPolicy records the startup manifest hash together with whether each
+// adapter slot was pinned by explicit CLI flags or hydrated from active-adapter.json on disk.
+func (p *Pipeline) ConfigureAdapterSyncPolicy(
+	hasHash bool,
+	hash [sha256.Size]byte,
+	lockPrimary, lockEscalation, primaryDisk, escalationDisk bool,
+) {
+	p.burnMu.Lock()
+	p.adapterMu.Lock()
+	if hasHash {
+		p.lastSyncedManifest = hash
+		p.hasSyncedManifest = true
+	} else {
+		p.lastSyncedManifest = [sha256.Size]byte{}
+		p.hasSyncedManifest = false
+	}
+	p.primaryLockedByCLI = lockPrimary
+	p.escalationLockedByCLI = lockEscalation
+	p.primaryFromDisk = primaryDisk
+	p.escalationFromDisk = escalationDisk
+	p.adapterMu.Unlock()
+	p.burnMu.Unlock()
+}
+
 // SetInitialSyncedManifestHash records the SHA-256 of the active-adapter.json revision
 // read by startup configuration (`watch`) so subsequent disk polling detects any external
 // manifest replacement that occurred between startup read and pipeline construction.
@@ -219,12 +243,11 @@ func (p *Pipeline) collectCorrelatedContextByKey(corrKey, excludeTemplateID stri
 		return nil
 	}
 
-	// Compact expired entries strictly in forward index order so slice aliasing cannot
-	// overwrite unread elements.
+	// Compact only expired entries strictly in forward index order so slice aliasing cannot
+	// overwrite unread elements; retain future windows intact for subsequent alerts.
 	kept := entries[:0]
 	for _, e := range entries {
-		age := nowUnix - e.timestamp
-		if age > correlationWindowTTLSec || age < -correlationWindowTTLSec {
+		if nowUnix-e.timestamp > correlationWindowTTLSec {
 			continue
 		}
 		kept = append(kept, e)
@@ -238,7 +261,7 @@ func (p *Pipeline) collectCorrelatedContextByKey(corrKey, excludeTemplateID stri
 	out := make([]string, 0, maxCorrelationPerService)
 	for i := len(kept) - 1; i >= 0 && len(out) < maxCorrelationPerService; i-- {
 		e := kept[i]
-		if e.templateID == excludeTemplateID {
+		if e.timestamp > nowUnix || e.templateID == excludeTemplateID {
 			continue
 		}
 		tidShort := e.templateID
@@ -327,6 +350,30 @@ func (p *Pipeline) recordCorrelationWindowWithKey(corrKey string, alertSeq uint6
 		list = append([]correlationEntry(nil), list[len(list)-maxCorrelationPerService:]...)
 	}
 	p.serviceCorrelator[corrKey] = list
+}
+
+// updateCorrelationWindowIfPresent refreshes an alert's severity and triage class in place
+// only while its original window sequence remains in the bounded cache, preserving window
+// ordering and never reinserting evicted entries.
+func (p *Pipeline) updateCorrelationWindowIfPresent(corrKey string, alertSeq uint64, a emit.Alert) {
+	if corrKey == "" || alertSeq == 0 || strings.TrimSpace(a.TemplateID) == "" {
+		return
+	}
+	p.corrMu.Lock()
+	defer p.corrMu.Unlock()
+	list := p.serviceCorrelator[corrKey]
+	if len(list) == 0 {
+		return
+	}
+	sev := sanitizeCorrelationTag(a.Severity, "MEDIUM")
+	triageClass := sanitizeCorrelationTag(a.TriageClass, "")
+	for i := range list {
+		if list[i].alertSeq == alertSeq && list[i].templateID == a.TemplateID {
+			list[i].severity = sev
+			list[i].triageClass = triageClass
+			return
+		}
+	}
 }
 
 func severityRank(sev string) int {
@@ -556,21 +603,71 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 		return false, err
 	}
 	if !curExists {
+		p.adapterMu.Lock()
+		lockPrimary := p.primaryLockedByCLI
+		lockEsc := p.escalationLockedByCLI
+		primaryDisk := p.primaryFromDisk
+		escDisk := p.escalationFromDisk
+		p.adapterMu.Unlock()
+
+		swappedAny := false
+		cancelAsync := false
+		if !lockPrimary && p.triageClient != nil && primaryDisk && p.triageClient.AdapterPath() != "" {
+			curModel := p.triageClient.BaseModel()
+			curAdapter := p.triageClient.AdapterPath()
+			p.triageClient.ResetAdapter()
+			p.adapterEpoch.Add(1)
+			cancelAsync = true
+			swappedAny = true
+			p.recordSwapLocked(train.SlotPrimary, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{})
+		} else if !lockPrimary && primaryDisk {
+			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, nil)
+		}
+		if !lockEsc && p.escalationClient != nil && escDisk && p.escalationClient.AdapterPath() != "" {
+			curModel := p.escalationClient.BaseModel()
+			curAdapter := p.escalationClient.AdapterPath()
+			p.escalationClient.ResetAdapter()
+			p.escalationEpoch.Add(1)
+			cancelAsync = true
+			swappedAny = true
+			p.recordSwapLocked(train.SlotEscalation, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, nil, nil, train.AdapterSlot{})
+		} else if !lockEsc && escDisk {
+			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, nil)
+		}
+		p.adapterMu.Lock()
+		if !lockPrimary {
+			p.primaryFromDisk = false
+		}
+		if !lockEsc {
+			p.escalationFromDisk = false
+		}
+		p.adapterMu.Unlock()
+		if cancelAsync {
+			p.asyncMu.Lock()
+			if p.activeAsyncCancel != nil {
+				p.activeAsyncCancel()
+			}
+			p.asyncMu.Unlock()
+		}
 		p.setSyncedManifestHashLocked([sha256.Size]byte{}, false)
-		return false, nil
+		return swappedAny, nil
 	}
 
 	p.adapterMu.Lock()
 	unchanged := p.hasSyncedManifest && p.lastSyncedManifest == curHash
+	lockPrimary := p.primaryLockedByCLI
+	lockEsc := p.escalationLockedByCLI
+	primaryDisk := p.primaryFromDisk
+	escDisk := p.escalationFromDisk
 	p.adapterMu.Unlock()
 	if unchanged {
 		return false, nil
 	}
 
-	// Pre-validate both slot pairs before mutating either runtime client so a valid file never
-	// leaves half-applied slot updates.
+	// Pre-validate non-CLI-locked slot pairs before mutating either runtime client so a
+	// manifest issue never leaves half-applied slot updates.
 	ps, hasPrimary := manifest.PrimarySlot()
-	if hasPrimary && p.triageClient != nil {
+	if !lockPrimary && hasPrimary && p.triageClient != nil {
 		if _, err := model.ValidateBaseModel(ps.BaseModel); err != nil {
 			return false, err
 		}
@@ -578,7 +675,7 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 			return false, err
 		}
 	}
-	if manifest.Escalation != nil && p.escalationClient != nil {
+	if !lockEsc && manifest.Escalation != nil && p.escalationClient != nil {
 		if _, err := model.ValidateBaseModel(manifest.Escalation.BaseModel); err != nil {
 			return false, err
 		}
@@ -590,60 +687,100 @@ func (p *Pipeline) SyncActiveAdapterFromDisk() (bool, error) {
 	swappedAny := false
 	cancelAsync := false
 
-	if hasPrimary && p.triageClient != nil {
-		curModel := p.triageClient.BaseModel()
-		curAdapter := p.triageClient.AdapterPath()
-		if curModel != ps.BaseModel || curAdapter != ps.AdapterPath {
-			if err := p.triageClient.SetModelAndAdapter(ps.BaseModel, ps.AdapterPath); err != nil {
-				return false, err
+	if !lockPrimary {
+		if hasPrimary {
+			if p.triageClient != nil {
+				curModel := p.triageClient.BaseModel()
+				curAdapter := p.triageClient.AdapterPath()
+				if curModel != ps.BaseModel || curAdapter != ps.AdapterPath {
+					if err := p.triageClient.SetModelAndAdapter(ps.BaseModel, ps.AdapterPath); err != nil {
+						return false, err
+					}
+					p.adapterEpoch.Add(1)
+					cancelAsync = true
+					swappedAny = true
+					p.recordSwapLocked(train.SlotPrimary, "auto_reload", ps.BaseModel, ps.AdapterPath, ps.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, ps)
+				} else {
+					p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous)
+				}
+				p.adapterMu.Lock()
+				p.primaryFromDisk = true
+				p.adapterMu.Unlock()
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous)
+				p.adapterMu.Lock()
+				p.primaryFromDisk = false
+				p.adapterMu.Unlock()
 			}
-			p.adapterEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotPrimary, "auto_reload", ps.BaseModel, ps.AdapterPath, ps.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, ps)
-		} else {
-			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, &ps, manifest.Previous)
-		}
-	} else if !hasPrimary && p.triageClient != nil {
-		if manifest.Previous != nil && p.triageClient.AdapterPath() != "" {
-			curModel := p.triageClient.BaseModel()
-			curAdapter := p.triageClient.AdapterPath()
-			p.triageClient.ResetAdapter()
-			p.adapterEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotPrimary, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+		} else if p.triageClient != nil {
+			if (primaryDisk || manifest.Previous != nil) && p.triageClient.AdapterPath() != "" {
+				curModel := p.triageClient.BaseModel()
+				curAdapter := p.triageClient.AdapterPath()
+				p.triageClient.ResetAdapter()
+				p.adapterEpoch.Add(1)
+				cancelAsync = true
+				swappedAny = true
+				p.recordSwapLocked(train.SlotPrimary, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous)
+			}
+			p.adapterMu.Lock()
+			p.primaryFromDisk = false
+			p.adapterMu.Unlock()
 		} else {
 			p.refreshUnchangedSlotMetaLocked(train.SlotPrimary, nil, manifest.Previous)
+			p.adapterMu.Lock()
+			p.primaryFromDisk = false
+			p.adapterMu.Unlock()
 		}
 	}
 
-	if manifest.Escalation != nil && p.escalationClient != nil {
-		es := *manifest.Escalation
-		curModel := p.escalationClient.BaseModel()
-		curAdapter := p.escalationClient.AdapterPath()
-		if curModel != es.BaseModel || curAdapter != es.AdapterPath {
-			if err := p.escalationClient.SetModelAndAdapter(es.BaseModel, es.AdapterPath); err != nil {
-				return false, err
+	if !lockEsc {
+		if manifest.Escalation != nil {
+			es := *manifest.Escalation
+			if p.escalationClient != nil {
+				curModel := p.escalationClient.BaseModel()
+				curAdapter := p.escalationClient.AdapterPath()
+				if curModel != es.BaseModel || curAdapter != es.AdapterPath {
+					if err := p.escalationClient.SetModelAndAdapter(es.BaseModel, es.AdapterPath); err != nil {
+						return false, err
+					}
+					p.escalationEpoch.Add(1)
+					cancelAsync = true
+					swappedAny = true
+					p.recordSwapLocked(train.SlotEscalation, "auto_reload", es.BaseModel, es.AdapterPath, es.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, es)
+				} else {
+					p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation)
+				}
+				p.adapterMu.Lock()
+				p.escalationFromDisk = true
+				p.adapterMu.Unlock()
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation)
+				p.adapterMu.Lock()
+				p.escalationFromDisk = false
+				p.adapterMu.Unlock()
 			}
-			p.escalationEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotEscalation, "auto_reload", es.BaseModel, es.AdapterPath, es.JobID, curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, es)
-		} else {
-			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, &es, manifest.PreviousEscalation)
-		}
-	} else if manifest.Escalation == nil && p.escalationClient != nil {
-		if manifest.PreviousEscalation != nil && p.escalationClient.AdapterPath() != "" {
-			curModel := p.escalationClient.BaseModel()
-			curAdapter := p.escalationClient.AdapterPath()
-			p.escalationClient.ResetAdapter()
-			p.escalationEpoch.Add(1)
-			cancelAsync = true
-			swappedAny = true
-			p.recordSwapLocked(train.SlotEscalation, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+		} else if p.escalationClient != nil {
+			if (escDisk || manifest.PreviousEscalation != nil) && p.escalationClient.AdapterPath() != "" {
+				curModel := p.escalationClient.BaseModel()
+				curAdapter := p.escalationClient.AdapterPath()
+				p.escalationClient.ResetAdapter()
+				p.escalationEpoch.Add(1)
+				cancelAsync = true
+				swappedAny = true
+				p.recordSwapLocked(train.SlotEscalation, "auto_reload", curModel, "", "", curModel, curAdapter, false, true, manifest.Previous, manifest.PreviousEscalation, train.AdapterSlot{})
+			} else {
+				p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation)
+			}
+			p.adapterMu.Lock()
+			p.escalationFromDisk = false
+			p.adapterMu.Unlock()
 		} else {
 			p.refreshUnchangedSlotMetaLocked(train.SlotEscalation, nil, manifest.PreviousEscalation)
+			p.adapterMu.Lock()
+			p.escalationFromDisk = false
+			p.adapterMu.Unlock()
 		}
 	}
 
@@ -695,13 +832,15 @@ func (p *Pipeline) recordSwapLocked(
 		}
 		if hasDiskManifest {
 			p.primaryMeta.previous = cloneSlotPtr(diskPrevPrimary)
-		} else if prevAdapter != "" && prevAdapter != adapterPath {
+		} else if action != train.ActionRollback && prevAdapter != "" && prevAdapter != adapterPath {
 			p.primaryMeta.previous = &train.AdapterSlot{
 				BaseModel:   prevModel,
 				AdapterPath: prevAdapter,
 				ActivatedAt: now,
 			}
 		}
+		p.primaryLockedByCLI = false
+		p.primaryFromDisk = hasDiskManifest && action != train.ActionDeactivate && strings.TrimSpace(adapterPath) != ""
 	}
 	if slot == train.SlotEscalation || slot == train.SlotAll {
 		p.escalationMeta.baseModel = baseModel
@@ -717,13 +856,15 @@ func (p *Pipeline) recordSwapLocked(
 		}
 		if hasDiskManifest {
 			p.escalationMeta.previous = cloneSlotPtr(diskPrevEsc)
-		} else if prevAdapter != "" && prevAdapter != adapterPath {
+		} else if action != train.ActionRollback && prevAdapter != "" && prevAdapter != adapterPath {
 			p.escalationMeta.previous = &train.AdapterSlot{
 				BaseModel:   prevModel,
 				AdapterPath: prevAdapter,
 				ActivatedAt: now,
 			}
 		}
+		p.escalationLockedByCLI = false
+		p.escalationFromDisk = hasDiskManifest && action != train.ActionDeactivate && strings.TrimSpace(adapterPath) != ""
 	}
 
 	rec := train.AdapterSwapRecord{
@@ -847,13 +988,42 @@ func (p *Pipeline) buildAdapterStatusResponseLocked(statusLabel, slot, action st
 	}
 	for len(resp.RecentSwaps) > 0 {
 		raw, err := json.Marshal(resp)
-		if err != nil || len(raw) <= train.MaxAdapterResponseBytes {
+		if err != nil || len(raw)+1 <= train.MaxAdapterResponseBytes {
 			break
 		}
 		resp.RecentSwaps = resp.RecentSwaps[1:]
 	}
 	if len(resp.RecentSwaps) == 0 {
 		resp.RecentSwaps = nil
+	}
+	// Ensure serialized wire size (including trailing '\n') always fits inside
+	// train.MaxAdapterResponseBytes even when mandatory slot metadata carries large fields
+	// such as a 40 KiB job_id duplicated at top level and under Primary/Escalation.
+	if raw, err := json.Marshal(resp); err == nil && len(raw)+1 > train.MaxAdapterResponseBytes {
+		resp.JobID = truncateAuditField(resp.JobID, maxSwapAuditFieldBytes)
+		if resp.Primary != nil {
+			resp.Primary.JobID = truncateAuditField(resp.Primary.JobID, maxSwapAuditFieldBytes)
+			resp.Primary.DatasetHash = truncateAuditField(resp.Primary.DatasetHash, maxSwapAuditFieldBytes)
+		}
+		if resp.Escalation != nil {
+			resp.Escalation.JobID = truncateAuditField(resp.Escalation.JobID, maxSwapAuditFieldBytes)
+			resp.Escalation.DatasetHash = truncateAuditField(resp.Escalation.DatasetHash, maxSwapAuditFieldBytes)
+		}
+		if raw2, err2 := json.Marshal(resp); err2 == nil && len(raw2)+1 > train.MaxAdapterResponseBytes {
+			resp.DataDir = truncateAuditField(resp.DataDir, maxSwapAuditFieldBytes*4)
+			resp.AdapterPath = truncateAuditField(resp.AdapterPath, maxSwapAuditFieldBytes*4)
+			resp.BaseModel = truncateAuditField(resp.BaseModel, maxSwapAuditFieldBytes*2)
+			resp.HealthBaseModel = truncateAuditField(resp.HealthBaseModel, maxSwapAuditFieldBytes*2)
+			for _, slotSt := range []*train.SlotStatus{resp.Primary, resp.Escalation} {
+				if slotSt == nil {
+					continue
+				}
+				slotSt.BaseModel = truncateAuditField(slotSt.BaseModel, maxSwapAuditFieldBytes*2)
+				slotSt.AdapterPath = truncateAuditField(slotSt.AdapterPath, maxSwapAuditFieldBytes*4)
+				slotSt.PreviousBaseModel = truncateAuditField(slotSt.PreviousBaseModel, maxSwapAuditFieldBytes*2)
+				slotSt.PreviousAdapterPath = truncateAuditField(slotSt.PreviousAdapterPath, maxSwapAuditFieldBytes*4)
+			}
+		}
 	}
 	return resp
 }
@@ -1132,27 +1302,39 @@ func (p *Pipeline) handleAdapterActivate(w http.ResponseWriter, r *http.Request,
 }
 
 func (p *Pipeline) handleAdapterRollback(w http.ResponseWriter, r *http.Request, slot string, verify, enable bool) {
-	// Resolve target rollback candidate under RLock so optional VerifyHealth does not hold burnMu.Lock.
+	// Resolve authoritative disk rollback target first (when DataDir is configured) under RLock
+	// so AutoReloadAdapter=false never verifies a stale cached target before checking disk.
 	p.burnMu.RLock()
-	var candidate *train.AdapterSlot
-	p.adapterMu.Lock()
-	if slot == train.SlotEscalation {
-		candidate = cloneSlotPtr(p.escalationMeta.previous)
-	} else {
-		candidate = cloneSlotPtr(p.primaryMeta.previous)
-	}
-	p.adapterMu.Unlock()
-	if candidate == nil && p.cfg.DataDir != "" {
-		if manifest, exists, err := train.LoadActiveAdapter(p.cfg.DataDir); err == nil && exists {
+	var (
+		candidate *train.AdapterSlot
+		diskErr   error
+	)
+	if p.cfg.DataDir != "" {
+		manifest, exists, err := train.LoadActiveAdapter(p.cfg.DataDir)
+		if err != nil {
+			diskErr = err
+		} else if exists {
 			if slot == train.SlotEscalation {
 				candidate = cloneSlotPtr(manifest.PreviousEscalation)
 			} else {
 				candidate = cloneSlotPtr(manifest.Previous)
 			}
 		}
+	} else {
+		p.adapterMu.Lock()
+		if slot == train.SlotEscalation {
+			candidate = cloneSlotPtr(p.escalationMeta.previous)
+		} else {
+			candidate = cloneSlotPtr(p.primaryMeta.previous)
+		}
+		p.adapterMu.Unlock()
 	}
 	p.burnMu.RUnlock()
 
+	if diskErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, diskErr.Error())
+		return
+	}
 	if candidate == nil {
 		writeJSONError(w, http.StatusConflict, train.ErrNoRollbackAvailable.Error())
 		return

@@ -1052,11 +1052,13 @@ class TestClaimsLinter(unittest.TestCase):
         sl = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", True, 2, 1, 0, 0.6, [12.0, 22.0, 32.0, 42.0], 22.0, 42.0, 27.0)
         gb = make_model_entry("google/gemma-2-2b-it", False, 3, 0, 1, 0.7, [100.0, 200.0, 300.0, 400.0], 200.0, 400.0, 250.0)
         gl = make_model_entry("google/gemma-2-2b-it", True, 4, 0, 1, 0.9, [110.0, 210.0, 310.0, 410.0], 210.0, 410.0, 260.0)
+        sl["training"].update({"lora_r": 8, "initial_loss": 2.0, "final_loss": 0.4, "train_seconds": 12.5, "adapter_size_mb": 1.2})
+        gl["training"].update({"lora_r": 8, "initial_loss": 1.8, "final_loss": 0.2, "train_seconds": 45.0, "adapter_size_mb": 6.4})
         # Window 0 & 1 primary-only (12.0, 22.0); Window 2 & 3 escalated (32+310=342.0, 42+410=452.0).
         hyb_samples = [12.0, 22.0, 342.0, 452.0]
         rec = (
             "In offline side-by-side holdout evaluation, Gemma-2B-IT LoRA improved holdout triage accuracy from "
-            "0.5000 (SmolLM2-135M-Instruct LoRA) to 1.0000, moved benign false positives from 1 to 0, changed "
+            "0.5000 (SmolLM2-135M-Instruct LoRA) to 1.0000, moved benign-cohort errors from 1 to 0, changed "
             "multi-window correlation accuracy from 0.0000 to 1.0000, and moved explanation quality from 0.6000 "
             "to 0.9000. At P50 per-incident latency, Gemma-2B-IT took 210.00 ms vs 22.00 ms (9.55x slower on CPU), "
             "while selective escalation routed 50.00% of alerts to Gemma-2B-IT for 1.0000 combined accuracy at "
@@ -1064,7 +1066,12 @@ class TestClaimsLinter(unittest.TestCase):
             "with resident PEFT hot-swaps completing in 4.1000 ms P50."
         )
         valid_payload = {
-            "metadata": {"offline_mode": True},
+            "metadata": {
+                "offline_mode": True,
+                "cpu_brand": "Test CPU",
+                "cpu_logical_cores": 8,
+                "torch_num_threads": 4,
+            },
             "dataset": {
                 "train_records": 8,
                 "eval_total_windows": 4,
@@ -1093,6 +1100,12 @@ class TestClaimsLinter(unittest.TestCase):
                 "blended_p50_ms": 22.0,
                 "blended_mean_ms": 207.0,
                 "per_sample_escalated": [False, False, True, True],
+                "per_sample_decisions": [
+                    {"id": "w0", "tier1_sev": "LOW", "primary_class": "BENIGN-NOISE", "primary_sev": "LOW", "inj": False, "correlated_case": False, "escalated": False},
+                    {"id": "w1", "tier1_sev": "MEDIUM", "primary_class": "BENIGN-NOISE", "primary_sev": "LOW", "inj": False, "correlated_case": False, "escalated": False},
+                    {"id": "w2", "tier1_sev": "HIGH", "primary_class": "AUTH-BRUTEFORCE", "primary_sev": "HIGH", "inj": False, "correlated_case": False, "escalated": True},
+                    {"id": "w3", "tier1_sev": "MEDIUM", "primary_class": "RECON-SCAN", "primary_sev": "MEDIUM", "inj": False, "correlated_case": True, "escalated": True},
+                ],
                 "raw_blended_samples_ms": hyb_samples,
             },
             "live_adapter_hotswap": {
@@ -1167,20 +1180,53 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("zero_restart_verified" in e for e in errs_b), errs_b)
             self.assertTrue(any("sentinel_sidecar_rollback_ms" in e for e in errs_b), errs_b)
 
-            # Reject Markdown table P50 tamper when report_markdown parity is checked.
+            # Reject inconsistent model counts (corr > cls or tp > fmt), non-high_critical policy,
+            # mismatched per_sample_decisions, and wrong post_rollback_adapter ([24], [27], [35]).
+            bad_inv = json.loads(json.dumps(valid_payload))
+            bad_inv["models"]["smol_base"]["correlated_correct_count"] = 2  # > class_correct_count(1), even though <= corr(1)? Make valid corr=2:
+            bad_inv["dataset"]["eval_correlated_windows"] = 2
+            bad_inv["models"]["smol_base"]["correlated_accuracy"] = 1.0
+            bad_inv["models"]["smol_lora"]["correlated_correct_count"] = 2
+            bad_inv["models"]["smol_lora"]["correlated_accuracy"] = 1.0
+            bad_inv["models"]["gemma_base"]["correlated_correct_count"] = 2
+            bad_inv["models"]["gemma_base"]["correlated_accuracy"] = 1.0
+            bad_inv["models"]["gemma_lora"]["correlated_correct_count"] = 2
+            bad_inv["models"]["gemma_lora"]["correlated_accuracy"] = 1.0
+            bad_inv["hybrid_escalation"]["policy"] = "always"
+            bad_inv["hybrid_escalation"]["per_sample_decisions"][0]["primary_sev"] = "HIGH"
+            bad_inv["live_adapter_hotswap"]["post_rollback_adapter"] = "artifacts/smol-v1/model_adapters"
+            inv_path = Path(tmp) / "bad_inv.json"
+            inv_path.write_text(json.dumps(bad_inv), encoding="utf-8")
+            ok_inv, errs_inv = sync_docs.independent_recompute_phase5_comparison(inv_path)
+            self.assertFalse(ok_inv)
+            self.assertTrue(any("out of range" in e for e in errs_inv), errs_inv)
+            self.assertTrue(any("policy must be 'high_critical'" in e for e in errs_inv), errs_inv)
+            self.assertTrue(any("per_sample_decisions[0] mismatch" in e for e in errs_inv), errs_inv)
+            self.assertTrue(any("post_rollback_adapter must equal" in e for e in errs_inv), errs_inv)
+
+            # Validate full Markdown report parity AND reject duplicate rows, HTML-commented conclusions,
+            # and tampered training provenance ([1], [26], [33], [39], [42]).
             md_path = Path(tmp) / "2026-11-26-phase5-comparison.md"
             md_lines = [
-                "| Tier / Model | Format Compliance | Class Accuracy | Benign FP (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
+                "- **Platform:** `Darwin x86_64` (`Test CPU`, `8` logical cores, `torch_threads=4`)",
+                "| Tier / Model | Format Compliance | Class Accuracy | Benign Error (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
                 "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
                 "| `SmolLM2-135M-Instruct` (Base) | 1.0000 | 0.2500 (1/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.4000 | 900.00 MB (+600.00) | 20.00 ms | 25.00 ms |",
                 "| `SmolLM2-135M-Instruct` (LoRA) | 1.0000 | 0.5000 (2/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.6000 | 900.00 MB (+600.00) | 22.00 ms | 27.00 ms |",
                 "| `google/gemma-2-2b-it` (Base) | 1.0000 | 0.7500 (3/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.7000 | 900.00 MB (+600.00) | 200.00 ms | 250.00 ms |",
                 "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |",
                 "| **Hybrid Escalation (`high_critical`, 0.5000 escalated)** | — | **1.0000 (4/4)** | **0 (0.0000)** | **1.0000** | **1.0000** | **0.9000** | Primary 900.00 MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **22.00 ms** | **207.00 ms** |",
+                "## LoRA Fine-Tuning Provenance",
+                "- **SmolLM2-135M-Instruct LoRA:** 2 epochs (4 steps, `r=8`), loss `2.0000` -> `0.4000` in `12.50s` (adapter `1.20 MB`)",
+                "- **google/gemma-2-2b-it LoRA:** 2 epochs (4 steps, `r=8`), loss `1.8000` -> `0.2000` in `45.00s` (adapter `6.40 MB`)",
+                "| Operation | Backend | Measured Latency |",
+                "| :--- | :--- | :---: |",
                 "| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `pytorch-peft` | 15.00 ms |",
                 "| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `pytorch-peft` | 4.1000 ms / 4.2000 ms |",
                 "| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `mock-inference-healthz` | 12.00 ms / 14.00 ms |",
                 "| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `mock-inference-healthz` | 11.50 ms |",
+                "## Conclusion",
+                "",
                 rec,
             ]
             md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
@@ -1191,10 +1237,24 @@ class TestClaimsLinter(unittest.TestCase):
             ok_m, errs_m = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
             self.assertTrue(ok_m, errs_m)
 
-            md_path.write_text(md_path.read_text(encoding="utf-8").replace("210.00 ms", "999.00 ms"), encoding="utf-8")
+            md_text_orig = md_path.read_text(encoding="utf-8")
+            md_path.write_text(md_text_orig.replace("210.00 ms", "999.00 ms"), encoding="utf-8")
             ok_tm, errs_tm = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
             self.assertFalse(ok_tm)
             self.assertTrue(any("table parity error" in e for e in errs_tm), errs_tm)
+
+            # Duplicate Gemma row + hidden HTML comment conclusion + visible Conclusion tamper + provenance tamper
+            dup_row = "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 999.00 ms | 260.00 ms |"
+            tampered_md = md_text_orig.replace(
+                "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |",
+                "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |\n" + dup_row,
+            ).replace("(4 steps,", "(40 steps,").replace(rec, "<!-- " + rec + " -->\nTampered conclusion prose.")
+            md_path.write_text(tampered_md, encoding="utf-8")
+            ok_td, errs_td = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_td)
+            self.assertTrue(any("duplicate row" in e for e in errs_td), errs_td)
+            self.assertTrue(any("provenance mismatch" in e for e in errs_td), errs_td)
+            self.assertTrue(any("visible Conclusion section drifted" in e for e in errs_td), errs_td)
 
 
 if __name__ == "__main__":

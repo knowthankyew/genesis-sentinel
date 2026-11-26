@@ -196,12 +196,16 @@ type Pipeline struct {
 	beforeAsyncPublishFn func() // optional test hook invoked right before publish check
 	afterAsyncTaskFn     func() // optional test hook invoked right after task completes
 
-	adapterMu          sync.Mutex
-	adapterHistory     []train.AdapterSwapRecord
-	primaryMeta        slotRuntimeMeta
-	escalationMeta     slotRuntimeMeta
-	lastSyncedManifest [sha256.Size]byte
-	hasSyncedManifest  bool
+	adapterMu              sync.Mutex
+	adapterHistory         []train.AdapterSwapRecord
+	primaryMeta            slotRuntimeMeta
+	escalationMeta         slotRuntimeMeta
+	primaryLockedByCLI     bool
+	escalationLockedByCLI  bool
+	primaryFromDisk        bool
+	escalationFromDisk     bool
+	lastSyncedManifest     [sha256.Size]byte
+	hasSyncedManifest      bool
 
 	corrMu            sync.Mutex
 	serviceCorrelator map[string][]correlationEntry
@@ -555,7 +559,7 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 		return
 	}
 	p.triageUpdatesEmitted.Add(1)
-	p.recordCorrelationWindowWithKey(task.corrKey, task.alertSeq, enriched)
+	p.updateCorrelationWindowIfPresent(task.corrKey, task.alertSeq, enriched)
 	if p.alertJournal != nil {
 		// Use UpdateIfPresent so a delayed async Tier 2 result updates its existing alert
 		// in-place and never evicts newer alerts if the original record aged out or was burned.
@@ -1415,6 +1419,8 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	p.adapterMu.Lock()
 	p.primaryMeta = slotRuntimeMeta{}
 	p.escalationMeta = slotRuntimeMeta{}
+	p.primaryFromDisk = false
+	p.escalationFromDisk = false
 	p.adapterHistory = nil
 	p.hasSyncedManifest = false
 	p.lastSyncedManifest = [sha256.Size]byte{}

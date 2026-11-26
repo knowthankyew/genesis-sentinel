@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -245,6 +246,9 @@ func TestPipelineDualSlotHotSwapVerifyRollbackDeactivateAndAutoReload(t *testing
 	if pipe.EscalationClient() != nil {
 		t.Fatal("failed preflight verification should not enable escalation client")
 	}
+	if _, exists, _ := train.LoadActiveAdapter(cfg.DataDir); exists {
+		t.Fatal("failed preflight verification must leave active-adapter.json absent")
+	}
 
 	// 2. Unhealthy server rejects 503.
 	healthModel.Store(model.ModelGemma22BIT)
@@ -482,8 +486,17 @@ func TestAsyncEscalationDiscardsStaleVerdictOnEscalationHotSwap(t *testing.T) {
 	if len(em3) != 1 {
 		t.Fatalf("expected 1 deterministic alert #3, got %d", len(em3))
 	}
-	<-sink2.ch
-	<-beforePubEntered
+	hookWait := 2 * time.Second
+	select {
+	case <-sink2.ch:
+	case <-time.After(hookWait):
+		t.Fatal("timed out waiting for initial Tier 0/1 alert #3 emission")
+	}
+	select {
+	case <-beforePubEntered:
+	case <-time.After(hookWait):
+		t.Fatal("timed out waiting for worker #2 beforeAsyncPublishFn hook")
+	}
 
 	recC := httptest.NewRecorder()
 	reqC := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"escalation","adapter_path":"artifacts/gemma-C/model_adapters"}`))
@@ -493,7 +506,11 @@ func TestAsyncEscalationDiscardsStaleVerdictOnEscalationHotSwap(t *testing.T) {
 		t.Fatalf("HandleAdapter escalation swap to gemma-C failed: %d", recC.Code)
 	}
 	releasePub()
-	<-afterTaskDone
+	select {
+	case <-afterTaskDone:
+	case <-time.After(hookWait):
+		t.Fatal("timed out waiting for worker #2 afterAsyncTaskFn completion hook")
+	}
 
 	select {
 	case leaked := <-sink2.ch:
@@ -675,5 +692,230 @@ func TestPipelinePhase5ReviewEdgeCasesAndHardening(t *testing.T) {
 	})
 	if rbErr == nil || !strings.Contains(rbErr.Error(), "changed") {
 		t.Fatalf("expected ErrRollbackTargetChanged on stale candidate, got %v", rbErr)
+	}
+}
+
+func TestPipelinePhase5Round2Invariants(t *testing.T) {
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+
+	// 1. Out-of-order late alert excludes future windows WITHOUT deleting them, and
+	// async enrichment never reinserts an evicted window ([22], [23]).
+	cfgCorr := config.DefaultConfig()
+	pipeCorr := New(cfgCorr, ruleEng, emit.NopSink{}, "file")
+	corrKey := correlationServiceKey("payments-api")
+
+	pipeCorr.recordCorrelationWindowWithKey(corrKey, 10, emit.Alert{
+		Timestamp: 2000, SourceService: "payments-api", TemplateID: "t-future",
+		Severity: "HIGH", Categories: []string{"exfil"}, Count: 4,
+	})
+	if gotLate := pipeCorr.collectCorrelatedContextByKey(corrKey, "t-other", 1300); len(gotLate) != 0 {
+		t.Fatalf("expected out-of-order earlier alert ts=1300 to exclude ts=2000, got %v", gotLate)
+	}
+	if gotLater := pipeCorr.collectCorrelatedContextByKey(corrKey, "t-other", 2010); len(gotLater) != 1 || !strings.Contains(gotLater[0], "t-future") {
+		t.Fatalf("expected future window ts=2000 to be retained for ts=2010, got %v", gotLater)
+	}
+
+	// Evict t-future (`alertSeq=10`) by recording 4 newer windows (`maxCorrelationPerService=4`).
+	for i := 1; i <= maxCorrelationPerService; i++ {
+		pipeCorr.recordCorrelationWindowWithKey(corrKey, uint64(10+i), emit.Alert{
+			Timestamp: int64(2010 + i), SourceService: "payments-api",
+			TemplateID: fmt.Sprintf("t-new-%d", i), Severity: "MEDIUM", Count: 1,
+		})
+	}
+	pipeCorr.updateCorrelationWindowIfPresent(corrKey, 10, emit.Alert{
+		Timestamp: 2000, SourceService: "payments-api", TemplateID: "t-future",
+		Severity: "CRITICAL", TriageClass: "EXFIL-SUSPECT",
+	})
+	ctxAfter := pipeCorr.collectCorrelatedContextByKey(corrKey, "exclude-none", 2020)
+	if len(ctxAfter) != maxCorrelationPerService {
+		t.Fatalf("expected %d correlated windows after evicted async update, got %d (%v)", maxCorrelationPerService, len(ctxAfter), ctxAfter)
+	}
+	for _, entry := range ctxAfter {
+		if strings.Contains(entry, "t-future") {
+			t.Fatalf("evicted window t-future must not be reinserted by async update: %v", ctxAfter)
+		}
+	}
+
+	// 2. Diskless rollback preserves full displaced slot provenance (JobID + DatasetHash + ActivatedAt),
+	// and an oversize manifest JobID (40 KiB) stays within MaxAdapterResponseBytes ([9], [17]).
+	cfgMem := config.DefaultConfig()
+	cfgMem.DataDir = ""
+	cfgMem.TriageMode = "http"
+	cfgMem.InferenceAddr = "http://127.0.0.1:8000"
+	cfgMem.AdapterPath = "artifacts/s-init/model_adapters"
+	pMem := New(cfgMem, ruleEng, emit.NopSink{}, "file")
+
+	memJob := strings.Repeat("K", 12*1024)
+	for _, payload := range []string{
+		`{"slot":"primary","job_id":"job-v1","adapter_path":"artifacts/s-v1/model_adapters","dataset_hash":"sha256:v1"}`,
+		fmt.Sprintf(`{"slot":"primary","job_id":%q,"adapter_path":"artifacts/s-v2/model_adapters","dataset_hash":"sha256:v2"}`, memJob),
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		pMem.HandleAdapter(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.Len() > train.MaxAdapterResponseBytes {
+			t.Fatalf("diskless swap failed or exceeded wire limit: code=%d len=%d", rec.Code, rec.Body.Len())
+		}
+	}
+	// First rollback -> v1 (displacing v2 with memJob); second rollback -> v2 retaining memJob provenance.
+	for _, wantAdapter := range []string{"artifacts/s-v1/model_adapters", "artifacts/s-v2/model_adapters"} {
+		recRB := httptest.NewRecorder()
+		reqRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback"}`))
+		reqRB.Header.Set("Content-Type", "application/json")
+		pMem.HandleAdapter(recRB, reqRB)
+		if recRB.Code != http.StatusOK || recRB.Body.Len() > train.MaxAdapterResponseBytes {
+			t.Fatalf("diskless rollback failed or exceeded wire limit: code=%d len=%d", recRB.Code, recRB.Body.Len())
+		}
+		var rbResp train.AdapterStatusResponse
+		_ = json.Unmarshal(recRB.Body.Bytes(), &rbResp)
+		if rbResp.AdapterPath != wantAdapter {
+			t.Fatalf("expected restored adapter %q, got %q", wantAdapter, rbResp.AdapterPath)
+		}
+	}
+	pMem.adapterMu.Lock()
+	preservedDataset := pMem.primaryMeta.datasetHash
+	preservedJobLen := len(pMem.primaryMeta.jobID)
+	pMem.adapterMu.Unlock()
+	if preservedDataset != "sha256:v2" || preservedJobLen != len(memJob) {
+		t.Fatalf("expected displaced diskless slot provenance preserved across double rollback, got jobLen=%d hash=%q", preservedJobLen, preservedDataset)
+	}
+
+	// Disk manifest carrying a valid 40 KiB JobID yields a rollback response <= MaxAdapterResponseBytes
+	// even with zero RecentSwaps history ([17]).
+	wireDir := t.TempDir()
+	bigDiskJob := strings.Repeat("W", 40*1024)
+	if err := train.SaveActiveAdapter(wireDir, train.ActiveAdapter{
+		JobID:       "j-cur-wire",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/wire-cur/model_adapters",
+		Previous: &train.AdapterSlot{
+			JobID:       bigDiskJob,
+			BaseModel:   model.ModelSmolLM2135MInstruct,
+			AdapterPath: "artifacts/wire-prev/model_adapters",
+			DatasetHash: "sha256:wire-prev",
+		},
+	}); err != nil {
+		t.Fatalf("seed wireDir: %v", err)
+	}
+	cfgWire := config.DefaultConfig()
+	cfgWire.DataDir = wireDir
+	cfgWire.TriageMode = "http"
+	cfgWire.InferenceAddr = "http://127.0.0.1:8000"
+	cfgWire.AdapterPath = "artifacts/wire-cur/model_adapters"
+	pWire := New(cfgWire, ruleEng, emit.NopSink{}, "file")
+	recWireRB := httptest.NewRecorder()
+	reqWireRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback"}`))
+	reqWireRB.Header.Set("Content-Type", "application/json")
+	pWire.HandleAdapter(recWireRB, reqWireRB)
+	if recWireRB.Code != http.StatusOK || recWireRB.Body.Len() > train.MaxAdapterResponseBytes {
+		t.Fatalf("expected 40 KiB manifest rollback response <= %d bytes, got code=%d len=%d",
+			train.MaxAdapterResponseBytes, recWireRB.Code, recWireRB.Body.Len())
+	}
+
+	// 3. CLI-locked explicit slot resists unrelated sibling updates on disk, disabled slots refresh metadata,
+	// and disk-owned slots clear when dropped from the manifest ([7], [12], [14]).
+	syncDir := t.TempDir()
+	_, initialHash, err := train.UpdateActiveAdapterSlotWithHash(syncDir, train.SlotPrimary, train.AdapterSlot{
+		JobID: "j-disk-p1", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/disk-p1/model_adapters",
+	})
+	if err != nil {
+		t.Fatalf("seed syncDir: %v", err)
+	}
+	cfgSync := config.DefaultConfig()
+	cfgSync.DataDir = syncDir
+	cfgSync.TriageMode = "http"
+	cfgSync.InferenceAddr = "http://127.0.0.1:8000"
+	cfgSync.AdapterPath = "artifacts/cli-pinned-primary/model_adapters"
+	cfgSync.EscalationMode = "off"
+	pSync := New(cfgSync, ruleEng, emit.NopSink{}, "file")
+	pSync.ConfigureAdapterSyncPolicy(true, initialHash, true, false, false, false)
+
+	// Sibling escalation update on disk must NOT clobber CLI-pinned primary, AND must populate
+	// metadata for disabled escalation slot without enabling EscalationClient ([7], [12]).
+	if _, err := train.UpdateActiveAdapterSlot(syncDir, train.SlotEscalation, train.AdapterSlot{
+		JobID: "j-esc-meta", BaseModel: model.ModelGemma22BIT, AdapterPath: "artifacts/disk-esc/model_adapters",
+	}); err != nil {
+		t.Fatalf("write escalation slot: %v", err)
+	}
+	reloaded, err := pSync.SyncActiveAdapterFromDisk()
+	if err != nil || reloaded {
+		t.Fatalf("expected no live client swap when primary is CLI-locked and escalation is off, reloaded=%v err=%v", reloaded, err)
+	}
+	if pSync.TriageClient().AdapterPath() != "artifacts/cli-pinned-primary/model_adapters" || pSync.EscalationClient() != nil {
+		t.Fatalf("expected CLI primary intact and escalation disabled, got primary=%q esc=%v",
+			pSync.TriageClient().AdapterPath(), pSync.EscalationClient())
+	}
+	recMeta := httptest.NewRecorder()
+	pSync.HandleAdapter(recMeta, httptest.NewRequest(http.MethodGet, "/adapter", nil))
+	var stMeta train.AdapterStatusResponse
+	_ = json.Unmarshal(recMeta.Body.Bytes(), &stMeta)
+	if stMeta.Escalation == nil || stMeta.Escalation.AdapterPath != "artifacts/disk-esc/model_adapters" || stMeta.Escalation.Enabled {
+		t.Fatalf("expected disabled escalation slot metadata refreshed on GET /adapter, got %+v", stMeta.Escalation)
+	}
+
+	// Disk-owned primary is cleared when replaced by an escalation-only manifest even with Previous==nil ([14]).
+	cfgDisk := config.DefaultConfig()
+	cfgDisk.DataDir = t.TempDir()
+	cfgDisk.TriageMode = "http"
+	cfgDisk.InferenceAddr = "http://127.0.0.1:8000"
+	cfgDisk.AdapterPath = "artifacts/disk-p-owned/model_adapters"
+	if err := train.SaveActiveAdapter(cfgDisk.DataDir, train.ActiveAdapter{
+		JobID: "j-owned", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/disk-p-owned/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed cfgDisk: %v", err)
+	}
+	_, ownedHash, _, _ := train.LoadActiveAdapterWithHash(cfgDisk.DataDir)
+	pDisk := New(cfgDisk, ruleEng, emit.NopSink{}, "file")
+	pDisk.ConfigureAdapterSyncPolicy(true, ownedHash, false, false, true, false)
+	if err := train.SaveActiveAdapter(cfgDisk.DataDir, train.ActiveAdapter{
+		Escalation: &train.AdapterSlot{
+			JobID: "j-only-esc", BaseModel: model.ModelGemma22BIT, AdapterPath: "artifacts/only-esc/model_adapters",
+		},
+	}); err != nil {
+		t.Fatalf("write escalation-only manifest: %v", err)
+	}
+	if sw, err := pDisk.SyncActiveAdapterFromDisk(); err != nil || !sw || pDisk.TriageClient().AdapterPath() != "" {
+		t.Fatalf("expected disk-owned primary reset when removed from manifest, sw=%v err=%v path=%q",
+			sw, err, pDisk.TriageClient().AdapterPath())
+	}
+
+	// 4. Verified rollback with AutoReloadAdapter=false reads fresh disk target BEFORE calling /healthz ([18]).
+	rbDir := t.TempDir()
+	for _, p := range []string{"artifacts/rb-A/model_adapters", "artifacts/rb-B/model_adapters"} {
+		if _, err := train.UpdateActiveAdapterSlot(rbDir, train.SlotPrimary, train.AdapterSlot{
+			BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: p,
+		}); err != nil {
+			t.Fatalf("seed rbDir: %v", err)
+		}
+	}
+	var seenHealth bool
+	hSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHealth = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"Healthy","baseModel":"HuggingFaceTB/SmolLM2-135M-Instruct","backend":"mock"}`))
+	}))
+	defer hSrv.Close()
+
+	cfgRB := config.DefaultConfig()
+	cfgRB.DataDir = rbDir
+	cfgRB.TriageMode = "http"
+	cfgRB.InferenceAddr = hSrv.URL
+	cfgRB.AdapterPath = "artifacts/rb-B/model_adapters"
+	cfgRB.AutoReloadAdapter = false
+	pRB := New(cfgRB, ruleEng, emit.NopSink{}, "file")
+	// Overwrite disk manifest externally clearing Previous so no rollback candidate exists on disk.
+	if err := train.SaveActiveAdapter(rbDir, train.ActiveAdapter{
+		JobID: "j-external", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/rb-C/model_adapters",
+	}); err != nil {
+		t.Fatalf("overwrite rbDir: %v", err)
+	}
+	recStaleRB := httptest.NewRecorder()
+	reqStaleRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback","verify":true}`))
+	reqStaleRB.Header.Set("Content-Type", "application/json")
+	pRB.HandleAdapter(recStaleRB, reqStaleRB)
+	if recStaleRB.Code != http.StatusConflict || seenHealth {
+		t.Fatalf("expected immediate 409 before /healthz when disk rollback target vanished, code=%d seenHealth=%v",
+			recStaleRB.Code, seenHealth)
 	}
 }

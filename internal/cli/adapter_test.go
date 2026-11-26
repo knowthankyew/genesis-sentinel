@@ -246,8 +246,8 @@ func TestExecuteTrainSubmitSelectsEscalationModelAndRollbackMirrorsDaemon(t *tes
 		t.Fatalf("expected both primary and escalation slots preserved, got %+v err=%v", loaded, err)
 	}
 
-	// 2. Verify `adapter rollback` against a daemon with a different data_dir synchronizes
-	// the local manifest to the daemon's restored adapter instead of rolling back independently.
+	// 2. Verify `adapter rollback` against a loopback daemon reporting its own daemonDir
+	// rolls back daemonDir cleanly WITHOUT mutating an unrelated localDivergedDir ([6]).
 	daemonDir := t.TempDir()
 	localDivergedDir := t.TempDir()
 	for _, path := range []string{"artifacts/d-1/model_adapters", "artifacts/d-2/model_adapters"} {
@@ -258,7 +258,6 @@ func TestExecuteTrainSubmitSelectsEscalationModelAndRollbackMirrorsDaemon(t *tes
 			t.Fatalf("seed daemon dir: %v", err)
 		}
 	}
-	// Local dir has NO rollback history at all; previously this failed even after daemon rolled back.
 	if _, err := train.UpdateActiveAdapterSlot(localDivergedDir, train.SlotPrimary, train.AdapterSlot{
 		BaseModel:   model.ModelSmolLM2135MInstruct,
 		AdapterPath: "artifacts/local-only/model_adapters",
@@ -283,10 +282,68 @@ func TestExecuteTrainSubmitSelectsEscalationModelAndRollbackMirrorsDaemon(t *tes
 		"--sentinel-http", daemonSrv.URL,
 		"--auth-token", "tok",
 	}, &out, &errBuf); err != nil {
-		t.Fatalf("synchronized rollback failed: %v stderr=%s", err, errBuf.String())
+		t.Fatalf("daemon rollback failed: %v stderr=%s", err, errBuf.String())
 	}
-	syncedLocal, _, err := train.LoadActiveAdapter(localDivergedDir)
-	if err != nil || syncedLocal.AdapterPath != "artifacts/d-1/model_adapters" {
-		t.Fatalf("expected local manifest synced to daemon rollback result d-1, got %+v err=%v", syncedLocal, err)
+	daemonLoaded, _, err := train.LoadActiveAdapter(daemonDir)
+	if err != nil || daemonLoaded.AdapterPath != "artifacts/d-1/model_adapters" {
+		t.Fatalf("expected daemonDir rolled back to d-1, got %+v err=%v", daemonLoaded, err)
+	}
+	untouchedLocal, _, err := train.LoadActiveAdapter(localDivergedDir)
+	if err != nil || untouchedLocal.AdapterPath != "artifacts/local-only/model_adapters" {
+		t.Fatalf("expected unrelated localDivergedDir untouched at local-only, got %+v err=%v", untouchedLocal, err)
+	}
+}
+
+func TestExecuteAdapterPositionalArgsAndIsolatedLocalManifest(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	for _, args := range [][]string{
+		{"adapter", "rollback", "escalation"},
+		{"adapter", "deactivate", "escalation"},
+		{"adapter", "history", "extra"},
+	} {
+		out.Reset()
+		errBuf.Reset()
+		err := ExecuteWithOutput(args, &out, &errBuf)
+		if err == nil || !strings.Contains(err.Error(), "unexpected positional argument") {
+			t.Fatalf("expected positional argument rejection for %v, got %v", args, err)
+		}
+	}
+
+	daemonDir := t.TempDir()
+	otherLocalDir := t.TempDir()
+	if _, err := train.UpdateActiveAdapterSlot(otherLocalDir, train.SlotPrimary, train.AdapterSlot{
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/other-instance/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed otherLocalDir: %v", err)
+	}
+
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+	dCfg := config.DefaultConfig()
+	dCfg.DataDir = daemonDir
+	dCfg.TriageMode = "off"
+	dPipe := pipeline.New(dCfg, ruleEng, emit.NopSink{}, "file")
+	daemonSrv := httptest.NewServer(newWatchHTTPHandler(dPipe, "tok"))
+	defer daemonSrv.Close()
+
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"adapter", "swap",
+		"--data-dir", otherLocalDir,
+		"--slot", "primary",
+		"--adapter-path", "artifacts/daemon-v2/model_adapters",
+		"--sentinel-http", daemonSrv.URL,
+		"--auth-token", "tok",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("adapter swap against loopback daemon failed: %v stderr=%s", err, errBuf.String())
+	}
+	daemonLoaded, _, err := train.LoadActiveAdapter(daemonDir)
+	if err != nil || daemonLoaded.AdapterPath != "artifacts/daemon-v2/model_adapters" {
+		t.Fatalf("expected daemonDir updated to daemon-v2, got %+v err=%v", daemonLoaded, err)
+	}
+	localLoaded, _, err := train.LoadActiveAdapter(otherLocalDir)
+	if err != nil || localLoaded.AdapterPath != "artifacts/other-instance/model_adapters" {
+		t.Fatalf("expected unrelated otherLocalDir untouched by loopback daemon swap, got %+v err=%v", localLoaded, err)
 	}
 }

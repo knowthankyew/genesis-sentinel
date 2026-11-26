@@ -338,6 +338,10 @@ func (c *Client) Health(ctx context.Context) (HealthStatus, error) {
 	if err != nil {
 		return HealthStatus{}, err
 	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("X-API-Key", c.apiKey)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return HealthStatus{}, fmt.Errorf("inference health check at %s: %w", c.redactedURL, security.SanitizeURLError(err))

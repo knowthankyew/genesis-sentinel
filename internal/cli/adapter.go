@@ -136,6 +136,9 @@ func runAdapterHistory(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q", fs.Arg(0))
+	}
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		return err
@@ -219,6 +222,7 @@ func runAdapterSwap(args []string, stdout, stderr io.Writer) error {
 	out, err := activateSlotWithOptionalDaemon(
 		context.Background(),
 		cfg.DataDir,
+		*dataDir != "",
 		normSlot,
 		slotState,
 		strings.TrimSpace(*sentinelHTTP),
@@ -246,6 +250,9 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 	enable := fs.Bool("enable", false, "Enable slot inference client dynamically if it started off")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --slot)", fs.Arg(0))
 	}
 	normSlot, err := train.NormalizeSlot(*slot, false)
 	if err != nil {
@@ -275,8 +282,10 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 		}
 		daemonRolledBack = true
 		daemonResp = resp
-		if security.IsLoopbackEndpoint(*sentinelHTTP) {
-			daemonSavedSameDir = sameCleanDir(resp.DataDir, cfg.DataDir)
+		if security.IsLoopbackEndpoint(*sentinelHTTP) && strings.TrimSpace(resp.DataDir) != "" {
+			// Loopback daemon already persisted authoritative state under resp.DataDir;
+			// never overwrite a different local instance's DataDir.
+			daemonSavedSameDir = true
 		}
 	}
 
@@ -325,6 +334,9 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional argument %q (use flags such as --slot)", fs.Arg(0))
+	}
 	normSlot, err := train.NormalizeSlot(*slot, true)
 	if err != nil {
 		return err
@@ -348,8 +360,10 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 		}
 		daemonCalled = true
 		daemonResp = resp
-		if security.IsLoopbackEndpoint(*sentinelHTTP) {
-			daemonSavedSameDir = sameCleanDir(resp.DataDir, cfg.DataDir)
+		if security.IsLoopbackEndpoint(*sentinelHTTP) && strings.TrimSpace(resp.DataDir) != "" {
+			// Loopback daemon already persisted authoritative state under resp.DataDir;
+			// never overwrite a different local instance's DataDir.
+			daemonSavedSameDir = true
 		}
 	}
 	if !daemonSavedSameDir {
@@ -375,7 +389,9 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 
 func activateSlotWithOptionalDaemon(
 	ctx context.Context,
-	dataDir, slot string,
+	dataDir string,
+	dataDirExplicit bool,
+	slot string,
 	slotState train.AdapterSlot,
 	sentinelHTTP, authToken string,
 	allowRemote, verify, enable bool,
@@ -426,13 +442,40 @@ func activateSlotWithOptionalDaemon(
 			daemonActivated = true
 			daemonResp = resp
 		}
-		if security.IsLoopbackEndpoint(sentinelHTTP) {
-			daemonSavedSameDir = sameCleanDir(daemonResp.DataDir, dataDir)
+		if security.IsLoopbackEndpoint(sentinelHTTP) && strings.TrimSpace(daemonResp.DataDir) != "" {
+			// When a loopback daemon reports its own non-empty DataDir, leave persistence
+			// strictly to the daemon so an unrelated local DataDir is never modified.
+			_ = dataDirExplicit
+			daemonSavedSameDir = true
+		} else if !security.IsLoopbackEndpoint(sentinelHTTP) && !dataDirExplicit {
+			daemonSavedSameDir = true
 		}
 	}
 
 	if !daemonSavedSameDir {
-		updated, err := train.UpdateActiveAdapterSlot(dataDir, normSlot, slotState)
+		var (
+			updated train.ActiveAdapter
+			err     error
+		)
+		if daemonActivated {
+			slotStatus := daemonResp.Primary
+			if normSlot == train.SlotEscalation {
+				slotStatus = daemonResp.Escalation
+			}
+			if slotStatus == nil {
+				slotStatus = &train.SlotStatus{
+					Slot:        normSlot,
+					JobID:       slotState.JobID,
+					BaseModel:   slotState.BaseModel,
+					AdapterPath: slotState.AdapterPath,
+					DatasetHash: slotState.DatasetHash,
+					SwappedAt:   slotState.ActivatedAt,
+				}
+			}
+			updated, err = train.MirrorDaemonSlotToManifest(dataDir, normSlot, slotStatus, slotState.BaseModel, slotState.AdapterPath, slotState.JobID)
+		} else {
+			updated, err = train.UpdateActiveAdapterSlot(dataDir, normSlot, slotState)
+		}
 		if err != nil {
 			if daemonActivated {
 				return nil, fmt.Errorf("running Sentinel daemon already activated adapter %q (job %s), but saving local manifest to %q failed: %w",
