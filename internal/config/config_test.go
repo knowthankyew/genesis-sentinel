@@ -164,3 +164,72 @@ func TestLoadConfigFileAndEnvPrecedence(t *testing.T) {
 		t.Fatalf("expected nonpositive env overrides to preserve file values (60, 96), got (%d, %d)", cfg.TriageTimeoutSec, cfg.TriageMaxTokens)
 	}
 }
+
+func TestConfigPhase5EscalationValidationAndEnv(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.EscalationMode != "off" || cfg.EscalationBaseModel != model.ModelGemma22BIT ||
+		cfg.EscalationPolicy != EscalationPolicyHighCritical || !cfg.AutoReloadAdapter {
+		t.Fatalf("unexpected Phase 5 default escalation config: %+v", cfg)
+	}
+
+	// Valid Gemma 2 2B IT escalation configuration
+	cfg.EscalationMode = "http"
+	cfg.EscalationPolicy = EscalationPolicyStrict
+	cfg.EscalationAdapterPath = "  artifacts/gemma-job/model_adapters\n"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid escalation config, got %v", err)
+	}
+	if cfg.EscalationAdapterPath != "artifacts/gemma-job/model_adapters" {
+		t.Fatalf("expected normalized EscalationAdapterPath, got %q", cfg.EscalationAdapterPath)
+	}
+
+	// Reject BitNet in escalation_base_model (ADR-5)
+	bad := DefaultConfig()
+	bad.EscalationBaseModel = "microsoft/BitNet-b1.58-2B-4T"
+	if err := bad.Validate(); err == nil {
+		t.Fatal("expected BitNet escalation_base_model to fail validation")
+	}
+
+	// Reject bad escalation_mode, escalation_policy, non-loopback inference URL, traversal adapter path
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{"BadMode", func(c *Config) { c.EscalationMode = "grpc" }},
+		{"BadPolicy", func(c *Config) { c.EscalationPolicy = "yolo" }},
+		{"BadRemoteAddr", func(c *Config) { c.EscalationInferenceAddr = "http://10.0.0.42:8001" }},
+		{"TraversalAdapter", func(c *Config) { c.EscalationAdapterPath = "../escape" }},
+		{"SmallPromptHTTP", func(c *Config) { c.EscalationMode = "http"; c.MaxPromptByte = 64 }},
+		{"BadTokens", func(c *Config) { c.EscalationMaxTokens = 5 }},
+		{"BadTimeout", func(c *Config) { c.EscalationTimeoutSec = 500 }},
+		{"BadFloor", func(c *Config) { c.EscalationConfidenceFloor = 1.5 }},
+	} {
+		c := DefaultConfig()
+		tc.mut(c)
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%s: expected validation error", tc.name)
+		}
+	}
+
+	// Environment variable overrides
+	t.Setenv("SENTINEL_ESCALATION_MODE", "http")
+	t.Setenv("SENTINEL_ESCALATION_INFERENCE_HTTP", "http://127.0.0.1:8101")
+	t.Setenv("SENTINEL_ESCALATION_BASE_MODEL", model.ModelGemma22BIT)
+	t.Setenv("SENTINEL_ESCALATION_ADAPTER_PATH", "artifacts/gemma-1/model_adapters")
+	t.Setenv("SENTINEL_ESCALATION_POLICY", "always")
+	t.Setenv("SENTINEL_ESCALATION_MAX_TOKENS", "128")
+	t.Setenv("SENTINEL_ESCALATION_TIMEOUT_SEC", "120")
+	t.Setenv("SENTINEL_ESCALATION_CONFIDENCE_FLOOR", "0.85")
+	t.Setenv("SENTINEL_AUTO_RELOAD_ADAPTER", "false")
+
+	loaded, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if loaded.EscalationMode != "http" || loaded.EscalationInferenceAddr != "http://127.0.0.1:8101" ||
+		loaded.EscalationPolicy != EscalationPolicyAlways || loaded.EscalationMaxTokens != 128 ||
+		loaded.EscalationTimeoutSec != 120 || loaded.EscalationConfidenceFloor != 0.85 ||
+		loaded.AutoReloadAdapter {
+		t.Fatalf("unexpected Phase 5 env overrides: %+v", loaded)
+	}
+}

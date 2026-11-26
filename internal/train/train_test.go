@@ -309,3 +309,58 @@ func TestNotifyDaemonAdapterRedactsEchoedCredentialsInErrorBody(t *testing.T) {
 		t.Fatalf("expected sanitized url.Error preserving context.Canceled without username/password, got %v", err)
 	}
 }
+
+func TestDualSlotManifestUpdateRollbackAndDeactivate(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Activate primary v1
+	if _, err := UpdateActiveAdapterSlot(dir, SlotPrimary, AdapterSlot{
+		JobID:       "smol-1",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/smol-1/model_adapters",
+	}); err != nil {
+		t.Fatalf("UpdateActiveAdapterSlot primary v1: %v", err)
+	}
+	// 2. Activate primary v2 -> preserves v1 in Previous
+	if _, err := UpdateActiveAdapterSlot(dir, SlotPrimary, AdapterSlot{
+		JobID:       "smol-2",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/smol-2/model_adapters",
+	}); err != nil {
+		t.Fatalf("UpdateActiveAdapterSlot primary v2: %v", err)
+	}
+	// 3. Activate escalation v1 -> preserves primary v2 + Previous
+	m, err := UpdateActiveAdapterSlot(dir, SlotEscalation, AdapterSlot{
+		JobID:       "gemma-1",
+		BaseModel:   model.ModelGemma22BIT,
+		AdapterPath: "artifacts/gemma-1/model_adapters",
+	})
+	if err != nil {
+		t.Fatalf("UpdateActiveAdapterSlot escalation v1: %v", err)
+	}
+	if m.AdapterPath != "artifacts/smol-2/model_adapters" || m.Previous == nil || m.Previous.JobID != "smol-1" ||
+		m.Escalation == nil || m.Escalation.BaseModel != model.ModelGemma22BIT {
+		t.Fatalf("unexpected dual-slot manifest state: %+v", m)
+	}
+
+	// 4. Rollback primary restores smol-1 and leaves escalation untouched
+	m, restored, err := RollbackActiveAdapterSlot(dir, SlotPrimary)
+	if err != nil {
+		t.Fatalf("RollbackActiveAdapterSlot primary: %v", err)
+	}
+	if restored.JobID != "smol-1" || m.JobID != "smol-1" || m.Previous == nil || m.Previous.JobID != "smol-2" ||
+		m.Escalation == nil || m.Escalation.JobID != "gemma-1" {
+		t.Fatalf("unexpected manifest after primary rollback: restored=%+v manifest=%+v", restored, m)
+	}
+
+	// 5. Rollback escalation fails cleanly before a second escalation swap
+	if _, _, err := RollbackActiveAdapterSlot(dir, SlotEscalation); !errors.Is(err, ErrNoRollbackAvailable) {
+		t.Fatalf("expected ErrNoRollbackAvailable for escalation, got %v", err)
+	}
+
+	// 6. Deactivate escalation keeps previous_escalation snapshot for recovery
+	m, changed, err := DeactivateActiveAdapterSlot(dir, SlotEscalation)
+	if err != nil || !changed || m.Escalation != nil || m.PreviousEscalation == nil || m.PreviousEscalation.JobID != "gemma-1" {
+		t.Fatalf("unexpected manifest after escalation deactivate: changed=%v err=%v manifest=%+v", changed, err, m)
+	}
+}

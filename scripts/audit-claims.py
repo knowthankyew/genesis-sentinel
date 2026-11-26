@@ -525,13 +525,27 @@ def audit_sentinel_invariants(errors: list[str]) -> None:
         ("github.com/knowthankyew/genesis-sentinel/internal/model", "TestValidateBaseModel"),
         ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestDefaultConfigValidates"),
         ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestConfigRejectsBitNetAndNonLoopback"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/config", "TestConfigPhase5EscalationValidationAndEnv"),
         ("github.com/knowthankyew/genesis-sentinel/internal/cli", "TestExecuteConfigRedactsTokens"),
         ("github.com/knowthankyew/genesis-sentinel/internal/cli", "TestExecuteDataSubcommands"),
+        ("github.com/knowthankyew/genesis-sentinel/internal/cli", "TestExecuteAdapterCLICommandsEndToEnd"),
         ("github.com/knowthankyew/genesis-sentinel/internal/pipeline", "TestBurnLocalStateRejectsFeedbackSymlinkEscape"),
         ("github.com/knowthankyew/genesis-sentinel/internal/pipeline", "TestPipelineCountsOnlySuccessfulSinkEmissions"),
         (
             "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
             "TestAsyncTier2EmitsDeterministicAlertImmediatelyAndEnrichesCorrelatedUpdate",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestPipelineDualTierEscalationAndCorrelation",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestPipelineDualSlotHotSwapVerifyRollbackDeactivateAndAutoReload",
+        ),
+        (
+            "github.com/knowthankyew/genesis-sentinel/internal/pipeline",
+            "TestAsyncEscalationDiscardsStaleVerdictOnEscalationHotSwap",
         ),
         (
             "github.com/knowthankyew/genesis-sentinel/internal/pipeline",

@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
 	"github.com/knowthankyew/genesis-sentinel/internal/security"
@@ -18,17 +16,24 @@ import (
 
 // Default operational ceilings and tuning bounds for Genesis Sentinel.
 const (
-	DefaultMaxMemMB             = 256
-	DefaultWindowSec            = 10
-	DefaultSurprisalThreshold   = 5.0
-	MinMaxPromptBytes           = 512
-	DefaultMaxPromptBytes       = 2048
-	DefaultMaxTrainingRecords   = 50000
-	DefaultMaxTrainingFileBytes = 25 * 1024 * 1024
-	MaxBaselineWindowSize       = 10000
-	DefaultTriageMaxTokens      = 64
-	DefaultTriageTemperature    = 0.1
-	DefaultTriageTimeoutSec     = 45
+	DefaultMaxMemMB                  = 256
+	DefaultWindowSec                 = 10
+	DefaultSurprisalThreshold        = 5.0
+	MinMaxPromptBytes                = 512
+	DefaultMaxPromptBytes            = 2048
+	DefaultMaxTrainingRecords        = 50000
+	DefaultMaxTrainingFileBytes      = 25 * 1024 * 1024
+	MaxBaselineWindowSize            = 10000
+	DefaultTriageMaxTokens           = 64
+	DefaultTriageTemperature         = 0.1
+	DefaultTriageTimeoutSec          = 45
+	DefaultEscalationMaxTokens       = 96
+	DefaultEscalationTimeoutSec      = 90
+	DefaultEscalationConfidenceFloor = 0.75
+
+	EscalationPolicyHighCritical = "high_critical"
+	EscalationPolicyStrict       = "strict"
+	EscalationPolicyAlways       = "always"
 )
 
 // Config represents all operational configuration options for Genesis Sentinel.
@@ -69,6 +74,17 @@ type Config struct {
 	InferenceAddr     string  `json:"inference_http"`
 	MaxPromptByte     int     `json:"max_prompt_bytes"`
 
+	// Phase 5: On-Demand Gemma 2 2B IT Reasoning Escalation & Live Adapter Hot-Swap
+	EscalationMode            string  `json:"escalation_mode"` // "off" (default) | "http"
+	EscalationInferenceAddr   string  `json:"escalation_inference_http"`
+	EscalationBaseModel       string  `json:"escalation_base_model"`
+	EscalationAdapterPath     string  `json:"escalation_adapter_path"`
+	EscalationPolicy          string  `json:"escalation_policy"` // "high_critical" (default) | "strict" | "always"
+	EscalationMaxTokens       int     `json:"escalation_max_tokens"`
+	EscalationTimeoutSec      int     `json:"escalation_timeout_sec"`
+	EscalationConfidenceFloor float64 `json:"escalation_confidence_floor"`
+	AutoReloadAdapter         bool    `json:"auto_reload_adapter"`
+
 	// Local Disk State & Privacy Guardrails (intentional Pillar 1 variance; see ADR-4)
 	DataDir              string `json:"data_dir"`
 	FeedbackDir          string `json:"feedback_dir"`
@@ -92,36 +108,45 @@ func DefaultDataDir() string {
 func DefaultConfig() *Config {
 	dataDir := DefaultDataDir()
 	return &Config{
-		HTTPAddr:             "127.0.0.1:8090",
-		AllowAllInterfaces:   false,
-		AuthToken:            "",
-		GenesisHTTPAddr:      "http://127.0.0.1:8080",
-		GenesisTCPAddr:       "127.0.0.1:9000",
-		GenesisAuthToken:     "",
-		GenesisDataDir:       "",
-		AlertServiceName:     "sentinel",
-		WindowDuration:       DefaultWindowSec * time.Second,
-		WindowStr:            "10s",
-		RulesPath:            "",
-		SurprisalMode:        "inprocess",
-		SurprisalHTTPAddr:    "http://127.0.0.1:5200",
-		SurprisalThreshold:   DefaultSurprisalThreshold,
-		BaselineWindowSize:   2000,
-		TriageMode:           "off",
-		TriageMaxTokens:      DefaultTriageMaxTokens,
-		TriageTemperature:    DefaultTriageTemperature,
-		TriageTimeoutSec:     DefaultTriageTimeoutSec,
-		BaseModel:            model.ModelSmolLM2135MInstruct,
-		AdapterPath:          "",
-		FTaaSAPIAddr:         "http://127.0.0.1:5100",
-		FTaaSAPIKey:          "",
-		InferenceAddr:        "http://127.0.0.1:8000",
-		MaxPromptByte:        DefaultMaxPromptBytes,
-		DataDir:              dataDir,
-		FeedbackDir:          "",
-		RequireRedaction:     true,
-		AllowRemoteEndpoints: false,
-		MaxMemMB:             DefaultMaxMemMB,
+		HTTPAddr:                  "127.0.0.1:8090",
+		AllowAllInterfaces:        false,
+		AuthToken:                 "",
+		GenesisHTTPAddr:           "http://127.0.0.1:8080",
+		GenesisTCPAddr:            "127.0.0.1:9000",
+		GenesisAuthToken:          "",
+		GenesisDataDir:            "",
+		AlertServiceName:          "sentinel",
+		WindowDuration:            DefaultWindowSec * time.Second,
+		WindowStr:                 "10s",
+		RulesPath:                 "",
+		SurprisalMode:             "inprocess",
+		SurprisalHTTPAddr:         "http://127.0.0.1:5200",
+		SurprisalThreshold:        DefaultSurprisalThreshold,
+		BaselineWindowSize:        2000,
+		TriageMode:                "off",
+		TriageMaxTokens:           DefaultTriageMaxTokens,
+		TriageTemperature:         DefaultTriageTemperature,
+		TriageTimeoutSec:          DefaultTriageTimeoutSec,
+		BaseModel:                 model.ModelSmolLM2135MInstruct,
+		AdapterPath:               "",
+		FTaaSAPIAddr:              "http://127.0.0.1:5100",
+		FTaaSAPIKey:               "",
+		InferenceAddr:             "http://127.0.0.1:8000",
+		MaxPromptByte:             DefaultMaxPromptBytes,
+		EscalationMode:            "off",
+		EscalationInferenceAddr:   "http://127.0.0.1:8001",
+		EscalationBaseModel:       model.ModelGemma22BIT,
+		EscalationAdapterPath:     "",
+		EscalationPolicy:          EscalationPolicyHighCritical,
+		EscalationMaxTokens:       DefaultEscalationMaxTokens,
+		EscalationTimeoutSec:      DefaultEscalationTimeoutSec,
+		EscalationConfidenceFloor: DefaultEscalationConfidenceFloor,
+		AutoReloadAdapter:         true,
+		DataDir:                   dataDir,
+		FeedbackDir:               "",
+		RequireRedaction:          true,
+		AllowRemoteEndpoints:      false,
+		MaxMemMB:                  DefaultMaxMemMB,
 	}
 }
 
@@ -179,55 +204,49 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_mem_mb must be positive, got %d", c.MaxMemMB)
 	}
 
-	switch strings.ToLower(strings.TrimSpace(c.TriageMode)) {
-	case "", "off":
-		c.TriageMode = "off"
-	case "http":
-		c.TriageMode = "http"
-	default:
-		return fmt.Errorf("invalid triage_mode %q: must be off or http", c.TriageMode)
-	}
-	if c.MaxPromptByte <= 0 {
-		return fmt.Errorf("max_prompt_bytes must be positive, got %d", c.MaxPromptByte)
-	}
-	if c.TriageMode == "http" {
-		if c.MaxPromptByte < MinMaxPromptBytes {
-			return fmt.Errorf("max_prompt_bytes must be at least %d when triage_mode=http to fit required prompt framing, got %d", MinMaxPromptBytes, c.MaxPromptByte)
-		}
-		if strings.TrimSpace(c.InferenceAddr) == "" {
-			return fmt.Errorf("triage_mode \"http\" requires a non-empty inference_http address")
-		}
-	}
-	if c.TriageMaxTokens < 16 || c.TriageMaxTokens > 256 {
-		return fmt.Errorf("triage_max_tokens must be between 16 and 256, got %d", c.TriageMaxTokens)
+	var err error
+	c.TriageMode, err = validateInferenceSlot(
+		"triage_mode", c.TriageMode,
+		"inference_http", c.InferenceAddr,
+		"triage_max_tokens", c.TriageMaxTokens,
+		"triage_timeout_sec", c.TriageTimeoutSec,
+		"adapter_path", &c.AdapterPath,
+		c.MaxPromptByte,
+	)
+	if err != nil {
+		return err
 	}
 	if math.IsNaN(c.TriageTemperature) || math.IsInf(c.TriageTemperature, 0) || c.TriageTemperature < 0 || c.TriageTemperature > 1.0 {
 		return fmt.Errorf("triage_temperature must be finite and in [0.0, 1.0], got %v", c.TriageTemperature)
 	}
-	if c.TriageTimeoutSec < 5 || c.TriageTimeoutSec > 300 {
-		return fmt.Errorf("triage_timeout_sec must be between 5 and 300, got %d", c.TriageTimeoutSec)
+
+	if _, err := model.ValidateBaseModel(c.EscalationBaseModel); err != nil {
+		return fmt.Errorf("invalid escalation_base_model: %w", err)
 	}
-	c.AdapterPath = strings.TrimSpace(c.AdapterPath)
-	if trimmedAdapter := c.AdapterPath; trimmedAdapter != "" {
-		for _, r := range trimmedAdapter {
-			if unicode.IsControl(r) {
-				return fmt.Errorf("adapter_path %q must not contain control characters", c.AdapterPath)
-			}
-		}
-		if strings.HasPrefix(trimmedAdapter, "/") || strings.ContainsRune(trimmedAdapter, '\\') ||
-			(len(trimmedAdapter) >= 2 && trimmedAdapter[1] == ':') {
-			return fmt.Errorf("adapter_path %q must be a relative forward-slash path under artifacts/", c.AdapterPath)
-		}
-		for _, seg := range strings.Split(trimmedAdapter, "/") {
-			if seg == ".." {
-				return fmt.Errorf("adapter_path %q must not contain path traversal segments", c.AdapterPath)
-			}
-		}
-		cleanedAdapter := path.Clean(trimmedAdapter)
-		if cleanedAdapter == "." || cleanedAdapter == ".." || strings.HasPrefix(cleanedAdapter, "../") ||
-			strings.HasPrefix(cleanedAdapter, "/") || (len(cleanedAdapter) >= 2 && cleanedAdapter[1] == ':') {
-			return fmt.Errorf("adapter_path %q must be a relative forward-slash path under artifacts/", c.AdapterPath)
-		}
+	c.EscalationMode, err = validateInferenceSlot(
+		"escalation_mode", c.EscalationMode,
+		"escalation_inference_http", c.EscalationInferenceAddr,
+		"escalation_max_tokens", c.EscalationMaxTokens,
+		"escalation_timeout_sec", c.EscalationTimeoutSec,
+		"escalation_adapter_path", &c.EscalationAdapterPath,
+		c.MaxPromptByte,
+	)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(c.EscalationPolicy)) {
+	case "", EscalationPolicyHighCritical:
+		c.EscalationPolicy = EscalationPolicyHighCritical
+	case EscalationPolicyStrict:
+		c.EscalationPolicy = EscalationPolicyStrict
+	case EscalationPolicyAlways:
+		c.EscalationPolicy = EscalationPolicyAlways
+	default:
+		return fmt.Errorf("invalid escalation_policy %q: must be high_critical, strict, or always", c.EscalationPolicy)
+	}
+	if math.IsNaN(c.EscalationConfidenceFloor) || math.IsInf(c.EscalationConfidenceFloor, 0) ||
+		c.EscalationConfidenceFloor < 0 || c.EscalationConfidenceFloor > 1.0 {
+		return fmt.Errorf("escalation_confidence_floor must be finite and in [0.0, 1.0], got %v", c.EscalationConfidenceFloor)
 	}
 
 	if !c.AllowAllInterfaces && security.IsBindingAllInterfaces(c.HTTPAddr) {
@@ -236,11 +255,12 @@ func (c *Config) Validate() error {
 
 	if !c.AllowRemoteEndpoints {
 		endpoints := map[string]string{
-			"genesis_http":   c.GenesisHTTPAddr,
-			"genesis_tcp":    c.GenesisTCPAddr,
-			"surprisal_http": c.SurprisalHTTPAddr,
-			"ftaas_api_http": c.FTaaSAPIAddr,
-			"inference_http": c.InferenceAddr,
+			"genesis_http":              c.GenesisHTTPAddr,
+			"genesis_tcp":               c.GenesisTCPAddr,
+			"surprisal_http":            c.SurprisalHTTPAddr,
+			"ftaas_api_http":            c.FTaaSAPIAddr,
+			"inference_http":            c.InferenceAddr,
+			"escalation_inference_http": c.EscalationInferenceAddr,
 		}
 		for name, addr := range endpoints {
 			if addr != "" && !security.IsLoopbackEndpoint(addr) {
@@ -250,6 +270,48 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func validateInferenceSlot(
+	modeField, rawMode string,
+	addrField, addr string,
+	tokensField string, maxTokens int,
+	timeoutField string, timeoutSec int,
+	adapterField string, adapterPtr *string,
+	maxPromptBytes int,
+) (string, error) {
+	if maxPromptBytes <= 0 {
+		return "", fmt.Errorf("max_prompt_bytes must be positive, got %d", maxPromptBytes)
+	}
+	mode := strings.ToLower(strings.TrimSpace(rawMode))
+	switch mode {
+	case "", "off":
+		mode = "off"
+	case "http":
+		mode = "http"
+	default:
+		return "", fmt.Errorf("invalid %s %q: must be off or http", modeField, rawMode)
+	}
+	if mode == "http" {
+		if maxPromptBytes < MinMaxPromptBytes {
+			return "", fmt.Errorf("max_prompt_bytes must be at least %d when %s=http to fit required prompt framing, got %d", MinMaxPromptBytes, modeField, maxPromptBytes)
+		}
+		if strings.TrimSpace(addr) == "" {
+			return "", fmt.Errorf("%s \"http\" requires a non-empty %s address", modeField, addrField)
+		}
+	}
+	if maxTokens < 16 || maxTokens > 256 {
+		return "", fmt.Errorf("%s must be between 16 and 256, got %d", tokensField, maxTokens)
+	}
+	if timeoutSec < 5 || timeoutSec > 300 {
+		return "", fmt.Errorf("%s must be between 5 and 300, got %d", timeoutField, timeoutSec)
+	}
+	cleanAdapter, err := model.ValidateAdapterPath(*adapterPtr)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", adapterField, err)
+	}
+	*adapterPtr = cleanAdapter
+	return mode, nil
 }
 
 func loadFromFile(cfg *Config, path string) error {
@@ -361,6 +423,39 @@ func loadFromEnv(cfg *Config) {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.MaxMemMB = n
 		}
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_MODE"); v != "" {
+		cfg.EscalationMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_INFERENCE_HTTP"); v != "" {
+		cfg.EscalationInferenceAddr = v
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_BASE_MODEL"); v != "" {
+		cfg.EscalationBaseModel = v
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_ADAPTER_PATH"); v != "" {
+		cfg.EscalationAdapterPath = v
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_POLICY"); v != "" {
+		cfg.EscalationPolicy = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EscalationMaxTokens = n
+		}
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.EscalationTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("SENTINEL_ESCALATION_CONFIDENCE_FLOOR"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.EscalationConfidenceFloor = f
+		}
+	}
+	if v := os.Getenv("SENTINEL_AUTO_RELOAD_ADAPTER"); v != "" {
+		cfg.AutoReloadAdapter = parseBool(v)
 	}
 }
 

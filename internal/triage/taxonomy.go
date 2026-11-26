@@ -221,6 +221,7 @@ type PromptInput struct {
 	SurprisalNats        float64
 	SurprisalThreshold   float64
 	TopSurprisalFeatures map[string]float64
+	CorrelatedWindows    []string
 	InjectionSuspected   bool
 	InjectionSignals     []string
 }
@@ -277,34 +278,9 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	cleanTmpl = defangFenceMarkers(sanitizeSingleLine(cleanTmpl, maxPromptBytes))
 	cleanSample = defangFenceMarkers(sanitizeSingleLine(cleanSample, maxPromptBytes))
 
-	rulesStr := "none"
-	if len(in.RuleIDs) > 0 {
-		cleanRules := make([]string, 0, len(in.RuleIDs))
-		for _, r := range in.RuleIDs {
-			sr, rSigs := security.SanitizeUntrustedLogText(r, 96)
-			metaSignals = append(metaSignals, rSigs...)
-			if c := defangFenceMarkers(sanitizeSingleLine(sr, 48)); c != "" {
-				cleanRules = append(cleanRules, c)
-			}
-		}
-		if len(cleanRules) > 0 {
-			rulesStr = strings.Join(cleanRules, ",")
-		}
-	}
-	catsStr := "none"
-	if len(in.Categories) > 0 {
-		cleanCats := make([]string, 0, len(in.Categories))
-		for _, c := range in.Categories {
-			sc, cSigs := security.SanitizeUntrustedLogText(c, 96)
-			metaSignals = append(metaSignals, cSigs...)
-			if cc := defangFenceMarkers(sanitizeSingleLine(sc, 48)); cc != "" {
-				cleanCats = append(cleanCats, cc)
-			}
-		}
-		if len(cleanCats) > 0 {
-			catsStr = strings.Join(cleanCats, ",")
-		}
-	}
+	rulesStr := joinSanitizedPromptTokens(in.RuleIDs, 96, 48, 0, "none", &metaSignals)
+	catsStr := joinSanitizedPromptTokens(in.Categories, 96, 48, 0, "none", &metaSignals)
+	corrStr := joinSanitizedPromptTokens(in.CorrelatedWindows, 128, 96, 4, "", &metaSignals)
 
 	topFeatStr, featSigs := formatTopFeatures(in.TopSurprisalFeatures)
 	metaSignals = append(metaSignals, featSigs...)
@@ -314,6 +290,9 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 		cleanSvc, cleanLvl, in.Count, clampFinite(in.SampleEntropy),
 		clampFinite(in.SurprisalNats), clampFinite(in.SurprisalThreshold),
 		rulesStr, catsStr)
+	if corrStr != "" {
+		metaLine += " correlated=" + corrStr
+	}
 	if topFeatStr != "" {
 		metaLine += " top_features=" + topFeatStr
 	}
@@ -508,6 +487,27 @@ func defangFenceMarkers(s string) string {
 	s = beginFenceRe.ReplaceAllString(s, "[BEGIN_MARKER]")
 	s = endFenceRe.ReplaceAllString(s, "[END_MARKER]")
 	return s
+}
+
+func joinSanitizedPromptTokens(items []string, rawLimit, itemLimit, maxItems int, emptyFallback string, metaSignals *[]string) string {
+	if len(items) == 0 {
+		return emptyFallback
+	}
+	clean := make([]string, 0, len(items))
+	for _, raw := range items {
+		sr, sigs := security.SanitizeUntrustedLogText(raw, rawLimit)
+		*metaSignals = append(*metaSignals, sigs...)
+		if c := defangFenceMarkers(sanitizeSingleLine(sr, itemLimit)); c != "" {
+			clean = append(clean, c)
+			if maxItems > 0 && len(clean) >= maxItems {
+				break
+			}
+		}
+	}
+	if len(clean) == 0 {
+		return emptyFallback
+	}
+	return strings.Join(clean, ",")
 }
 
 func sanitizeSingleLine(s string, maxBytes int) string {

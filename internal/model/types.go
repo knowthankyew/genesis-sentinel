@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 	"unicode"
@@ -85,6 +86,37 @@ func ValidateBaseModel(modelID string) (ModelSpec, error) {
 		return ModelSpec{}, fmt.Errorf("%w: %q", ErrUnsupportedModel, trimmed)
 	}
 	return spec, nil
+}
+
+// ValidateAdapterPath checks that a LoRA adapter path conforms to FTaaS relative path
+// confinement rules (no absolute paths, no ".." traversal segments, no control characters).
+func ValidateAdapterPath(rel string) (string, error) {
+	trimmed := strings.TrimSpace(rel)
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, r := range trimmed {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("invalid adapter path: contains control characters")
+		}
+	}
+	// Reject Windows drive prefixes or backslashes that could confuse cross-platform path resolution.
+	if strings.ContainsRune(trimmed, '\\') || (len(trimmed) >= 2 && trimmed[1] == ':') {
+		return "", fmt.Errorf("invalid adapter path %q: must use relative forward-slash segments", rel)
+	}
+	if strings.HasPrefix(trimmed, "/") {
+		return "", fmt.Errorf("invalid adapter path %q: must be relative under artifacts/", rel)
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == ".." {
+			return "", fmt.Errorf("invalid adapter path %q: path traversal is prohibited", rel)
+		}
+	}
+	cleaned := path.Clean(trimmed)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || (len(cleaned) >= 2 && cleaned[1] == ':') {
+		return "", fmt.Errorf("invalid adapter path %q: escapes artifacts directory", rel)
+	}
+	return cleaned, nil
 }
 
 // LogEvent mirrors Genesis's parser.LogEntry wire contract over /query and /tail.

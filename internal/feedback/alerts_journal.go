@@ -193,6 +193,17 @@ func (j *AlertJournal) UpdateIfPresent(alert emit.Alert) error {
 	return j.writeAtomicLocked(updated)
 }
 
+func redactStringSlice(items []string) []string {
+	if len(items) == 0 {
+		return items
+	}
+	out := make([]string, len(items))
+	for i, item := range items {
+		out[i], _ = RedactText(item)
+	}
+	return out
+}
+
 func redactAlertForPersistence(a emit.Alert) emit.Alert {
 	a.Service, _ = RedactText(a.Service)
 	a.TraceID, _ = RedactText(a.TraceID)
@@ -205,27 +216,13 @@ func redactAlertForPersistence(a emit.Alert) emit.Alert {
 	a.TriageExplanation, _ = RedactText(a.TriageExplanation)
 	a.TriageModel, _ = RedactText(a.TriageModel)
 	a.TriageAdapter, _ = RedactText(a.TriageAdapter)
-	if len(a.RuleIDs) > 0 {
-		out := make([]string, len(a.RuleIDs))
-		for i, r := range a.RuleIDs {
-			out[i], _ = RedactText(r)
-		}
-		a.RuleIDs = out
-	}
-	if len(a.Categories) > 0 {
-		out := make([]string, len(a.Categories))
-		for i, c := range a.Categories {
-			out[i], _ = RedactText(c)
-		}
-		a.Categories = out
-	}
-	if len(a.InjectionSignals) > 0 {
-		out := make([]string, len(a.InjectionSignals))
-		for i, s := range a.InjectionSignals {
-			out[i], _ = RedactText(s)
-		}
-		a.InjectionSignals = out
-	}
+	a.TriageEscalationReason, _ = RedactText(a.TriageEscalationReason)
+	a.TriagePrimaryModel, _ = RedactText(a.TriagePrimaryModel)
+	a.TriagePrimaryAdapter, _ = RedactText(a.TriagePrimaryAdapter)
+	a.RuleIDs = redactStringSlice(a.RuleIDs)
+	a.Categories = redactStringSlice(a.Categories)
+	a.InjectionSignals = redactStringSlice(a.InjectionSignals)
+	a.CorrelatedWindows = redactStringSlice(a.CorrelatedWindows)
 	if len(a.TopSurprisalFeatures) > 0 {
 		out := make(map[string]float64, len(a.TopSurprisalFeatures))
 		for k, v := range a.TopSurprisalFeatures {

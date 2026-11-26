@@ -39,6 +39,10 @@ type ScanReport struct {
 	TriageEvaluated          uint64       `json:"triage_evaluated"`
 	TriageFallbacks          uint64       `json:"triage_fallbacks"`
 	TriageInjectionOverrides uint64       `json:"triage_injection_overrides"`
+	EscalationMode           string       `json:"escalation_mode"`
+	EscalationsTriggered     uint64       `json:"escalations_triggered"`
+	EscalationEvaluated      uint64       `json:"escalation_evaluated"`
+	EscalationFallbacks      uint64       `json:"escalation_fallbacks"`
 	CorruptedFrames          uint64       `json:"corrupted_frames"`
 	HeapBytes                uint64       `json:"heap_bytes"`
 	Alerts                   []emit.Alert `json:"alerts"`
@@ -61,6 +65,12 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	baseModel := fs.String("base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
 	adapterPath := fs.String("adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
 	triageTimeout := fs.Int("triage-timeout", 0, "Tier 2 flush-wide inference budget in seconds (5-300, default 45)")
+	escalationMode := fs.String("escalation-mode", "", "Phase 5 escalation inference mode: off | http")
+	escalationInferenceHTTP := fs.String("escalation-inference-http", "", "Loopback URL for Gemma 2 2B IT escalation inference (:8001)")
+	escalationBaseModel := fs.String("escalation-base-model", "", "Allowlisted escalation base model (default google/gemma-2-2b-it)")
+	escalationAdapterPath := fs.String("escalation-adapter-path", "", "Relative LoRA adapter path for escalation slot")
+	escalationPolicy := fs.String("escalation-policy", "", "Escalation policy: high_critical | strict | always")
+	escalationTimeout := fs.Int("escalation-timeout", 0, "Escalation flush-wide inference budget in seconds (5-300, default 90)")
 	windowEvents := fs.Int("window-events", 0, "Optional event batch size per window flush during offline replay (0 = single flush)")
 	asJSON := fs.Bool("json", false, "Emit full ScanReport as JSON")
 	emitGenesis := fs.Bool("emit-genesis", false, "Also emit detected alerts to Genesis TCP ingest")
@@ -95,6 +105,20 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		case "triage-timeout":
 			if *triageTimeout > 0 {
 				cfg.TriageTimeoutSec = *triageTimeout
+			}
+		case "escalation-mode":
+			cfg.EscalationMode = *escalationMode
+		case "escalation-inference-http":
+			cfg.EscalationInferenceAddr = *escalationInferenceHTTP
+		case "escalation-base-model":
+			cfg.EscalationBaseModel = *escalationBaseModel
+		case "escalation-adapter-path":
+			cfg.EscalationAdapterPath = *escalationAdapterPath
+		case "escalation-policy":
+			cfg.EscalationPolicy = *escalationPolicy
+		case "escalation-timeout":
+			if *escalationTimeout > 0 {
+				cfg.EscalationTimeoutSec = *escalationTimeout
 			}
 		}
 	})
@@ -207,6 +231,10 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		TriageEvaluated:          st.TriageEvaluated,
 		TriageFallbacks:          st.TriageFallbacks,
 		TriageInjectionOverrides: st.TriageInjectionOverrides,
+		EscalationMode:           st.EscalationMode,
+		EscalationsTriggered:     st.EscalationsTriggered,
+		EscalationEvaluated:      st.EscalationEvaluated,
+		EscalationFallbacks:      st.EscalationFallbacks,
 		CorruptedFrames:          st.CorruptedFrames,
 		HeapBytes:                st.HeapBytes,
 		Alerts:                   alerts,
@@ -236,8 +264,9 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 				report.SurprisalMode, report.SurprisalScored, report.SurprisalAnomalies, report.SurprisalMaxNats, report.SurprisalBaselineCases)
 		},
 		func() error {
-			return writef("  Tier 2 Triage   : mode=%s evaluated=%d fallbacks=%d injection_overrides=%d\n",
-				report.TriageMode, report.TriageEvaluated, report.TriageFallbacks, report.TriageInjectionOverrides)
+			return writef("  Tier 2 Triage   : mode=%s evaluated=%d fallbacks=%d injection_overrides=%d (escalation=%s triggered=%d eval=%d)\n",
+				report.TriageMode, report.TriageEvaluated, report.TriageFallbacks, report.TriageInjectionOverrides,
+				report.EscalationMode, report.EscalationsTriggered, report.EscalationEvaluated)
 		},
 		func() error {
 			return writef("  Elapsed         : %.2f ms (%.0f lines/sec)\n", report.ElapsedMs, report.ThroughputLPS)

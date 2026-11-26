@@ -35,26 +35,33 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 
 	var (
-		configPath         string
-		genesisDataDir     string
-		genesisHTTP        string
-		genesisTCP         string
-		httpAddr           string
-		dataDir            string
-		windowStr          string
-		rulesPath          string
-		surprisalMode      string
-		surprisalHTTP      string
-		surprisalThreshold float64
-		baselineSize       int
-		triageMode         string
-		inferenceHTTP      string
-		baseModel          string
-		adapterPath        string
-		triageTimeout      int
-		pollInterval       time.Duration
-		dryRun             bool
-		stdoutAlerts       bool
+		configPath              string
+		genesisDataDir          string
+		genesisHTTP             string
+		genesisTCP              string
+		httpAddr                string
+		dataDir                 string
+		windowStr               string
+		rulesPath               string
+		surprisalMode           string
+		surprisalHTTP           string
+		surprisalThreshold      float64
+		baselineSize            int
+		triageMode              string
+		inferenceHTTP           string
+		baseModel               string
+		adapterPath             string
+		triageTimeout           int
+		escalationMode          string
+		escalationInferenceHTTP string
+		escalationBaseModel     string
+		escalationAdapterPath   string
+		escalationPolicy        string
+		escalationTimeout       int
+		autoReloadAdapter       bool
+		pollInterval            time.Duration
+		dryRun                  bool
+		stdoutAlerts            bool
 	)
 
 	fs.StringVar(&configPath, "config", "", "Path to sentinel.json config file")
@@ -74,6 +81,13 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&baseModel, "base-model", "", "Allowlisted Tier 2 base model (default SmolLM2-135M-Instruct)")
 	fs.StringVar(&adapterPath, "adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
 	fs.IntVar(&triageTimeout, "triage-timeout", 0, "Tier 2 flush-wide inference budget in seconds (5-300, default 45)")
+	fs.StringVar(&escalationMode, "escalation-mode", "", "Phase 5 escalation inference mode: off | http")
+	fs.StringVar(&escalationInferenceHTTP, "escalation-inference-http", "", "Loopback URL for Gemma 2 2B IT escalation inference (:8001)")
+	fs.StringVar(&escalationBaseModel, "escalation-base-model", "", "Allowlisted escalation base model (default google/gemma-2-2b-it)")
+	fs.StringVar(&escalationAdapterPath, "escalation-adapter-path", "", "Relative LoRA adapter path for escalation slot")
+	fs.StringVar(&escalationPolicy, "escalation-policy", "", "Escalation policy: high_critical | strict | always")
+	fs.IntVar(&escalationTimeout, "escalation-timeout", 0, "Escalation flush-wide inference budget in seconds (5-300, default 90)")
+	fs.BoolVar(&autoReloadAdapter, "auto-reload-adapter", true, "Automatically hot-reload active-adapter.json changes on disk during watch")
 	fs.DurationVar(&pollInterval, "poll-interval", 250*time.Millisecond, "Polling interval for new .seg frames or /query windows")
 	fs.BoolVar(&dryRun, "dry-run", false, "Print alerts to stdout instead of emitting to Genesis TCP")
 	fs.BoolVar(&stdoutAlerts, "stdout-alerts", false, "Mirror emitted alerts to stdout in addition to Genesis TCP")
@@ -92,6 +106,8 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 
 	adapterPathExplicit := false
 	baseModelExplicit := false
+	escalationAdapterExplicit := false
+	escalationModelExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "genesis-data-dir":
@@ -130,27 +146,56 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			if triageTimeout > 0 {
 				cfg.TriageTimeoutSec = triageTimeout
 			}
+		case "escalation-mode":
+			cfg.EscalationMode = escalationMode
+		case "escalation-inference-http":
+			cfg.EscalationInferenceAddr = escalationInferenceHTTP
+		case "escalation-base-model":
+			cfg.EscalationBaseModel = escalationBaseModel
+			escalationModelExplicit = true
+		case "escalation-adapter-path":
+			cfg.EscalationAdapterPath = escalationAdapterPath
+			escalationAdapterExplicit = true
+		case "escalation-policy":
+			cfg.EscalationPolicy = escalationPolicy
+		case "escalation-timeout":
+			if escalationTimeout > 0 {
+				cfg.EscalationTimeoutSec = escalationTimeout
+			}
+		case "auto-reload-adapter":
+			cfg.AutoReloadAdapter = autoReloadAdapter
 		}
 	})
 
-	// Auto-load persisted active LoRA adapter manifest only when --adapter-path was omitted
-	// and no adapter_path is configured (explicit `--adapter-path=` disables auto-load).
-	// If --base-model was explicitly set to a different model than the manifest's base_model,
-	// decline to pair an incompatible adapter and warn the operator at startup.
+	// Auto-load persisted active LoRA adapter manifest for primary and/or escalation slots when
+	// omitted in flags/config, declining mismatched model pairs cleanly.
 	var adapterManifestLoadErr error
 	var adapterManifestMismatchMsg string
-	if !adapterPathExplicit && cfg.AdapterPath == "" && cfg.DataDir != "" {
+	if cfg.DataDir != "" && ((!adapterPathExplicit && cfg.AdapterPath == "") || (!escalationAdapterExplicit && cfg.EscalationAdapterPath == "")) {
 		active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir)
 		if loadErr != nil {
 			adapterManifestLoadErr = loadErr
 		} else if exists {
-			if baseModelExplicit && active.BaseModel != "" && !strings.EqualFold(active.BaseModel, cfg.BaseModel) {
-				adapterManifestMismatchMsg = fmt.Sprintf("skipping persisted adapter %q trained for %s because --base-model=%s was explicitly requested",
-					active.AdapterPath, active.BaseModel, cfg.BaseModel)
-			} else {
-				cfg.AdapterPath = active.AdapterPath
-				if !baseModelExplicit && active.BaseModel != "" {
-					cfg.BaseModel = active.BaseModel
+			if !adapterPathExplicit && cfg.AdapterPath == "" && active.AdapterPath != "" {
+				if baseModelExplicit && active.BaseModel != "" && !strings.EqualFold(active.BaseModel, cfg.BaseModel) {
+					adapterManifestMismatchMsg = fmt.Sprintf("skipping persisted adapter %q trained for %s because --base-model=%s was explicitly requested",
+						active.AdapterPath, active.BaseModel, cfg.BaseModel)
+				} else {
+					cfg.AdapterPath = active.AdapterPath
+					if !baseModelExplicit && active.BaseModel != "" {
+						cfg.BaseModel = active.BaseModel
+					}
+				}
+			}
+			if !escalationAdapterExplicit && cfg.EscalationAdapterPath == "" && active.Escalation != nil {
+				if escalationModelExplicit && active.Escalation.BaseModel != "" && !strings.EqualFold(active.Escalation.BaseModel, cfg.EscalationBaseModel) {
+					adapterManifestMismatchMsg = strings.TrimSpace(adapterManifestMismatchMsg + fmt.Sprintf(" skipping persisted escalation adapter %q trained for %s because --escalation-base-model=%s was explicitly requested",
+						active.Escalation.AdapterPath, active.Escalation.BaseModel, cfg.EscalationBaseModel))
+				} else {
+					cfg.EscalationAdapterPath = active.Escalation.AdapterPath
+					if !escalationModelExplicit && active.Escalation.BaseModel != "" {
+						cfg.EscalationBaseModel = active.Escalation.BaseModel
+					}
 				}
 			}
 		}
@@ -258,6 +303,12 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	} else {
 		logger.Printf("[Tier2]  LoRA Triage Mode  : off (enable via --triage-mode http; default model %s)", cfg.BaseModel)
 	}
+	if cfg.EscalationMode == "http" {
+		logger.Printf("[Tier2+] Escalation Mode   : http (%s) | Model: %s | Adapter: %q | Policy: %s",
+			cfg.EscalationInferenceAddr, cfg.EscalationBaseModel, cfg.EscalationAdapterPath, cfg.EscalationPolicy)
+	} else {
+		logger.Printf("[Tier2+] Escalation Mode   : off (enable via --escalation-mode http; default model %s)", cfg.EscalationBaseModel)
+	}
 	if activeSource == "segdir" {
 		logger.Printf("[Source] Lossless .seg Dir : %s (cursor: %s)", cfg.GenesisDataDir, cursorPath)
 	} else {
@@ -268,11 +319,16 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	} else {
 		logger.Printf("[Sink]   Genesis TCP Alert : %s (service=%s)", cfg.GenesisTCPAddr, cfg.AlertServiceName)
 	}
-	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v", cfg.WindowDuration, pollInterval)
+	logger.Printf("[Window] Flush Interval    : %v | Poll Interval: %v | Auto-Reload Adapter: %v", cfg.WindowDuration, pollInterval, cfg.AutoReloadAdapter)
 
 	writeTimeout := 15 * time.Second
 	if cfg.TriageMode == "http" && cfg.TriageTimeoutSec > 0 {
 		if want := time.Duration(cfg.TriageTimeoutSec+5) * time.Second; want > writeTimeout {
+			writeTimeout = want
+		}
+	}
+	if cfg.EscalationMode == "http" && cfg.EscalationTimeoutSec > 0 {
+		if want := time.Duration(cfg.EscalationTimeoutSec+5) * time.Second; want > writeTimeout {
 			writeTimeout = want
 		}
 	}
@@ -299,6 +355,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 
 	flushTicker := time.NewTicker(cfg.WindowDuration)
 	defer flushTicker.Stop()
+
+	adapterReloadTicker := time.NewTicker(time.Second)
+	defer adapterReloadTicker.Stop()
 
 	// Track unsaved cursor progress so transient SaveCursor errors retry on subsequent idle polls.
 	cursorDirty := false
@@ -378,6 +437,15 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			}
 			if saveErr := pipe.SaveBaseline(baselinePath, false); saveErr != nil {
 				logger.Printf("[Tier1] baseline save error (will retry on next flush): %v", saveErr)
+			}
+
+		case <-adapterReloadTicker.C:
+			if reloaded, reloadErr := pipe.SyncActiveAdapterFromDisk(); reloadErr != nil {
+				logger.Printf("[Adapter] Warning: failed auto-reloading active-adapter.json: %v", reloadErr)
+			} else if reloaded {
+				st := pipe.Stats()
+				logger.Printf("[Adapter] Auto-reloaded manifest on disk (primary=%q escalation=%q swaps=%d)",
+					st.TriageAdapter, st.EscalationAdapter, st.AdapterSwapsTotal)
 			}
 		}
 	}

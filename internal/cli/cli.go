@@ -15,7 +15,7 @@ import (
 )
 
 // Version identifies the current Genesis Sentinel release stage.
-const Version = "0.5.0-phase4"
+const Version = "0.6.0-phase5"
 
 // openDirFn launches the OS file manager for `sentinel data open` (overridable in tests).
 var openDirFn = openDirectoryOS
@@ -42,6 +42,8 @@ func ExecuteWithOutput(args []string, stdout, stderr io.Writer) error {
 		return runFeedback(args[1:], stdout, stderr)
 	case "train":
 		return runTrain(args[1:], stdout, stderr)
+	case "adapter":
+		return runAdapter(args[1:], stdout, stderr)
 	case "stats":
 		return runStats(args[1:], stdout, stderr)
 	case "burn":
@@ -195,6 +197,7 @@ Commands:
   scan      Run an offline scan over Genesis .seg files, raw log files, or synthetic replay
   feedback  Label alerts as true/false positives, seed starter data, and export redacted JSONL
   train     Audit/submit redacted feedback datasets to local FTaaS and activate LoRA adapters
+  adapter   Inspect, hot-swap, verify, roll back, or deactivate live Tier 2 LoRA adapters
   stats     Display live pipeline throughput, surprisal, triage, and alert metrics
   burn      Purge Sentinel disk state, baselines, alert journals, and unexported feedback queues
   data      Inspect or open Sentinel's local data directory (path | status | open)

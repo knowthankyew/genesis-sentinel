@@ -10,12 +10,10 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"path"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/model"
@@ -130,32 +128,7 @@ type Client struct {
 // ValidateAdapterPath checks that a LoRA adapter path conforms to FTaaS's relative path
 // confinement rule (no absolute paths, no ".." traversal segments, no control characters).
 func ValidateAdapterPath(rel string) (string, error) {
-	trimmed := strings.TrimSpace(rel)
-	if trimmed == "" {
-		return "", nil
-	}
-	for _, r := range trimmed {
-		if unicode.IsControl(r) {
-			return "", fmt.Errorf("invalid adapter path: contains control characters")
-		}
-	}
-	// Reject Windows drive prefixes or backslashes that could confuse cross-platform path resolution.
-	if strings.ContainsRune(trimmed, '\\') || (len(trimmed) >= 2 && trimmed[1] == ':') {
-		return "", fmt.Errorf("invalid adapter path %q: must use relative forward-slash segments", rel)
-	}
-	if strings.HasPrefix(trimmed, "/") {
-		return "", fmt.Errorf("invalid adapter path %q: must be relative under artifacts/", rel)
-	}
-	for _, seg := range strings.Split(trimmed, "/") {
-		if seg == ".." {
-			return "", fmt.Errorf("invalid adapter path %q: path traversal is prohibited", rel)
-		}
-	}
-	cleaned := path.Clean(trimmed)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || (len(cleaned) >= 2 && cleaned[1] == ':') {
-		return "", fmt.Errorf("invalid adapter path %q: escapes artifacts directory", rel)
-	}
-	return cleaned, nil
+	return model.ValidateAdapterPath(rel)
 }
 
 // NewClient constructs a validated Tier 2 inference client.
@@ -290,6 +263,11 @@ func (c *Client) BaseModel() string {
 	return c.baseModel
 }
 
+// RedactedURL returns the inference base URL with any userinfo stripped for safe diagnostics.
+func (c *Client) RedactedURL() string {
+	return c.redactedURL
+}
+
 // SetModelAndAdapter atomically validates and hot-swaps both the active base model and
 // LoRA adapter path under a single lock so concurrent readers never observe a torn pair.
 func (c *Client) SetModelAndAdapter(baseModel, relPath string) error {
@@ -379,6 +357,26 @@ func (c *Client) Health(ctx context.Context) (HealthStatus, error) {
 	var st HealthStatus
 	if err := json.Unmarshal(body, &st); err != nil {
 		return HealthStatus{}, fmt.Errorf("decode inference /healthz: %w", err)
+	}
+	return st, nil
+}
+
+// VerifyHealth validates that the inference endpoint is healthy, has a loaded base model,
+// and (when expectedBaseModel is non-empty) serves that exact base model.
+func (c *Client) VerifyHealth(ctx context.Context, expectedBaseModel string) (HealthStatus, error) {
+	st, err := c.Health(ctx)
+	if err != nil {
+		return st, err
+	}
+	status := strings.TrimSpace(st.Status)
+	if !strings.EqualFold(status, "healthy") && !strings.EqualFold(status, "ok") {
+		return st, fmt.Errorf("inference server reported unhealthy status %q", st.Status)
+	}
+	if !st.BaseModelLoaded {
+		return st, fmt.Errorf("inference server reported base model %q is not loaded", st.BaseModel)
+	}
+	if want := strings.TrimSpace(expectedBaseModel); want != "" && strings.TrimSpace(st.BaseModel) != want {
+		return st, fmt.Errorf("inference server serves %q, expected %q", st.BaseModel, want)
 	}
 	return st, nil
 }

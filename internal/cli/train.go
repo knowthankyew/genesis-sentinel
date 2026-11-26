@@ -13,7 +13,6 @@ import (
 
 	"github.com/knowthankyew/genesis-sentinel/internal/config"
 	"github.com/knowthankyew/genesis-sentinel/internal/feedback"
-	"github.com/knowthankyew/genesis-sentinel/internal/security"
 	"github.com/knowthankyew/genesis-sentinel/internal/train"
 )
 
@@ -84,6 +83,9 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	wait := fs.Bool("wait", false, "Poll FTaaS until training job completes")
 	pollInterval := fs.Duration("poll-interval", 3*time.Second, "Polling interval when --wait is enabled")
 	activate := fs.Bool("activate", false, "Persist active-adapter.json once --wait completes (and hot-reload daemon if --sentinel-http is set)")
+	slot := fs.String("slot", train.SlotPrimary, "Target slot when --activate is set: primary | escalation")
+	verify := fs.Bool("verify", false, "Preflight verify /healthz when --activate notifies --sentinel-http")
+	enable := fs.Bool("enable", false, "Dynamically enable slot inference client if off during live activation")
 	sentinelHTTP := fs.String("sentinel-http", "", "Optional running Sentinel HTTP URL for live POST /adapter hot-swap")
 	authToken := fs.String("auth-token", "", "Optional Bearer token for running Sentinel HTTP API")
 	allowRemote := fs.Bool("allow-remote", false, "Allow non-loopback FTaaS/Sentinel endpoints")
@@ -213,40 +215,40 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 		if strings.TrimSpace(finalJob.AdapterPath) == "" {
 			return fmt.Errorf("FTaaS job %s completed (%s) but returned an empty adapterPath; cannot activate", finalJob.JobID, finalJob.Status)
 		}
-		state := train.ActiveAdapter{
+		normSlot, slotErr := train.NormalizeSlot(*slot, false)
+		if slotErr != nil {
+			return slotErr
+		}
+		slotState := train.AdapterSlot{
 			JobID:       finalJob.JobID,
 			BaseModel:   finalJob.BaseModel,
 			AdapterPath: finalJob.AdapterPath,
 			DatasetHash: finalJob.DatasetHash,
 			ActivatedAt: time.Now().UTC(),
 		}
-		// Notify a running daemon BEFORE updating any local manifest so a 401/rejection never
-		// writes an unactivated adapter, and skip redundant unserialized local writes when the
-		// daemon already persisted active-adapter.json under its exclusive activation lock.
-		daemonSavedSameDir := false
-		daemonActivated := false
-		if strings.TrimSpace(*sentinelHTTP) != "" {
-			token := *authToken
-			if token == "" {
-				token = cfg.AuthToken
+		token := resolveAuthToken(*authToken, cfg.AuthToken)
+		if _, actErr := activateSlotWithOptionalDaemon(
+			ctx,
+			cfg.DataDir,
+			normSlot,
+			slotState,
+			strings.TrimSpace(*sentinelHTTP),
+			token,
+			cfg.AllowRemoteEndpoints,
+			*verify,
+			*enable,
+		); actErr != nil {
+			if strings.TrimSpace(*sentinelHTTP) != "" {
+				return fmt.Errorf("notify running Sentinel daemon: %w", actErr)
 			}
-			daemonDir, err := train.NotifyDaemonAdapter(ctx, *sentinelHTTP, token, state, cfg.AllowRemoteEndpoints)
-			if err != nil {
-				return fmt.Errorf("notify running Sentinel daemon: %w", err)
-			}
-			daemonActivated = true
-			if security.IsLoopbackEndpoint(*sentinelHTTP) {
-				daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
-			}
+			return fmt.Errorf("save active adapter: %w", actErr)
 		}
-		if !daemonSavedSameDir {
-			if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-				if daemonActivated {
-					return fmt.Errorf("running Sentinel daemon already activated adapter %q (job %s), but saving local manifest to %q failed (retry with `sentinel train activate --adapter-path %s --job-id %s` without re-training): %w",
-						state.AdapterPath, state.JobID, cfg.DataDir, state.AdapterPath, state.JobID, err)
-				}
-				return fmt.Errorf("save active adapter: %w", err)
-			}
+		state := train.ActiveAdapter{
+			JobID:       finalJob.JobID,
+			BaseModel:   finalJob.BaseModel,
+			AdapterPath: finalJob.AdapterPath,
+			DatasetHash: finalJob.DatasetHash,
+			ActivatedAt: slotState.ActivatedAt,
 		}
 		activatedState = &state
 	}
@@ -353,17 +355,24 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "Path to sentinel.json configuration file")
 	dataDir := fs.String("data-dir", "", "Override Sentinel data directory")
+	slot := fs.String("slot", train.SlotPrimary, "Target slot: primary | escalation")
 	adapterPath := fs.String("adapter-path", "", "Relative LoRA adapter path under ml/data/artifacts/")
 	baseModel := fs.String("base-model", "", "Allowlisted base model matching the adapter")
 	jobID := fs.String("job-id", "", "Optional originating FTaaS job ID")
 	sentinelHTTP := fs.String("sentinel-http", "", "Optional running Sentinel HTTP URL for live POST /adapter hot-swap")
 	authToken := fs.String("auth-token", "", "Optional Bearer token for running Sentinel HTTP API")
 	allowRemote := fs.Bool("allow-remote", false, "Allow non-loopback Sentinel endpoint")
+	verify := fs.Bool("verify", false, "Preflight verify /healthz when notifying --sentinel-http")
+	enable := fs.Bool("enable", false, "Dynamically enable slot inference client if off")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected positional argument %q (use flags such as --adapter-path)", fs.Arg(0))
+	}
+	normSlot, err := train.NormalizeSlot(*slot, false)
+	if err != nil {
+		return err
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -373,45 +382,37 @@ func runTrainActivate(args []string, stdout, stderr io.Writer) error {
 	if *dataDir != "" {
 		cfg.DataDir = *dataDir
 	}
-	if *baseModel != "" {
-		cfg.BaseModel = *baseModel
+	resolvedModel := strings.TrimSpace(*baseModel)
+	if resolvedModel == "" {
+		if normSlot == train.SlotEscalation {
+			resolvedModel = cfg.EscalationBaseModel
+		} else {
+			resolvedModel = cfg.BaseModel
+		}
 	}
 	remote := *allowRemote || cfg.AllowRemoteEndpoints
 
-	state := train.ActiveAdapter{
+	slotState := train.AdapterSlot{
 		JobID:       strings.TrimSpace(*jobID),
-		BaseModel:   cfg.BaseModel,
+		BaseModel:   resolvedModel,
 		AdapterPath: strings.TrimSpace(*adapterPath),
 		ActivatedAt: time.Now().UTC(),
 	}
-	daemonSavedSameDir := false
-	daemonActivated := false
-	if strings.TrimSpace(*sentinelHTTP) != "" {
-		token := *authToken
-		if token == "" {
-			token = cfg.AuthToken
-		}
-		daemonDir, err := train.NotifyDaemonAdapter(context.Background(), *sentinelHTTP, token, state, remote)
-		if err != nil {
-			return err
-		}
-		daemonActivated = true
-		if security.IsLoopbackEndpoint(*sentinelHTTP) {
-			daemonSavedSameDir = sameCleanDir(daemonDir, cfg.DataDir)
-		}
+	out, err := activateSlotWithOptionalDaemon(
+		context.Background(),
+		cfg.DataDir,
+		normSlot,
+		slotState,
+		strings.TrimSpace(*sentinelHTTP),
+		resolveAuthToken(*authToken, cfg.AuthToken),
+		remote,
+		*verify,
+		*enable,
+	)
+	if err != nil {
+		return err
 	}
-	if !daemonSavedSameDir {
-		if err := train.SaveActiveAdapter(cfg.DataDir, state); err != nil {
-			if daemonActivated {
-				return fmt.Errorf("running Sentinel daemon already activated adapter %q (job %s), but saving local manifest to %q failed: %w",
-					state.AdapterPath, state.JobID, cfg.DataDir, err)
-			}
-			return err
-		}
-	}
-	enc := json.NewEncoder(stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(state)
+	return writeIndentedJSON(stdout, out)
 }
 
 func sameCleanDir(daemonDir, localDir string) bool {

@@ -9,9 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -83,6 +81,15 @@ type Stats struct {
 	TriageInjectionOverrides   uint64  `json:"triage_injection_overrides"`
 	TriageUpdatesEmitted       uint64  `json:"triage_updates_emitted,omitempty"`
 	TriageQueueDropped         uint64  `json:"triage_queue_dropped,omitempty"`
+	EscalationMode             string  `json:"escalation_mode"`
+	EscalationPolicy           string  `json:"escalation_policy,omitempty"`
+	EscalationModel            string  `json:"escalation_model,omitempty"`
+	EscalationAdapter          string  `json:"escalation_adapter,omitempty"`
+	EscalationEvaluated        uint64  `json:"escalation_evaluated"`
+	EscalationFallbacks        uint64  `json:"escalation_fallbacks"`
+	EscalationsTriggered       uint64  `json:"escalations_triggered"`
+	AdapterSwapsTotal          uint64  `json:"adapter_swaps_total"`
+	LastAdapterSwapUnix        int64   `json:"last_adapter_swap_unix,omitempty"`
 	CorruptedFrames            uint64  `json:"corrupted_frames"`
 	RecoveryStalls             uint64  `json:"recovery_stalls"`
 	BurnResets                 uint64  `json:"burn_resets"`
@@ -151,6 +158,7 @@ type Pipeline struct {
 	ruleEng            *rules.Engine
 	surprisalEng       *surprisal.Engine
 	triageClient       *triage.Client
+	escalationClient   *triage.Client
 	alertJournal       *feedback.AlertJournal
 	sink               emit.Sink
 	activeSource       string
@@ -158,6 +166,7 @@ type Pipeline struct {
 	startTime          time.Time
 	nowUnixFn          func() int64
 	triageReqTimeout   time.Duration
+	escalationTimeout  time.Duration
 	triageCancelMu     sync.Mutex
 	burnPending        int
 	nextFlushCancelID  uint64
@@ -165,9 +174,13 @@ type Pipeline struct {
 
 	// Async Tier 2 enrichment state (enabled by sentinel watch; disabled by default so
 	// offline sentinel scan returns enriched alerts synchronously in one pass).
-	// Lock hierarchy: burnMu -> asyncMu (never asyncMu -> burnMu).
+	// Lock hierarchy: burnMu -> asyncMu / adapterMu / corrMu / windowMu (never reverse).
 	burnEpoch            atomic.Uint64
 	adapterEpoch         atomic.Uint64
+	escalationEpoch      atomic.Uint64
+	escalationsTriggered atomic.Uint64
+	adapterSwapsTotal    atomic.Uint64
+	lastAdapterSwapUnix  atomic.Int64
 	triageUpdatesEmitted atomic.Uint64
 	triageQueueDropped   atomic.Uint64
 	asyncMu              sync.Mutex
@@ -180,6 +193,16 @@ type Pipeline struct {
 	activeAsyncCancel    context.CancelFunc
 	beforeAsyncPublishFn func() // optional test hook invoked right before publish check
 	afterAsyncTaskFn     func() // optional test hook invoked right after task completes
+
+	adapterMu          sync.Mutex
+	adapterHistory     []train.AdapterSwapRecord
+	primaryMeta        slotRuntimeMeta
+	escalationMeta     slotRuntimeMeta
+	lastSyncedManifest [sha256.Size]byte
+	hasSyncedManifest  bool
+
+	corrMu            sync.Mutex
+	serviceCorrelator map[string][]correlationEntry
 
 	// burnMu coordinates Burn() with IngestEvent()/FlushWindow() so no pre-burn
 	// alert can be delivered after Burn acknowledges completion.
@@ -231,34 +254,30 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		HTTPClient:         httpClient,
 	})
 
-	var triageClient *triage.Client
-	var reqTimeout time.Duration
+	var (
+		triageClient      *triage.Client
+		reqTimeout        time.Duration
+		escalationClient  *triage.Client
+		escalationTimeout time.Duration
+	)
 	if strings.EqualFold(cfg.TriageMode, "http") && cfg.InferenceAddr != "" {
-		flushBudget := time.Duration(cfg.TriageTimeoutSec) * time.Second
-		if flushBudget <= 0 {
-			flushBudget = config.DefaultTriageTimeoutSec * time.Second
-		}
-		// Bound each individual Tier 2 request strictly so a stalled inference server trips
-		// the circuit breaker promptly instead of delaying deterministic Tier 0/1 alerts.
-		reqTimeout = 10 * time.Second
-		if flushBudget <= 15*time.Second {
-			reqTimeout = 5 * time.Second
-		}
-		if flushBudget < reqTimeout {
-			reqTimeout = flushBudget
-		}
-		if tc, err := triage.NewClient(triage.ClientOptions{
-			BaseURL:        cfg.InferenceAddr,
-			BaseModel:      cfg.BaseModel,
-			AdapterPath:    cfg.AdapterPath,
-			APIKey:         cfg.FTaaSAPIKey,
-			Timeout:        reqTimeout,
-			MaxTokens:      cfg.TriageMaxTokens,
-			Temperature:    cfg.TriageTemperature,
-			MaxPromptBytes: cfg.MaxPromptByte,
-			AllowRemote:    cfg.AllowRemoteEndpoints,
-		}); err == nil {
+		if tc, rt, err := buildSlotClient(
+			cfg.InferenceAddr, cfg.BaseModel, cfg.AdapterPath, cfg.FTaaSAPIKey,
+			cfg.TriageTimeoutSec, cfg.TriageMaxTokens, cfg.TriageTemperature,
+			cfg.MaxPromptByte, cfg.AllowRemoteEndpoints,
+		); err == nil {
 			triageClient = tc
+			reqTimeout = rt
+		}
+	}
+	if strings.EqualFold(cfg.EscalationMode, "http") && cfg.EscalationInferenceAddr != "" {
+		if ec, et, err := buildSlotClient(
+			cfg.EscalationInferenceAddr, cfg.EscalationBaseModel, cfg.EscalationAdapterPath, cfg.FTaaSAPIKey,
+			cfg.EscalationTimeoutSec, cfg.EscalationMaxTokens, cfg.TriageTemperature,
+			cfg.MaxPromptByte, cfg.AllowRemoteEndpoints,
+		); err == nil {
+			escalationClient = ec
+			escalationTimeout = et
 		}
 	}
 
@@ -266,21 +285,25 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 	_, _ = rand.Read(idBytes[:])
 	instanceID := hex.EncodeToString(idBytes[:])
 
-	return &Pipeline{
+	p := &Pipeline{
 		cfg:                   cfg,
 		agg:                   template.NewAggregator(template.DefaultMaxClusters),
 		ruleEng:               ruleEng,
 		surprisalEng:          surpEng,
 		triageClient:          triageClient,
+		escalationClient:      escalationClient,
 		sink:                  sink,
 		activeSource:          activeSource,
 		instanceID:            instanceID,
 		startTime:             time.Now(),
 		triageReqTimeout:      reqTimeout,
+		escalationTimeout:     escalationTimeout,
 		activeTriageCancel:    make(map[uint64]context.CancelFunc),
 		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
 		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
+	p.initAdapterTracking()
+	return p
 }
 
 // TriageClient returns the active Tier 2 local inference client (nil when triage_mode=off).
@@ -290,11 +313,31 @@ func (p *Pipeline) TriageClient() *triage.Client {
 	return p.triageClient
 }
 
+// EscalationClient returns the active Phase 5 escalation inference client (nil when escalation_mode=off).
+func (p *Pipeline) EscalationClient() *triage.Client {
+	p.burnMu.RLock()
+	defer p.burnMu.RUnlock()
+	return p.escalationClient
+}
+
 // AttachTriageClient sets or replaces the Tier 2 local inference client cleanly.
 func (p *Pipeline) AttachTriageClient(c *triage.Client) {
 	p.burnMu.Lock()
 	p.triageClient = c
 	p.adapterEpoch.Add(1)
+	p.asyncMu.Lock()
+	if p.activeAsyncCancel != nil {
+		p.activeAsyncCancel()
+	}
+	p.asyncMu.Unlock()
+	p.burnMu.Unlock()
+}
+
+// AttachEscalationClient sets or replaces the Phase 5 escalation inference client cleanly.
+func (p *Pipeline) AttachEscalationClient(c *triage.Client) {
+	p.burnMu.Lock()
+	p.escalationClient = c
+	p.escalationEpoch.Add(1)
 	p.asyncMu.Lock()
 	if p.activeAsyncCancel != nil {
 		p.activeAsyncCancel()
@@ -393,6 +436,11 @@ func cloneAlertForAsync(a emit.Alert) emit.Alert {
 		copy(cp, a.InjectionSignals)
 		a.InjectionSignals = cp
 	}
+	if len(a.CorrelatedWindows) > 0 {
+		cp := make([]string, len(a.CorrelatedWindows))
+		copy(cp, a.CorrelatedWindows)
+		a.CorrelatedWindows = cp
+	}
 	if len(a.TopSurprisalFeatures) > 0 {
 		cp := make(map[string]float64, len(a.TopSurprisalFeatures))
 		for k, v := range a.TopSurprisalFeatures {
@@ -431,14 +479,16 @@ func (p *Pipeline) runAsyncTriageWorker() {
 }
 
 func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
-	// Select client/epochs AND register activeAsyncCancel atomically under the standard
+	// Select clients/epochs AND register activeAsyncCancel atomically under the standard
 	// burnMu.RLock -> asyncMu.Lock order so an adapter hot-swap occurring before this point
 	// never cancels a freshly dequeued task that is about to use the new adapter.
 	p.burnMu.RLock()
 	client := p.triageClient
+	escClient := p.escalationClient
 	curBurnEpoch := p.burnEpoch.Load()
 	startAdapterEpoch := p.adapterEpoch.Load()
-	if client == nil || curBurnEpoch != task.burnEpoch {
+	startEscEpoch := p.escalationEpoch.Load()
+	if (client == nil && escClient == nil) || curBurnEpoch != task.burnEpoch {
 		p.burnMu.RUnlock()
 		return
 	}
@@ -464,19 +514,23 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 	}()
 
 	enriched := task.alert
-	if !p.enrichWithTier2(reqCtx, client, &enriched) {
+	if !p.enrichWithTier2Dual(reqCtx, client, escClient, &enriched) {
 		return
 	}
 	if p.beforeAsyncPublishFn != nil {
 		p.beforeAsyncPublishFn()
 	}
 
-	// Re-verify under burnMu.RLock that neither Burn(), Close(), nor an adapter hot-swap
-	// retired this task while Tier 2 inference was in flight.
+	// Re-verify under burnMu.RLock that neither Burn(), Close(), nor a primary/escalation
+	// adapter hot-swap retired this task while Tier 2 inference was in flight.
 	p.burnMu.RLock()
 	defer p.burnMu.RUnlock()
 
-	if p.burnEpoch.Load() != task.burnEpoch || p.adapterEpoch.Load() != startAdapterEpoch || p.triageClient != client {
+	if p.burnEpoch.Load() != task.burnEpoch ||
+		p.adapterEpoch.Load() != startAdapterEpoch ||
+		p.escalationEpoch.Load() != startEscEpoch ||
+		p.triageClient != client ||
+		p.escalationClient != escClient {
 		return
 	}
 	p.asyncMu.Lock()
@@ -491,6 +545,7 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 		return
 	}
 	p.triageUpdatesEmitted.Add(1)
+	p.recordCorrelationWindow(enriched)
 	if p.alertJournal != nil {
 		// Use UpdateIfPresent so a delayed async Tier 2 result updates its existing alert
 		// in-place and never evicts newer alerts if the original record aged out or was burned.
@@ -818,14 +873,30 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 	}
 
 	triageClient := p.triageClient
+	escClient := p.escalationClient
+	hasTier2 := triageClient != nil || escClient != nil
 	asyncTriage := p.isAsyncTriageEnabled()
 	curBurnEpoch := p.burnEpoch.Load()
 	var (
 		triageCtx    context.Context
 		cancelTriage context.CancelFunc
 	)
-	if triageClient != nil && !asyncTriage {
-		flushBudget := time.Duration(p.cfg.TriageTimeoutSec) * time.Second
+	if hasTier2 && !asyncTriage {
+		flushBudget := 0 * time.Second
+		if triageClient != nil {
+			t := time.Duration(p.cfg.TriageTimeoutSec) * time.Second
+			if t <= 0 {
+				t = config.DefaultTriageTimeoutSec * time.Second
+			}
+			flushBudget += t
+		}
+		if escClient != nil {
+			et := time.Duration(p.cfg.EscalationTimeoutSec) * time.Second
+			if et <= 0 {
+				et = config.DefaultEscalationTimeoutSec * time.Second
+			}
+			flushBudget += et
+		}
 		if flushBudget <= 0 {
 			flushBudget = config.DefaultTriageTimeoutSec * time.Second
 		}
@@ -1018,8 +1089,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      bestSample,
 		}
 
-		if triageClient != nil && !asyncTriage {
-			p.enrichWithTier2(triageCtx, triageClient, &alert)
+		alert.CorrelatedWindows = p.collectCorrelatedContext(alert.SourceService, alert.TemplateID, alert.Timestamp)
+		if hasTier2 && !asyncTriage {
+			p.enrichWithTier2Dual(triageCtx, triageClient, escClient, &alert)
 		}
 
 		emittedWinKeys[k] = true
@@ -1029,6 +1101,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
+		p.recordCorrelationWindow(alert)
 		emitted = append(emitted, alert)
 	}
 
@@ -1104,8 +1177,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      cleanSample,
 		}
 
-		if triageClient != nil && !asyncTriage {
-			p.enrichWithTier2(triageCtx, triageClient, &alert)
+		alert.CorrelatedWindows = p.collectCorrelatedContext(alert.SourceService, alert.TemplateID, alert.Timestamp)
+		if hasTier2 && !asyncTriage {
+			p.enrichWithTier2Dual(triageCtx, triageClient, escClient, &alert)
 		}
 
 		if sw.hasKey {
@@ -1117,6 +1191,7 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
+		p.recordCorrelationWindow(alert)
 		emitted = append(emitted, alert)
 	}
 
@@ -1128,63 +1203,13 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 	// Enqueue async Tier 2 enrichment AFTER emitting and journaling the deterministic alerts
 	// so every async update strictly follows and upserts on top of its deterministic base alert.
-	if triageClient != nil && asyncTriage && len(emitted) > 0 {
+	if hasTier2 && asyncTriage && len(emitted) > 0 {
 		for _, a := range emitted {
 			p.enqueueAsyncTriage(a, curBurnEpoch)
 		}
 	}
 
 	return emitted, failed
-}
-
-func (p *Pipeline) enrichWithTier2(ctx context.Context, client *triage.Client, alert *emit.Alert) bool {
-	if client == nil || alert == nil {
-		return false
-	}
-	reqCtx := ctx
-	var cancelReq context.CancelFunc
-	if p.triageReqTimeout > 0 {
-		reqCtx, cancelReq = context.WithTimeout(ctx, p.triageReqTimeout)
-		defer cancelReq()
-	}
-	verdict, overridden, err := client.TriageWindow(reqCtx, triage.PromptInput{
-		Service:              alert.SourceService,
-		Level:                alert.SourceLevel,
-		TemplateID:           alert.TemplateID,
-		Template:             alert.Template,
-		SampleLine:           alert.SanitizedSample,
-		Count:                alert.Count,
-		SampleEntropy:        alert.SampleEntropy,
-		RuleIDs:              alert.RuleIDs,
-		Categories:           alert.Categories,
-		SurprisalNats:        alert.SurprisalNats,
-		SurprisalThreshold:   alert.SurprisalThreshold,
-		TopSurprisalFeatures: alert.TopSurprisalFeatures,
-		InjectionSuspected:   alert.InjectionSuspected,
-		InjectionSignals:     alert.InjectionSignals,
-	})
-	if err != nil {
-		return false
-	}
-	explanation, _ := security.SanitizeUntrustedLogText(verdict.Explanation, triage.MaxExplanationBytes*3+64)
-	if p.cfg.RequireRedaction {
-		explanation, _ = feedback.RedactText(explanation)
-	}
-	alert.Tier = alert.Tier + "+tier2"
-	alert.TriageClass = verdict.Label
-	alert.TriageConfidence = math.Round(verdict.Confidence*1000) / 1000
-	alert.TriageMitreTactic = verdict.MitreTactic
-	alert.TriageExplanation = explanation
-	alert.TriageModel = verdict.ModelID
-	alert.TriageAdapter = verdict.AdapterID
-	alert.TriageOverridden = overridden
-
-	// Fail closed: preserve the higher severity across Tier 0/1 and Tier 2 so a model
-	// hallucination cannot silently downgrade a deterministic CRITICAL/HIGH rule alert.
-	alert.Severity = emit.HigherSeverity(alert.Severity, verdict.Severity)
-	alert.Level = emit.MapSeverityToGenesisLevel(alert.Severity)
-	alert.Message = fmt.Sprintf("%s triage=[%s] %s", alert.Message, verdict.Label, truncateSummary(explanation, 160))
-	return true
 }
 
 func mapSurprisalSeverity(totalNats, thresholdNats float64, level string) string {
@@ -1215,6 +1240,7 @@ func (p *Pipeline) Stats() Stats {
 	queryPoller := p.queryPoller
 	surpEng := p.surprisalEng
 	triageClient := p.triageClient
+	escClient := p.escalationClient
 	p.burnMu.RUnlock()
 
 	st := Stats{
@@ -1231,6 +1257,11 @@ func (p *Pipeline) Stats() Stats {
 		SinkErrors:               p.sinkErrors.Load(),
 		JournalErrors:            p.journalErrors.Load(),
 		TriageMode:               "off",
+		EscalationMode:           "off",
+		EscalationPolicy:         p.cfg.EscalationPolicy,
+		EscalationsTriggered:     p.escalationsTriggered.Load(),
+		AdapterSwapsTotal:        p.adapterSwapsTotal.Load(),
+		LastAdapterSwapUnix:      p.lastAdapterSwapUnix.Load(),
 		ActiveSource:             p.activeSource,
 		DataDir:                  p.cfg.DataDir,
 		GenesisDataDir:           p.cfg.GenesisDataDir,
@@ -1249,6 +1280,14 @@ func (p *Pipeline) Stats() Stats {
 		st.TriageInjectionOverrides = ts.InjectionOverrides
 		st.TriageUpdatesEmitted = p.triageUpdatesEmitted.Load()
 		st.TriageQueueDropped = p.triageQueueDropped.Load()
+	}
+	if escClient != nil {
+		es := escClient.Stats()
+		st.EscalationMode = "http"
+		st.EscalationModel = es.BaseModel
+		st.EscalationAdapter = es.AdapterPath
+		st.EscalationEvaluated = es.EvaluatedTotal
+		st.EscalationFallbacks = es.FallbacksTotal
 	}
 
 	if surpEng != nil {
@@ -1332,6 +1371,20 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	if p.triageClient != nil {
 		p.triageClient.ResetAdapter()
 	}
+	if p.escalationClient != nil {
+		p.escalationClient.ResetAdapter()
+	}
+	p.escalationEpoch.Add(1)
+	p.corrMu.Lock()
+	p.serviceCorrelator = nil
+	p.corrMu.Unlock()
+	p.adapterMu.Lock()
+	p.primaryMeta = slotRuntimeMeta{}
+	p.escalationMeta = slotRuntimeMeta{}
+	p.adapterHistory = nil
+	p.hasSyncedManifest = false
+	p.lastSyncedManifest = [sha256.Size]byte{}
+	p.adapterMu.Unlock()
 	if p.segReader != nil {
 		p.segReader.ResetCursor()
 	}
@@ -1341,110 +1394,10 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	return BurnLocalStateWithFeedbackDir(p.cfg.DataDir, p.cfg.FeedbackDir)
 }
 
-// HandleAdapter serves POST /adapter to hot-swap the active Tier 2 LoRA adapter on a running
-// Sentinel sidecar and persist active-adapter.json cleanly inside one exclusive activation
-// transaction (holding burnMu.Lock so concurrent activations, FlushWindow, and Burn strictly
-// serialize, and persisting to disk before mutating live in-memory state).
+// HandleAdapter serves GET, POST, and DELETE /adapter to inspect, hot-swap, roll back,
+// verify, or deactivate active Tier 2 / escalation LoRA adapters cleanly under burnMu.
 func (p *Pipeline) HandleAdapter(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed; use POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	// Require application/json Content-Type so cross-origin browser simple POSTs (text/plain,
-	// form-urlencoded) cannot trigger state mutation even when loopback auth_token is unset.
-	mediaType, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if mtErr != nil || mediaType != "application/json" {
-		w.WriteHeader(http.StatusUnsupportedMediaType)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Content-Type must be application/json"})
-		return
-	}
-	var req struct {
-		JobID       string `json:"job_id"`
-		BaseModel   string `json:"base_model"`
-		AdapterPath string `json:"adapter_path"`
-		DatasetHash string `json:"dataset_hash"`
-	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024))
-	if err := dec.Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload"})
-		return
-	}
-	var trailing any
-	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload: unexpected trailing data"})
-		return
-	}
-	baseModel := strings.TrimSpace(req.BaseModel)
-	if baseModel == "" {
-		baseModel = p.cfg.BaseModel
-	}
-	if _, err := model.ValidateBaseModel(baseModel); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	cleanAdapter, err := triage.ValidateAdapterPath(req.AdapterPath)
-	if err != nil || cleanAdapter == "" {
-		msg := "adapter_path is required"
-		if err != nil {
-			msg = err.Error()
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
-		return
-	}
-
-	p.burnMu.Lock()
-	defer p.burnMu.Unlock()
-
-	state := train.ActiveAdapter{
-		JobID:       strings.TrimSpace(req.JobID),
-		BaseModel:   baseModel,
-		AdapterPath: cleanAdapter,
-		DatasetHash: strings.TrimSpace(req.DatasetHash),
-		ActivatedAt: time.Now().UTC(),
-	}
-	// Persist before committing to live triageClient so a disk persistence failure leaves
-	// the previously active adapter untouched in both memory and active-adapter.json.
-	if p.cfg.DataDir != "" {
-		if err := train.SaveActiveAdapter(p.cfg.DataDir, state); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
-	if p.triageClient != nil {
-		if err := p.triageClient.SetModelAndAdapter(baseModel, cleanAdapter); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
-	// Bump adapterEpoch and cancel any in-flight async Tier 2 request so verdicts computed
-	// under the retired adapter can never be published after this swap completes. Queued
-	// alerts that have not started inference yet remain queued and will use the new adapter.
-	p.adapterEpoch.Add(1)
-	p.asyncMu.Lock()
-	if p.activeAsyncCancel != nil {
-		p.activeAsyncCancel()
-	}
-	p.asyncMu.Unlock()
-	respDataDir := p.cfg.DataDir
-	if strings.TrimSpace(respDataDir) != "" {
-		if absDir, absErr := filepath.Abs(respDataDir); absErr == nil {
-			respDataDir = absDir
-		}
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":         "activated",
-		"base_model":     state.BaseModel,
-		"adapter_path":   state.AdapterPath,
-		"data_dir":       respDataDir,
-		"triage_enabled": p.triageClient != nil,
-	})
+	p.handleAdapterRequest(w, r)
 }
 
 // HandleHealthz serves GET /healthz for loopback liveness checks.
