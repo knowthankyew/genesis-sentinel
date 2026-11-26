@@ -991,6 +991,12 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
     }
 
 
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 def _run_adapter_cli_timed(cmd: list[str], label: str, timeout_sec: float = 15.0) -> float:
     t0 = time.perf_counter()
     try:
