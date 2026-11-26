@@ -171,11 +171,15 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	// omitted in flags/config, declining mismatched model pairs cleanly.
 	var adapterManifestLoadErr error
 	var adapterManifestMismatchMsg string
-	if cfg.DataDir != "" && ((!adapterPathExplicit && cfg.AdapterPath == "") || (!escalationAdapterExplicit && cfg.EscalationAdapterPath == "")) {
-		active, exists, loadErr := train.LoadActiveAdapter(cfg.DataDir)
+	var startupManifestHash [32]byte
+	var hasStartupManifest bool
+	if cfg.DataDir != "" {
+		active, diskHash, exists, loadErr := train.LoadActiveAdapterWithHash(cfg.DataDir)
 		if loadErr != nil {
 			adapterManifestLoadErr = loadErr
 		} else if exists {
+			startupManifestHash = diskHash
+			hasStartupManifest = true
 			if !adapterPathExplicit && cfg.AdapterPath == "" && active.AdapterPath != "" {
 				if baseModelExplicit && active.BaseModel != "" && !strings.EqualFold(active.BaseModel, cfg.BaseModel) {
 					adapterManifestMismatchMsg = fmt.Sprintf("skipping persisted adapter %q trained for %s because --base-model=%s was explicitly requested",
@@ -262,6 +266,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 	}
 
 	pipe := pipeline.New(cfg, ruleEng, sink, activeSource)
+	if hasStartupManifest {
+		pipe.SetInitialSyncedManifestHash(startupManifestHash)
+	}
 	pipe.EnableAsyncTriage(0)
 	defer pipe.Close()
 	pipe.AttachSegReader(segReader)
@@ -440,6 +447,9 @@ func runWatch(args []string, stdout, stderr io.Writer) error {
 			}
 
 		case <-adapterReloadTicker.C:
+			if !cfg.AutoReloadAdapter {
+				continue
+			}
 			if reloaded, reloadErr := pipe.SyncActiveAdapterFromDisk(); reloadErr != nil {
 				logger.Printf("[Adapter] Warning: failed auto-reloading active-adapter.json: %v", reloadErr)
 			} else if reloaded {

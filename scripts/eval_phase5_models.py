@@ -61,6 +61,7 @@ CANONICAL_CLASSES = (
     "NEEDS-REVIEW",
 )
 VALID_SEVERITIES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 PERSONAL_PATH_RE = re.compile(r"(?:/Users/|/home/|[A-Za-z]:(?:\\|/)[Uu]sers(?:\\|/))")
 
 PROMPT_HEADER = (
@@ -109,7 +110,7 @@ def build_telemetry_prompt(row: dict) -> str:
 
 def build_phase5_corpora() -> tuple[list[dict], list[dict]]:
     """
-    Build disjoint offline fine-tuning (24 records across 8 canonical classes) and
+    Build disjoint offline fine-tuning (40 records across 8 canonical classes) and
     unseen holdout evaluation (20 records covering false-positive traps, attacks,
     correlated multi-window chains, hostile prompt injections, and ambiguous events).
     Zero PII or personal paths.
@@ -406,7 +407,12 @@ def parse_sentinel_completion(raw_completion: str) -> dict:
     explanation = exp_match.group(1).strip() if exp_match else ""
     explanation = explanation.replace("<|im_end|>", "").replace("<end_of_turn>", "").strip()
 
-    format_valid = bool(matched_tag and severity in VALID_SEVERITIES and len(explanation) >= 6)
+    format_valid = bool(
+        matched_tag
+        and severity in VALID_SEVERITIES
+        and mitre_match is not None
+        and len(explanation) >= 6
+    )
     return {
         "raw_first_line": first_line[:240],
         "matched_tag": matched_tag,
@@ -514,20 +520,21 @@ def run_eval_pass(model, tokenizer, model_id: str, eval_rows: list[dict], max_ne
 def summarize_eval_samples(per_sample: list[dict], latencies_ms: list[float]) -> dict:
     total = len(per_sample)
     fmt_cnt = sum(1 for r in per_sample if r["format_valid"])
-    cls_cnt = sum(1 for r in per_sample if r["pred_class"] == r["truth_class"])
+    # Do not award class, correlation, or MITRE accuracy credit to unformatted fallback labels.
+    cls_cnt = sum(1 for r in per_sample if r["format_valid"] and r["pred_class"] == r["truth_class"])
 
     benign_rows = [r for r in per_sample if r["partition"] == "benign"]
-    fp_cnt = sum(1 for r in benign_rows if r["pred_class"] != "BENIGN-NOISE")
+    fp_cnt = sum(1 for r in benign_rows if (not r["format_valid"]) or r["pred_class"] != "BENIGN-NOISE")
 
     attack_rows = [r for r in per_sample if r["partition"] == "attack"]
-    attack_tp = sum(1 for r in attack_rows if r["pred_class"] not in ("BENIGN-NOISE", "NEEDS-REVIEW"))
+    attack_tp = sum(1 for r in attack_rows if r["format_valid"] and r["pred_class"] not in ("BENIGN-NOISE", "NEEDS-REVIEW"))
     attack_fn = len(attack_rows) - attack_tp
 
     corr_rows = [r for r in per_sample if r["correlated_case"]]
-    corr_cnt = sum(1 for r in corr_rows if r["pred_class"] == r["truth_class"])
+    corr_cnt = sum(1 for r in corr_rows if r["format_valid"] and r["pred_class"] == r["truth_class"])
 
     mitre_rows = [r for r in per_sample if r["truth_mitre"] != "NONE"]
-    mitre_cnt = sum(1 for r in mitre_rows if r["pred_mitre"] == r["truth_mitre"])
+    mitre_cnt = sum(1 for r in mitre_rows if r["format_valid"] and r["pred_mitre"] == r["truth_mitre"])
 
     inj_rows = [r for r in per_sample if r["inj"]]
     inj_raw_coerced = sum(1 for r in inj_rows if r["pred_class"] == "BENIGN-NOISE")
@@ -561,12 +568,22 @@ def summarize_eval_samples(per_sample: list[dict], latencies_ms: list[float]) ->
 
 def build_lora_training_tensors(tokenizer, model_id: str, train_records: list[dict], max_length: int) -> list[dict]:
     items = []
-    for rec in train_records:
+    for idx_rec, rec in enumerate(train_records):
         prompt_only = format_chat_prompt(tokenizer, rec["prompt"])
         full_text = format_chat_prompt(tokenizer, rec["prompt"], rec["completion"])
         full_ids = tokenizer.encode(full_text, truncation=True, max_length=max_length, add_special_tokens=False)
         prompt_ids = tokenizer.encode(prompt_only, truncation=True, max_length=max_length, add_special_tokens=False)
         prompt_len = min(len(prompt_ids), len(full_ids))
+        if full_ids[:prompt_len] != prompt_ids:
+            raise ValueError(
+                f"Tokenizer prompt prefix mismatch on {model_id} record {idx_rec}; inspect chat template alignment"
+            )
+        target_decoded = tokenizer.decode(full_ids[prompt_len:], skip_special_tokens=True).strip()
+        if not target_decoded.startswith("[") or rec["completion"] not in target_decoded:
+            raise ValueError(
+                f"Training target boundary clipped/misaligned on {model_id} record {idx_rec} at max_length={max_length}: "
+                f"got {target_decoded!r}, expected {rec['completion']!r}"
+            )
         labels = [
             int(tok) if idx >= prompt_len else -100
             for idx, tok in enumerate(full_ids)
@@ -775,10 +792,12 @@ def run_worker_phase(args: argparse.Namespace) -> int:
         peft_m = PeftModel.from_pretrained(base_m, str(adapter_v2_dir), adapter_name="slot_v2")
         load_sec = round(time.perf_counter() - t0, 3)
 
-        # Measure real inference evaluation using trained smol_v2 adapter (clean inference RSS)
+        # Measure real inference evaluation using trained smol_v2 adapter and sample RSS at the same
+        # post-inference point as the sibling workers before mounting any swap adapter.
         per_sample, lat_ms = run_eval_pass(peft_m, tok, SMOL_MODEL_ID, eval_rows)
+        rss_after = rss_mb()
 
-        # Measure live PEFT cold load (new adapter mount) + warm LRU switch (v2 <-> v1)
+        # Measure live PEFT additional adapter load + resident switch (v2 <-> v1)
         t_cold0 = time.perf_counter()
         peft_m.load_adapter(str(adapter_v1_dir), adapter_name="slot_v1")
         cold_load_ms = round((time.perf_counter() - t_cold0) * 1000.0, 3)
@@ -788,8 +807,8 @@ def run_worker_phase(args: argparse.Namespace) -> int:
             ts0 = time.perf_counter()
             peft_m.set_adapter(target_name)
             swap_times_ms.append(round((time.perf_counter() - ts0) * 1000.0, 4))
+        swap_rss_after = rss_mb()
 
-        rss_after = rss_mb()
         summary = summarize_eval_samples(per_sample, lat_ms)
         summary.update({
             "model_id": SMOL_MODEL_ID,
@@ -798,6 +817,7 @@ def run_worker_phase(args: argparse.Namespace) -> int:
             "rss_before_model_mb": rss_before,
             "rss_after_model_mb": rss_after,
             "rss_delta_mb": round(max(rss_after - rss_before, 0.0), 2),
+            "swap_rss_after_mb": swap_rss_after,
             "peft_cold_adapter_load_ms": cold_load_ms,
             "raw_peft_warm_swap_ms": swap_times_ms,
         })
@@ -848,13 +868,14 @@ def run_worker_phase(args: argparse.Namespace) -> int:
 
 def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
     """
-    Replay Sentinel's exact selective `high_critical` escalation policy across identical
-    holdout scenarios using measured primary (`SmolLM2`) and escalation (`Gemma`) verdicts.
+    Replay Sentinel's exact runtime `high_critical` escalation + fail-closed safety overrides
+    across identical holdout scenarios using measured primary (`SmolLM2`) and escalation (`Gemma`) outputs.
     """
     smol_rows = smol_res["per_sample"]
     gemma_rows = gemma_res["per_sample"]
     combined: list[dict] = []
     blended_ms: list[float] = []
+    escalated_flags: list[bool] = []
     escalated_count = 0
 
     for sr, gr in zip(smol_rows, gemma_rows):
@@ -865,13 +886,28 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
             or sr["correlated_case"]
             or sr["pred_class"] == "NEEDS-REVIEW"
         )
+        escalated_flags.append(bool(needs_esc))
         if needs_esc:
             escalated_count += 1
-            chosen = dict(gr)
+            if gr["format_valid"]:
+                chosen = dict(gr)
+            elif sr["format_valid"]:
+                # Mirror runtime fallback: retain valid primary verdict if escalation output fails validation.
+                chosen = dict(sr)
+            else:
+                chosen = dict(gr)
             lat = round(sr["latency_ms"] + gr["latency_ms"], 3)
         else:
             chosen = dict(sr)
             lat = sr["latency_ms"]
+
+        # Mirror runtime fail-closed guards in triage.ParseCompletion & pipeline.applyVerdictToAlert.
+        if chosen["inj"] and chosen["pred_class"] == "BENIGN-NOISE":
+            chosen["pred_class"] = "NEEDS-REVIEW"
+            chosen["pred_sev"] = "HIGH"
+        if SEVERITY_RANK.get(chosen["tier1_sev"], 0) > SEVERITY_RANK.get(chosen["pred_sev"], 0):
+            chosen["pred_sev"] = chosen["tier1_sev"]
+
         chosen["latency_ms"] = lat
         combined.append(chosen)
         blended_ms.append(lat)
@@ -900,20 +936,30 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
         "explanation_quality_avg": summary["explanation_quality_avg"],
         "blended_p50_ms": summary["latency_p50_ms"],
         "blended_mean_ms": summary["latency_mean_ms"],
+        "per_sample_escalated": escalated_flags,
         "raw_blended_samples_ms": blended_ms,
     }
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def _run_adapter_cli_timed(cmd: list[str], label: str, timeout_sec: float = 15.0) -> float:
+    t0 = time.perf_counter()
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label} timed out after {timeout_sec}s") from exc
+    return round((time.perf_counter() - t0) * 1000.0, 2)
 
 
 def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
     """
-    Start a real `bin/sentinel watch` sidecar + loopback inference health mock and measure live
-    `sentinel adapter swap --verify` and `sentinel adapter rollback --verify` end-to-end times.
+    Start a real `bin/sentinel watch` sidecar + loopback mock `/healthz` endpoint and measure live
+    `sentinel adapter swap --verify` and `sentinel adapter rollback --verify` CLI control-plane times.
     """
     data_dir = tmp_dir / "sentinel-data"
     seg_dir = tmp_dir / "genesis-segs"
@@ -956,35 +1002,40 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
         def log_message(self, format, *args):
             return
 
-    inf_port = _find_free_port()
-    inf_srv = http.server.ThreadingHTTPServer(("127.0.0.1", inf_port), MockInfHandler)
+    no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    inf_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockInfHandler)
+    inf_port = int(inf_srv.server_address[1])
     inf_thread = threading.Thread(target=inf_srv.serve_forever, daemon=True)
     inf_thread.start()
 
-    watch_port = _find_free_port()
-    tcp_port = _find_free_port()
-    watch_url = f"http://127.0.0.1:{watch_port}"
-    proc = subprocess.Popen(
-        [
-            str(sentinel_bin),
-            "watch",
-            "--http", f"127.0.0.1:{watch_port}",
-            "--data-dir", str(data_dir),
-            "--genesis-data-dir", str(seg_dir),
-            "--genesis-tcp", f"127.0.0.1:{tcp_port}",
-            "--triage-mode", "http",
-            "--inference-http", f"http://127.0.0.1:{inf_port}",
-            "--base-model", SMOL_MODEL_ID,
-            "--dry-run",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    proc = None
     try:
+        watch_port = _find_free_port()
+        tcp_port = _find_free_port()
+        watch_url = f"http://127.0.0.1:{watch_port}"
+        proc = subprocess.Popen(
+            [
+                str(sentinel_bin),
+                "watch",
+                "--http", f"127.0.0.1:{watch_port}",
+                "--data-dir", str(data_dir),
+                "--genesis-data-dir", str(seg_dir),
+                "--genesis-tcp", f"127.0.0.1:{tcp_port}",
+                "--triage-mode", "http",
+                "--inference-http", f"http://127.0.0.1:{inf_port}",
+                "--base-model", SMOL_MODEL_ID,
+                "--dry-run",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
         ready = False
         for _ in range(50):
+            if proc.poll() is not None:
+                raise RuntimeError(f"sentinel watch sidecar exited early with code {proc.returncode}")
             try:
-                with urllib.request.urlopen(f"{watch_url}/healthz", timeout=0.5) as resp:
+                with no_proxy_opener.open(f"{watch_url}/healthz", timeout=0.5) as resp:
                     if resp.status == 200:
                         ready = True
                         break
@@ -996,8 +1047,7 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
         swap_latencies: list[float] = []
         for idx in range(5):
             adapter_rel = f"artifacts/smol-v{(idx % 2) + 1}/model_adapters"
-            t0 = time.perf_counter()
-            subprocess.run(
+            ms = _run_adapter_cli_timed(
                 [
                     str(sentinel_bin),
                     "adapter", "swap",
@@ -1008,14 +1058,11 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
                     "--sentinel-http", watch_url,
                     "--data-dir", str(data_dir),
                 ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                f"sentinel adapter swap #{idx + 1}",
             )
-            swap_latencies.append(round((time.perf_counter() - t0) * 1000.0, 2))
+            swap_latencies.append(ms)
 
-        tr0 = time.perf_counter()
-        subprocess.run(
+        rollback_ms = _run_adapter_cli_timed(
             [
                 str(sentinel_bin),
                 "adapter", "rollback",
@@ -1024,33 +1071,42 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
                 "--sentinel-http", watch_url,
                 "--data-dir", str(data_dir),
             ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            "sentinel adapter rollback",
         )
-        rollback_ms = round((time.perf_counter() - tr0) * 1000.0, 2)
 
-        with urllib.request.urlopen(f"{watch_url}/adapter", timeout=1.0) as resp:
+        with no_proxy_opener.open(f"{watch_url}/adapter", timeout=1.0) as resp:
             status_json = json.loads(resp.read().decode("utf-8"))
-        with urllib.request.urlopen(f"{watch_url}/stats", timeout=1.0) as resp:
+        with no_proxy_opener.open(f"{watch_url}/stats", timeout=1.0) as resp:
             stats_json = json.loads(resp.read().decode("utf-8"))
+
+        if proc.poll() is not None:
+            raise RuntimeError(f"sentinel watch sidecar did not remain running continuously (exit={proc.returncode})")
+        post_rb = status_json.get("primary", {}).get("adapter_path", "")
+        if post_rb != "artifacts/smol-v2/model_adapters":
+            raise RuntimeError(f"expected rollback to restore artifacts/smol-v2/model_adapters, got {post_rb!r}")
+        swaps_recorded = int(stats_json.get("adapter_swaps_total", 0))
+        if swaps_recorded < 6:
+            raise RuntimeError(f"expected >= 6 recorded swaps/rollback, got {swaps_recorded}")
 
         return {
             "sidecar_verify_swap_p50_ms": round(pct(sorted(swap_latencies), 50), 2),
             "sidecar_verify_swap_max_ms": max(swap_latencies),
             "sidecar_rollback_ms": rollback_ms,
             "raw_sidecar_verify_swap_ms": swap_latencies,
-            "adapter_swaps_recorded": int(stats_json.get("adapter_swaps_total", 0)),
-            "post_rollback_adapter": status_json["primary"]["adapter_path"],
+            "adapter_swaps_recorded": swaps_recorded,
+            "post_rollback_adapter": post_rb,
             "zero_restart_verified": True,
         }
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
         inf_srv.shutdown()
+        inf_srv.server_close()
 
 
 def build_conclusion_recommendation(
@@ -1067,17 +1123,23 @@ def build_conclusion_recommendation(
     smol_p50_ms: float,
     gemma_p50_ms: float,
     slowdown_x: float,
+    faster_x: float,
     hybrid_esc_rate: float,
     hybrid_acc: float,
     hybrid_mean_ms: float,
-    hybrid_speedup_x: float,
+    gemma_mean_ms: float,
+    hybrid_abs_delta_pct: float,
     warm_swap_ms: float,
 ) -> str:
     """Build governed Phase 5 conclusion prose exclusively from computed metrics (AST-checked)."""
-    if gemma_acc >= smol_acc:
+    if gemma_acc > smol_acc:
         acc_phrase = (
             f"{gemma_label} LoRA improved holdout triage accuracy from "
             f"{smol_acc:.4f} ({smol_label} LoRA) to {gemma_acc:.4f}"
+        )
+    elif gemma_acc == smol_acc:
+        acc_phrase = (
+            f"{gemma_label} LoRA matched {smol_label} LoRA holdout triage accuracy at {gemma_acc:.4f}"
         )
     else:
         acc_phrase = (
@@ -1085,16 +1147,28 @@ def build_conclusion_recommendation(
             f"{smol_label} LoRA at {smol_acc:.4f}"
         )
 
+    if gemma_p50_ms > smol_p50_ms:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({slowdown_x:.2f}x slower on CPU)"
+    elif gemma_p50_ms < smol_p50_ms:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({faster_x:.2f}x faster on CPU)"
+    else:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms (matched {smol_p50_ms:.2f} ms)"
+
+    if hybrid_mean_ms < gemma_mean_ms:
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster mean turnaround than always running {gemma_label}"
+    elif hybrid_mean_ms > gemma_mean_ms:
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower mean turnaround than always running {gemma_label}"
+    else:
+        turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
+
     return (
         f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign false positives "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
-        f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({slowdown_x:.2f}x slower on CPU), while "
-        f"selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
+        f"{p50_phrase}, while selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
         f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended mean latency "
-        f"({hybrid_speedup_x:.2f}x faster mean turnaround than always running {gemma_label}), "
-        f"with cached PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
+        f"({turnaround_phrase}), with resident PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
     )
 
 
@@ -1135,12 +1209,21 @@ def main() -> int:
     if args.worker:
         return run_worker_phase(args)
 
+    if args.train_epochs_smol <= 0 or args.train_epochs_gemma <= 0:
+        raise ValueError(
+            f"Epoch counts must be positive integers, got smol={args.train_epochs_smol}, gemma={args.train_epochs_gemma}"
+        )
+
+    out_json_abs = (REPO_ROOT / args.out_json) if not args.out_json.is_absolute() else args.out_json
+    out_md_abs = (REPO_ROOT / args.out_md) if not args.out_md.is_absolute() else args.out_md
+    if out_json_abs.resolve() == out_md_abs.resolve():
+        raise ValueError(f"--out-json and --out-md must not resolve to the same file: {out_json_abs.resolve()}")
+
     train_records, eval_rows = build_phase5_corpora()
     sentinel_bin = (REPO_ROOT / args.sentinel_bin) if not args.sentinel_bin.is_absolute() else args.sentinel_bin
     if not sentinel_bin.is_file():
         raise FileNotFoundError(f"Sentinel binary not found at {sentinel_bin}; run `make build` first")
 
-    git_rev = "unknown"
     try:
         git_rev = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -1149,8 +1232,21 @@ def main() -> int:
             text=True,
             timeout=2,
         ).strip()
-    except Exception:
-        pass
+        git_dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=str(REPO_ROOT),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception as exc:
+        raise RuntimeError(f"Failed verifying git provenance before Phase 5 benchmark: {exc}") from exc
+    if not git_rev:
+        raise RuntimeError("Resolved empty HEAD commit hash")
+    if git_dirty:
+        raise RuntimeError(
+            "Refusing to run governed Phase 5 benchmark with uncommitted git changes; commit changes first:\n" + git_dirty
+        )
 
     with tempfile.TemporaryDirectory(prefix="sentinel-phase5-") as td:
         tmp_dir = Path(td)
@@ -1182,14 +1278,18 @@ def main() -> int:
 
     hybrid = compute_hybrid_escalation(smol_lora, gemma_lora)
 
+    swap_rss_after = smol_lora.pop("swap_rss_after_mb", None)
     peft_cold_ms = smol_lora.pop("peft_cold_adapter_load_ms")
     peft_raw_warm = smol_lora.pop("raw_peft_warm_swap_ms")
     peft_warm_sorted = sorted(peft_raw_warm)
 
     smol_p50 = smol_lora["latency_p50_ms"]
     gemma_p50 = gemma_lora["latency_p50_ms"]
+    gemma_mean = gemma_lora["latency_mean_ms"]
     slowdown_x = round(gemma_p50 / max(smol_p50, 0.001), 2)
-    hybrid_speedup_x = round(gemma_lora["latency_mean_ms"] / max(hybrid["blended_mean_ms"], 0.001), 2)
+    faster_x = round(smol_p50 / max(gemma_p50, 0.001), 2)
+    hybrid_ratio_x = round(hybrid["blended_mean_ms"] / max(gemma_mean, 0.001), 4)
+    hybrid_delta_pct = round(((hybrid["blended_mean_ms"] - gemma_mean) / max(gemma_mean, 0.001)) * 100.0, 2)
 
     rec = build_conclusion_recommendation(
         smol_label="SmolLM2-135M-Instruct",
@@ -1205,17 +1305,25 @@ def main() -> int:
         smol_p50_ms=smol_p50,
         gemma_p50_ms=gemma_p50,
         slowdown_x=slowdown_x,
+        faster_x=faster_x,
         hybrid_esc_rate=hybrid["escalation_rate"],
         hybrid_acc=hybrid["class_accuracy"],
         hybrid_mean_ms=hybrid["blended_mean_ms"],
-        hybrid_speedup_x=hybrid_speedup_x,
+        gemma_mean_ms=gemma_mean,
+        hybrid_abs_delta_pct=abs(hybrid_delta_pct),
         warm_swap_ms=round(pct(peft_warm_sorted, 50), 4),
     )
+
+    try:
+        report_rel = out_md_abs.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        report_rel = args.out_md.as_posix()
 
     out_data = {
         "metadata": {
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "git_commit": git_rev,
+            "report_markdown": report_rel,
             "command": f"python scripts/eval_phase5_models.py --train-epochs-smol {args.train_epochs_smol} --train-epochs-gemma {args.train_epochs_gemma}",
             "offline_mode": True,
             "execution_device": "cpu",
@@ -1248,15 +1356,19 @@ def main() -> int:
         },
         "hybrid_escalation": hybrid,
         "live_adapter_hotswap": {
-            "inference_backend": "pytorch-peft",
+            "peft_backend": "pytorch-peft",
+            "sidecar_cli_backend": "mock-inference-healthz",
             "peft_cold_adapter_load_ms": peft_cold_ms,
             "peft_warm_swap_p50_ms": round(pct(peft_warm_sorted, 50), 4),
             "peft_warm_swap_max_ms": max(peft_warm_sorted),
             "raw_peft_warm_swap_ms": peft_raw_warm,
+            "peft_swap_rss_after_mb": swap_rss_after,
             "sentinel_sidecar_verify_swap_p50_ms": sidecar_swap["sidecar_verify_swap_p50_ms"],
             "sentinel_sidecar_verify_swap_max_ms": sidecar_swap["sidecar_verify_swap_max_ms"],
             "sentinel_sidecar_rollback_ms": sidecar_swap["sidecar_rollback_ms"],
             "raw_sidecar_verify_swap_ms": sidecar_swap["raw_sidecar_verify_swap_ms"],
+            "adapter_swaps_recorded": sidecar_swap["adapter_swaps_recorded"],
+            "post_rollback_adapter": sidecar_swap["post_rollback_adapter"],
             "zero_restart_verified": sidecar_swap["zero_restart_verified"],
         },
         "comparison": {
@@ -1267,7 +1379,8 @@ def main() -> int:
             "gemma_vs_smol_correlated_accuracy_delta": round(gemma_lora["correlated_accuracy"] - smol_lora["correlated_accuracy"], 4),
             "gemma_vs_smol_explanation_quality_delta": round(gemma_lora["explanation_quality_avg"] - smol_lora["explanation_quality_avg"], 4),
             "gemma_vs_smol_p50_slowdown_x": slowdown_x,
-            "hybrid_vs_gemma_mean_latency_speedup_x": hybrid_speedup_x,
+            "hybrid_vs_gemma_mean_turnaround_ratio": hybrid_ratio_x,
+            "hybrid_vs_gemma_mean_latency_delta_pct": hybrid_delta_pct,
             "comparison_direction": "gemma_lora_p50_ms / smol_lora_p50_ms (>1 means Gemma is slower)",
             "recommendation": rec,
         },
@@ -1277,14 +1390,12 @@ def main() -> int:
     if PERSONAL_PATH_RE.search(encoded):
         raise RuntimeError("Refusing to write Phase 5 JSON containing personal host path")
 
-    out_json_abs = (REPO_ROOT / args.out_json) if not args.out_json.is_absolute() else args.out_json
     out_json_abs.parent.mkdir(parents=True, exist_ok=True)
     out_json_abs.write_text(encoded, encoding="utf-8")
 
     md = render_phase5_markdown(out_data)
     if PERSONAL_PATH_RE.search(md):
         raise RuntimeError("Refusing to write Phase 5 Markdown report containing personal host path")
-    out_md_abs = (REPO_ROOT / args.out_md) if not args.out_md.is_absolute() else args.out_md
     out_md_abs.parent.mkdir(parents=True, exist_ok=True)
     out_md_abs.write_text(md, encoding="utf-8")
 
@@ -1319,7 +1430,7 @@ def render_phase5_markdown(d: dict) -> str:
         f"| `SmolLM2-135M-Instruct` (LoRA) | {sl['format_compliance_rate']:.4f} | {sl['class_accuracy']:.4f} ({sl['class_correct_count']}/{sl['eval_total']}) | {sl['benign_fp_count']} ({sl['benign_fp_rate']:.4f}) | {sl['correlated_accuracy']:.4f} | {sl['mitre_accuracy']:.4f} | {sl['explanation_quality_avg']:.4f} | {sl['rss_after_model_mb']:.2f} MB (+{sl['rss_delta_mb']:.2f}) | {sl['latency_p50_ms']:.2f} ms | {sl['latency_mean_ms']:.2f} ms |",
         f"| `google/gemma-2-2b-it` (Base) | {gb['format_compliance_rate']:.4f} | {gb['class_accuracy']:.4f} ({gb['class_correct_count']}/{gb['eval_total']}) | {gb['benign_fp_count']} ({gb['benign_fp_rate']:.4f}) | {gb['correlated_accuracy']:.4f} | {gb['mitre_accuracy']:.4f} | {gb['explanation_quality_avg']:.4f} | {gb['rss_after_model_mb']:.2f} MB (+{gb['rss_delta_mb']:.2f}) | {gb['latency_p50_ms']:.2f} ms | {gb['latency_mean_ms']:.2f} ms |",
         f"| `google/gemma-2-2b-it` (LoRA) | {gl['format_compliance_rate']:.4f} | {gl['class_accuracy']:.4f} ({gl['class_correct_count']}/{gl['eval_total']}) | {gl['benign_fp_count']} ({gl['benign_fp_rate']:.4f}) | {gl['correlated_accuracy']:.4f} | {gl['mitre_accuracy']:.4f} | {gl['explanation_quality_avg']:.4f} | {gl['rss_after_model_mb']:.2f} MB (+{gl['rss_delta_mb']:.2f}) | {gl['latency_p50_ms']:.2f} ms | {gl['latency_mean_ms']:.2f} ms |",
-        f"| **Hybrid Escalation (`{hyb['policy']}`, {hyb['escalation_rate']:.4f} escalated)** | — | **{hyb['class_accuracy']:.4f} ({hyb['class_correct_count']}/{hyb['total_windows']})** | **{hyb['benign_fp_count']} ({hyb['benign_fp_rate']:.4f})** | **{hyb['correlated_accuracy']:.4f}** | **{hyb['mitre_accuracy']:.4f}** | **{hyb['explanation_quality_avg']:.4f}** | Primary {sl['rss_after_model_mb']:.0f} MB steady + Gemma on-demand | **{hyb['blended_p50_ms']:.2f} ms** | **{hyb['blended_mean_ms']:.2f} ms** |",
+        f"| **Hybrid Escalation (`{hyb['policy']}`, {hyb['escalation_rate']:.4f} escalated)** | — | **{hyb['class_accuracy']:.4f} ({hyb['class_correct_count']}/{hyb['total_windows']})** | **{hyb['benign_fp_count']} ({hyb['benign_fp_rate']:.4f})** | **{hyb['correlated_accuracy']:.4f}** | **{hyb['mitre_accuracy']:.4f}** | **{hyb['explanation_quality_avg']:.4f}** | Primary {sl['rss_after_model_mb']:.2f} MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **{hyb['blended_p50_ms']:.2f} ms** | **{hyb['blended_mean_ms']:.2f} ms** |",
         "",
         "## LoRA Fine-Tuning Provenance",
         "",
@@ -1328,12 +1439,12 @@ def render_phase5_markdown(d: dict) -> str:
         "",
         "## Live Adapter Hot-Swap Benchmark",
         "",
-        "| Operation | Measured Latency |",
-        "| :--- | :---: |",
-        f"| PyTorch PEFT Cold LoRA Mount (`from_pretrained`) | {hs['peft_cold_adapter_load_ms']:.2f} ms |",
-        f"| PyTorch PEFT Warm LRU Adapter Switch (`set_adapter` P50 / Max) | {hs['peft_warm_swap_p50_ms']:.4f} ms / {hs['peft_warm_swap_max_ms']:.4f} ms |",
-        f"| Sentinel Sidecar Preflight-Checked Live Swap (`sentinel adapter swap --verify`, P50 / Max) | {hs['sentinel_sidecar_verify_swap_p50_ms']:.2f} ms / {hs['sentinel_sidecar_verify_swap_max_ms']:.2f} ms |",
-        f"| Sentinel Sidecar Preflight-Checked Rollback (`sentinel adapter rollback --verify`) | {hs['sentinel_sidecar_rollback_ms']:.2f} ms |",
+        "| Operation | Backend | Measured Latency |",
+        "| :--- | :--- | :---: |",
+        f"| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `{hs['peft_backend']}` | {hs['peft_cold_adapter_load_ms']:.2f} ms |",
+        f"| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `{hs['peft_backend']}` | {hs['peft_warm_swap_p50_ms']:.4f} ms / {hs['peft_warm_swap_max_ms']:.4f} ms |",
+        f"| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `{hs['sidecar_cli_backend']}` | {hs['sentinel_sidecar_verify_swap_p50_ms']:.2f} ms / {hs['sentinel_sidecar_verify_swap_max_ms']:.2f} ms |",
+        f"| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `{hs['sidecar_cli_backend']}` | {hs['sentinel_sidecar_rollback_ms']:.2f} ms |",
         "",
         "## Conclusion",
         "",

@@ -1000,29 +1000,33 @@ class TestClaimsLinter(unittest.TestCase):
     def test_independent_recompute_phase5_comparison_valid_and_tamper_guards(self):
         """Verify Phase 5 recomputation accepts valid derived math and rejects tampered metrics."""
 
-        def make_model_entry(base_cls_correct: int, fp: int, corr_correct: int, qual: float, samples: list[float], trained: bool = False):
-            tot = len(samples)
-            tp = 2
-            fn = 0
-            s = sorted(samples)
-            p50 = round(sync_docs._nearest_rank_percentile(s, 50.0), 3)
-            p99 = round(sync_docs._nearest_rank_percentile(s, 99.0), 3)
-            lmean = round(sum(samples) / len(samples), 3)
+        def make_model_entry(
+            model_id: str,
+            trained: bool,
+            base_cls_correct: int,
+            fp: int,
+            corr_correct: int,
+            qual: float,
+            samples: list[float],
+            p50: float,
+            p99: float,
+            lmean: float,
+        ):
             entry = {
-                "model_id": "test-model",
+                "model_id": model_id,
                 "adapter_trained": trained,
                 "rss_before_model_mb": 300.0,
                 "rss_after_model_mb": 900.0,
                 "rss_delta_mb": 600.0,
-                "eval_total": tot,
-                "format_valid_count": tot,
+                "eval_total": 4,
+                "format_valid_count": 4,
                 "format_compliance_rate": 1.0,
                 "class_correct_count": base_cls_correct,
-                "class_accuracy": round(base_cls_correct / tot, 4),
+                "class_accuracy": round(base_cls_correct / 4, 4),
                 "benign_fp_count": fp,
                 "benign_fp_rate": round(fp / 2, 4),
-                "attack_tp_count": tp,
-                "attack_fn_count": fn,
+                "attack_tp_count": 2,
+                "attack_fn_count": 0,
                 "attack_recall": 1.0,
                 "correlated_correct_count": corr_correct,
                 "correlated_accuracy": round(corr_correct / 1, 4),
@@ -1044,30 +1048,20 @@ class TestClaimsLinter(unittest.TestCase):
                 }
             return entry
 
-        sb = make_model_entry(1, 1, 0, 0.4, [10.0, 20.0, 30.0, 40.0], trained=False)
-        sl = make_model_entry(2, 1, 0, 0.6, [12.0, 22.0, 32.0, 42.0], trained=True)
-        gb = make_model_entry(3, 0, 1, 0.7, [100.0, 200.0, 300.0, 400.0], trained=False)
-        gl = make_model_entry(4, 0, 1, 0.9, [110.0, 210.0, 310.0, 410.0], trained=True)
+        sb = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", False, 1, 1, 0, 0.4, [10.0, 20.0, 30.0, 40.0], 20.0, 40.0, 25.0)
+        sl = make_model_entry("HuggingFaceTB/SmolLM2-135M-Instruct", True, 2, 1, 0, 0.6, [12.0, 22.0, 32.0, 42.0], 22.0, 42.0, 27.0)
+        gb = make_model_entry("google/gemma-2-2b-it", False, 3, 0, 1, 0.7, [100.0, 200.0, 300.0, 400.0], 200.0, 400.0, 250.0)
+        gl = make_model_entry("google/gemma-2-2b-it", True, 4, 0, 1, 0.9, [110.0, 210.0, 310.0, 410.0], 210.0, 410.0, 260.0)
+        # Window 0 & 1 primary-only (12.0, 22.0); Window 2 & 3 escalated (32+310=342.0, 42+410=452.0).
         hyb_samples = [12.0, 22.0, 342.0, 452.0]
-        rec = sync_docs._format_expected_phase5_recommendation(
-            smol_label="SmolLM2-135M-Instruct",
-            gemma_label="Gemma-2B-IT",
-            smol_acc=sl["class_accuracy"],
-            gemma_acc=gl["class_accuracy"],
-            smol_fp=sl["benign_fp_count"],
-            gemma_fp=gl["benign_fp_count"],
-            smol_corr_acc=sl["correlated_accuracy"],
-            gemma_corr_acc=gl["correlated_accuracy"],
-            smol_qual=sl["explanation_quality_avg"],
-            gemma_qual=gl["explanation_quality_avg"],
-            smol_p50_ms=sl["latency_p50_ms"],
-            gemma_p50_ms=gl["latency_p50_ms"],
-            slowdown_x=round(gl["latency_p50_ms"] / sl["latency_p50_ms"], 2),
-            hybrid_esc_rate=0.5,
-            hybrid_acc=1.0,
-            hybrid_mean_ms=round(sum(hyb_samples) / len(hyb_samples), 3),
-            hybrid_speedup_x=round(gl["latency_mean_ms"] / (sum(hyb_samples) / len(hyb_samples)), 2),
-            warm_swap_ms=4.1,
+        rec = (
+            "In offline side-by-side holdout evaluation, Gemma-2B-IT LoRA improved holdout triage accuracy from "
+            "0.5000 (SmolLM2-135M-Instruct LoRA) to 1.0000, moved benign false positives from 1 to 0, changed "
+            "multi-window correlation accuracy from 0.0000 to 1.0000, and moved explanation quality from 0.6000 "
+            "to 0.9000. At P50 per-incident latency, Gemma-2B-IT took 210.00 ms vs 22.00 ms (9.55x slower on CPU), "
+            "while selective escalation routed 50.00% of alerts to Gemma-2B-IT for 1.0000 combined accuracy at "
+            "207.00 ms blended mean latency (20.38% faster mean turnaround than always running Gemma-2B-IT), "
+            "with resident PEFT hot-swaps completing in 4.1000 ms P50."
         )
         valid_payload = {
             "metadata": {"offline_mode": True},
@@ -1082,34 +1076,50 @@ class TestClaimsLinter(unittest.TestCase):
             },
             "models": {"smol_base": sb, "smol_lora": sl, "gemma_base": gb, "gemma_lora": gl},
             "hybrid_escalation": {
+                "policy": "high_critical",
                 "total_windows": 4,
                 "escalated_count": 2,
                 "primary_only_count": 2,
                 "escalation_rate": 0.5,
                 "class_correct_count": 4,
                 "class_accuracy": 1.0,
-                "blended_p50_ms": round(sync_docs._nearest_rank_percentile(sorted(hyb_samples), 50.0), 3),
-                "blended_mean_ms": round(sum(hyb_samples) / len(hyb_samples), 3),
+                "benign_fp_count": 0,
+                "benign_fp_rate": 0.0,
+                "correlated_correct_count": 1,
+                "correlated_accuracy": 1.0,
+                "mitre_correct_count": 2,
+                "mitre_accuracy": 1.0,
+                "explanation_quality_avg": 0.9,
+                "blended_p50_ms": 22.0,
+                "blended_mean_ms": 207.0,
+                "per_sample_escalated": [False, False, True, True],
                 "raw_blended_samples_ms": hyb_samples,
             },
             "live_adapter_hotswap": {
+                "peft_backend": "pytorch-peft",
+                "sidecar_cli_backend": "mock-inference-healthz",
+                "peft_cold_adapter_load_ms": 15.0,
                 "peft_warm_swap_p50_ms": 4.1,
                 "peft_warm_swap_max_ms": 4.2,
                 "raw_peft_warm_swap_ms": [4.0, 4.1, 4.2],
                 "sentinel_sidecar_verify_swap_p50_ms": 12.0,
                 "sentinel_sidecar_verify_swap_max_ms": 14.0,
+                "sentinel_sidecar_rollback_ms": 11.5,
                 "raw_sidecar_verify_swap_ms": [11.0, 12.0, 14.0],
+                "adapter_swaps_recorded": 4,
+                "post_rollback_adapter": "artifacts/smol-v2/model_adapters",
                 "zero_restart_verified": True,
             },
             "comparison": {
-                "lora_accuracy_gain_smol": round(sl["class_accuracy"] - sb["class_accuracy"], 4),
-                "lora_accuracy_gain_gemma": round(gl["class_accuracy"] - gb["class_accuracy"], 4),
-                "gemma_vs_smol_lora_accuracy_delta": round(gl["class_accuracy"] - sl["class_accuracy"], 4),
-                "gemma_vs_smol_fp_reduction": sl["benign_fp_count"] - gl["benign_fp_count"],
-                "gemma_vs_smol_correlated_accuracy_delta": round(gl["correlated_accuracy"] - sl["correlated_accuracy"], 4),
-                "gemma_vs_smol_explanation_quality_delta": round(gl["explanation_quality_avg"] - sl["explanation_quality_avg"], 4),
-                "gemma_vs_smol_p50_slowdown_x": round(gl["latency_p50_ms"] / sl["latency_p50_ms"], 2),
-                "hybrid_vs_gemma_mean_latency_speedup_x": round(gl["latency_mean_ms"] / (sum(hyb_samples) / len(hyb_samples)), 2),
+                "lora_accuracy_gain_smol": 0.25,
+                "lora_accuracy_gain_gemma": 0.25,
+                "gemma_vs_smol_lora_accuracy_delta": 0.5,
+                "gemma_vs_smol_fp_reduction": 1,
+                "gemma_vs_smol_correlated_accuracy_delta": 1.0,
+                "gemma_vs_smol_explanation_quality_delta": 0.3,
+                "gemma_vs_smol_p50_slowdown_x": 9.55,
+                "hybrid_vs_gemma_mean_turnaround_ratio": 0.7962,
+                "hybrid_vs_gemma_mean_latency_delta_pct": -20.38,
                 "recommendation": rec,
             },
         }
@@ -1126,6 +1136,65 @@ class TestClaimsLinter(unittest.TestCase):
             ok_bad, errs_bad = sync_docs.independent_recompute_phase5_comparison(bad_path)
             self.assertFalse(ok_bad)
             self.assertTrue(any("class_accuracy mismatch" in e for e in errs_bad), errs_bad)
+
+            # Reject tampered per-sample hybrid latencies even when blended_p50/mean agree with them.
+            bad_hyb = json.loads(json.dumps(valid_payload))
+            bad_hyb["hybrid_escalation"]["raw_blended_samples_ms"] = [1.0, 1.0, 1.0, 1.0]
+            bad_hyb["hybrid_escalation"]["blended_p50_ms"] = 1.0
+            bad_hyb["hybrid_escalation"]["blended_mean_ms"] = 1.0
+            bad_hyb_path = Path(tmp) / "bad_hyb.json"
+            bad_hyb_path.write_text(json.dumps(bad_hyb), encoding="utf-8")
+            ok_h, errs_h = sync_docs.independent_recompute_phase5_comparison(bad_hyb_path)
+            self.assertFalse(ok_h)
+            self.assertTrue(any("does not match component sum" in e for e in errs_h), errs_h)
+
+            # Reject out-of-range counts/rates (e.g. 5/4 = 1.25), missing Gemma training, and wrong model_id.
+            bad_bounds = json.loads(json.dumps(valid_payload))
+            bad_bounds["models"]["smol_base"]["format_valid_count"] = 5
+            bad_bounds["models"]["smol_base"]["format_compliance_rate"] = 1.25
+            bad_bounds["models"]["gemma_lora"].pop("training")
+            bad_bounds["models"]["gemma_base"]["model_id"] = "wrong/model"
+            bad_bounds["live_adapter_hotswap"]["zero_restart_verified"] = False
+            bad_bounds["live_adapter_hotswap"]["sentinel_sidecar_rollback_ms"] = -2.0
+            b_path = Path(tmp) / "bad_bounds.json"
+            b_path.write_text(json.dumps(bad_bounds), encoding="utf-8")
+            ok_b, errs_b = sync_docs.independent_recompute_phase5_comparison(b_path)
+            self.assertFalse(ok_b)
+            self.assertTrue(any("exceeds eval_total" in e for e in errs_b), errs_b)
+            self.assertTrue(any("outside [0, 1]" in e for e in errs_b), errs_b)
+            self.assertTrue(any("gemma_lora.training must be a JSON object" in e for e in errs_b), errs_b)
+            self.assertTrue(any("model_id must be" in e for e in errs_b), errs_b)
+            self.assertTrue(any("zero_restart_verified" in e for e in errs_b), errs_b)
+            self.assertTrue(any("sentinel_sidecar_rollback_ms" in e for e in errs_b), errs_b)
+
+            # Reject Markdown table P50 tamper when report_markdown parity is checked.
+            md_path = Path(tmp) / "2026-11-26-phase5-comparison.md"
+            md_lines = [
+                "| Tier / Model | Format Compliance | Class Accuracy | Benign FP (Rate) | Correlated Accuracy | MITRE Accuracy | Explanation Quality | Peak RSS (Delta) | P50 Latency | Mean Latency |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+                "| `SmolLM2-135M-Instruct` (Base) | 1.0000 | 0.2500 (1/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.4000 | 900.00 MB (+600.00) | 20.00 ms | 25.00 ms |",
+                "| `SmolLM2-135M-Instruct` (LoRA) | 1.0000 | 0.5000 (2/4) | 1 (0.5000) | 0.0000 | 1.0000 | 0.6000 | 900.00 MB (+600.00) | 22.00 ms | 27.00 ms |",
+                "| `google/gemma-2-2b-it` (Base) | 1.0000 | 0.7500 (3/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.7000 | 900.00 MB (+600.00) | 200.00 ms | 250.00 ms |",
+                "| `google/gemma-2-2b-it` (LoRA) | 1.0000 | 1.0000 (4/4) | 0 (0.0000) | 1.0000 | 1.0000 | 0.9000 | 900.00 MB (+600.00) | 210.00 ms | 260.00 ms |",
+                "| **Hybrid Escalation (`high_critical`, 0.5000 escalated)** | — | **1.0000 (4/4)** | **0 (0.0000)** | **1.0000** | **1.0000** | **0.9000** | Primary 900.00 MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **22.00 ms** | **207.00 ms** |",
+                "| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `pytorch-peft` | 15.00 ms |",
+                "| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `pytorch-peft` | 4.1000 ms / 4.2000 ms |",
+                "| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `mock-inference-healthz` | 12.00 ms / 14.00 ms |",
+                "| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `mock-inference-healthz` | 11.50 ms |",
+                rec,
+            ]
+            md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+            with_md = json.loads(json.dumps(valid_payload))
+            with_md["metadata"]["report_markdown"] = md_path.name
+            with_md_path = Path(tmp) / "with_md.json"
+            with_md_path.write_text(json.dumps(with_md), encoding="utf-8")
+            ok_m, errs_m = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertTrue(ok_m, errs_m)
+
+            md_path.write_text(md_path.read_text(encoding="utf-8").replace("210.00 ms", "999.00 ms"), encoding="utf-8")
+            ok_tm, errs_tm = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_tm)
+            self.assertTrue(any("table parity error" in e for e in errs_tm), errs_tm)
 
 
 if __name__ == "__main__":

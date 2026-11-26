@@ -220,6 +220,22 @@ func TestFTaaSClientSubmitAuditWaitAndActivate(t *testing.T) {
 	if err := SaveActiveAdapter(tmp, oversizedState); err == nil {
 		t.Fatal("expected SaveActiveAdapter to reject oversized manifest exceeding maxActiveAdapterBytes")
 	}
+
+	// Verify SaveActiveAdapter does not mutate caller-owned Escalation/Previous pointers.
+	callerEsc := &AdapterSlot{
+		JobID:       "esc-job",
+		BaseModel:   model.ModelGemma22BIT,
+		AdapterPath: "../escape",
+	}
+	err = SaveActiveAdapter(tmp, ActiveAdapter{
+		JobID:       "p-job",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/p1/model_adapters",
+		Escalation:  callerEsc,
+	})
+	if err == nil || callerEsc.JobID != "esc-job" || callerEsc.AdapterPath != "../escape" || !callerEsc.ActivatedAt.IsZero() {
+		t.Fatalf("expected failed SaveActiveAdapter without mutating caller pointers, err=%v callerEsc=%+v", err, callerEsc)
+	}
 }
 
 func TestFTaaSClientRejectsBitNetNonLoopbackBadURLAndUnredactedPIIWithoutUpload(t *testing.T) {

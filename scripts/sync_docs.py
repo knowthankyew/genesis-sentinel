@@ -1316,32 +1316,51 @@ def _format_expected_phase5_recommendation(
     smol_p50_ms: float,
     gemma_p50_ms: float,
     slowdown_x: float,
+    faster_x: float,
     hybrid_esc_rate: float,
     hybrid_acc: float,
     hybrid_mean_ms: float,
-    hybrid_speedup_x: float,
+    gemma_mean_ms: float,
+    hybrid_abs_delta_pct: float,
     warm_swap_ms: float,
 ) -> str:
-    if gemma_acc >= smol_acc:
+    if gemma_acc > smol_acc:
         acc_phrase = (
             f"{gemma_label} LoRA improved holdout triage accuracy from "
             f"{smol_acc:.4f} ({smol_label} LoRA) to {gemma_acc:.4f}"
+        )
+    elif gemma_acc == smol_acc:
+        acc_phrase = (
+            f"{gemma_label} LoRA matched {smol_label} LoRA holdout triage accuracy at {gemma_acc:.4f}"
         )
     else:
         acc_phrase = (
             f"{gemma_label} LoRA measured {gemma_acc:.4f} accuracy vs "
             f"{smol_label} LoRA at {smol_acc:.4f}"
         )
+
+    if gemma_p50_ms > smol_p50_ms:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({slowdown_x:.2f}x slower on CPU)"
+    elif gemma_p50_ms < smol_p50_ms:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({faster_x:.2f}x faster on CPU)"
+    else:
+        p50_phrase = f"{gemma_p50_ms:.2f} ms (matched {smol_p50_ms:.2f} ms)"
+
+    if hybrid_mean_ms < gemma_mean_ms:
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% faster mean turnaround than always running {gemma_label}"
+    elif hybrid_mean_ms > gemma_mean_ms:
+        turnaround_phrase = f"{hybrid_abs_delta_pct:.2f}% slower mean turnaround than always running {gemma_label}"
+    else:
+        turnaround_phrase = f"matched mean turnaround vs always running {gemma_label}"
+
     return (
         f"In offline side-by-side holdout evaluation, {acc_phrase}, moved benign false positives "
         f"from {smol_fp} to {gemma_fp}, changed multi-window correlation accuracy from "
         f"{smol_corr_acc:.4f} to {gemma_corr_acc:.4f}, and moved explanation quality from "
         f"{smol_qual:.4f} to {gemma_qual:.4f}. At P50 per-incident latency, {gemma_label} took "
-        f"{gemma_p50_ms:.2f} ms vs {smol_p50_ms:.2f} ms ({slowdown_x:.2f}x slower on CPU), while "
-        f"selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
+        f"{p50_phrase}, while selective escalation routed {hybrid_esc_rate:.2%} of alerts to {gemma_label} for "
         f"{hybrid_acc:.4f} combined accuracy at {hybrid_mean_ms:.2f} ms blended mean latency "
-        f"({hybrid_speedup_x:.2f}x faster mean turnaround than always running {gemma_label}), "
-        f"with cached PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
+        f"({turnaround_phrase}), with resident PEFT hot-swaps completing in {warm_swap_ms:.4f} ms P50."
     )
 
 
@@ -1405,11 +1424,24 @@ def independent_recompute_phase5_comparison(
     if eval_corr > eval_attack:
         errors.append(f"phase5 dataset eval_correlated_windows ({eval_corr}) exceeds eval_attack_windows ({eval_attack})")
 
-    recomputed_models: dict[str, dict[str, float | int]] = {}
+    expected_slot_contracts = {
+        "smol_base": ("HuggingFaceTB/SmolLM2-135M-Instruct", False),
+        "smol_lora": ("HuggingFaceTB/SmolLM2-135M-Instruct", True),
+        "gemma_base": ("google/gemma-2-2b-it", False),
+        "gemma_lora": ("google/gemma-2-2b-it", True),
+    }
+
+    recomputed_models: dict[str, dict[str, object]] = {}
     for key in ("smol_base", "smol_lora", "gemma_base", "gemma_lora"):
         sec = _req_dict(models, key, errors, "models")
         if sec is None:
             continue
+        exp_model, exp_trained = expected_slot_contracts[key]
+        if sec.get("model_id") != exp_model:
+            errors.append(f"phase5 {key}.model_id must be {exp_model!r}, got {sec.get('model_id')!r}")
+        if not isinstance(sec.get("adapter_trained"), bool) or sec.get("adapter_trained") is not exp_trained:
+            errors.append(f"phase5 {key}.adapter_trained must be {exp_trained!r}, got {sec.get('adapter_trained')!r}")
+
         rss_before = _req_num(sec, "rss_before_model_mb", errors, key)
         rss_after = _req_num(sec, "rss_after_model_mb", errors, key)
         rss_delta = _req_num(sec, "rss_delta_mb", errors, key)
@@ -1445,14 +1477,20 @@ def independent_recompute_phase5_comparison(
         if None in (ev_tot, fmt_cnt, fmt_rate, cls_cnt, cls_acc, fp_cnt, fp_rate, tp_cnt, fn_cnt, att_rec, corr_cnt, corr_acc, mitre_cnt, mitre_acc, qual_avg, p50, p99, lmean):
             continue
 
+        if fmt_cnt > ev_tot:
+            errors.append(f"phase5 {key} format_valid_count ({fmt_cnt}) exceeds eval_total ({ev_tot})")
+        if cls_cnt > fmt_cnt:
+            errors.append(f"phase5 {key} class_correct_count ({cls_cnt}) exceeds format_valid_count ({fmt_cnt})")
         if fp_cnt > eval_benign:
             errors.append(f"phase5 {key} benign_fp_count ({fp_cnt}) exceeds eval_benign_windows ({eval_benign})")
         if tp_cnt + fn_cnt != eval_attack:
             errors.append(f"phase5 {key} attack tp+fn ({tp_cnt + fn_cnt}) != eval_attack_windows ({eval_attack})")
-        if corr_cnt > eval_corr:
-            errors.append(f"phase5 {key} correlated_correct_count ({corr_cnt}) exceeds eval_correlated_windows ({eval_corr})")
-        if mitre_cnt > mitre_app:
-            errors.append(f"phase5 {key} mitre_correct_count ({mitre_cnt}) exceeds mitre_applicable_windows ({mitre_app})")
+        if corr_cnt > eval_corr or corr_cnt > fmt_cnt:
+            errors.append(f"phase5 {key} correlated_correct_count ({corr_cnt}) out of range (corr={eval_corr}, fmt={fmt_cnt})")
+        if mitre_cnt > mitre_app or mitre_cnt > fmt_cnt:
+            errors.append(f"phase5 {key} mitre_correct_count ({mitre_cnt}) out of range (app={mitre_app}, fmt={fmt_cnt})")
+        if not (0.0 <= qual_avg <= 1.0):
+            errors.append(f"phase5 {key} explanation_quality_avg ({qual_avg}) outside [0, 1]")
 
         checks = (
             ("format_compliance_rate", fmt_rate, round(fmt_cnt / ev_tot, 4)),
@@ -1463,7 +1501,9 @@ def independent_recompute_phase5_comparison(
             ("mitre_accuracy", mitre_acc, round(mitre_cnt / mitre_app, 4)),
         )
         for lbl, st_val, calc_val in checks:
-            if f"{st_val:.4f}" != f"{calc_val:.4f}":
+            if not (0.0 <= st_val <= 1.0):
+                errors.append(f"phase5 {key} {lbl} ({st_val}) outside [0, 1]")
+            elif f"{st_val:.4f}" != f"{calc_val:.4f}":
                 errors.append(f"phase5 {key} {lbl} mismatch: stored {st_val:.4f}, calc {calc_val:.4f}")
 
         raw_samples = _req_sample_array(sec, "raw_samples_ms", eval_total, errors, key)
@@ -1483,7 +1523,8 @@ def independent_recompute_phase5_comparison(
             if f"{lmean:.3f}" != f"{calc_mean:.3f}":
                 errors.append(f"phase5 {key} latency_mean_ms mismatch: stored {lmean:.3f}, calc {calc_mean:.3f}")
 
-        if sec.get("adapter_trained") is True:
+        tr_sec = None
+        if exp_trained:
             tr_sec = _req_dict(sec, "training", errors, key)
             if tr_sec is not None:
                 ep = _req_int(tr_sec, "epochs", errors, f"{key}.training", min_val=1)
@@ -1499,12 +1540,21 @@ def independent_recompute_phase5_comparison(
                     errors.append(f"phase5 {key}.training.trainable_params ({tr_p}) must be < all_params ({all_p})")
 
         recomputed_models[key] = {
+            "fmt_rate": round(fmt_cnt / ev_tot, 4),
             "acc": round(cls_cnt / ev_tot, 4),
+            "cls_cnt": cls_cnt,
+            "ev_tot": ev_tot,
             "fp": fp_cnt,
+            "fp_rate": round(fp_cnt / eval_benign, 4),
             "corr_acc": round(corr_cnt / eval_corr, 4),
+            "mitre_acc": round(mitre_cnt / mitre_app, 4),
             "qual": qual_avg,
+            "rss_after": rss_after,
+            "rss_delta": round(max((rss_after or 0.0) - (rss_before or 0.0), 0.0), 2),
             "p50": eff_p50,
             "mean": eff_mean,
+            "raw_samples": raw_samples,
+            "training": tr_sec,
         }
 
     # Hybrid escalation validation
@@ -1514,23 +1564,69 @@ def independent_recompute_phase5_comparison(
     hyb_rate = _req_num(hybrid, "escalation_rate", errors, "hybrid_escalation")
     hyb_cls = _req_int(hybrid, "class_correct_count", errors, "hybrid_escalation", min_val=0)
     hyb_acc = _req_num(hybrid, "class_accuracy", errors, "hybrid_escalation")
+    hyb_fp = _req_int(hybrid, "benign_fp_count", errors, "hybrid_escalation", min_val=0)
+    hyb_fp_rate = _req_num(hybrid, "benign_fp_rate", errors, "hybrid_escalation")
+    hyb_corr_cnt = _req_int(hybrid, "correlated_correct_count", errors, "hybrid_escalation", min_val=0)
+    hyb_corr_acc = _req_num(hybrid, "correlated_accuracy", errors, "hybrid_escalation")
+    hyb_mitre_cnt = _req_int(hybrid, "mitre_correct_count", errors, "hybrid_escalation", min_val=0)
+    hyb_mitre_acc = _req_num(hybrid, "mitre_accuracy", errors, "hybrid_escalation")
+    hyb_qual = _req_num(hybrid, "explanation_quality_avg", errors, "hybrid_escalation")
     hyb_mean = _req_num(hybrid, "blended_mean_ms", errors, "hybrid_escalation")
     hyb_p50 = _req_num(hybrid, "blended_p50_ms", errors, "hybrid_escalation")
     eff_hyb_mean = hyb_mean
-    if None not in (hyb_tot, hyb_esc, hyb_pri, hyb_rate, hyb_cls, hyb_acc, hyb_mean, hyb_p50):
+    eff_hyb_p50 = hyb_p50
+    if None not in (hyb_tot, hyb_esc, hyb_pri, hyb_rate, hyb_cls, hyb_acc, hyb_fp, hyb_fp_rate, hyb_corr_cnt, hyb_corr_acc, hyb_mitre_cnt, hyb_mitre_acc, hyb_qual, hyb_mean, hyb_p50):
         if hyb_tot != eval_total:
             errors.append(f"phase5 hybrid_escalation.total_windows ({hyb_tot}) != {eval_total}")
         if hyb_esc + hyb_pri != hyb_tot:
             errors.append(f"phase5 hybrid escalated({hyb_esc}) + primary_only({hyb_pri}) != {hyb_tot}")
-        if f"{hyb_rate:.4f}" != f"{round(hyb_esc / hyb_tot, 4):.4f}":
-            errors.append(f"phase5 hybrid escalation_rate mismatch: stored {hyb_rate:.4f}, calc {round(hyb_esc / hyb_tot, 4):.4f}")
-        if f"{hyb_acc:.4f}" != f"{round(hyb_cls / hyb_tot, 4):.4f}":
-            errors.append(f"phase5 hybrid class_accuracy mismatch: stored {hyb_acc:.4f}, calc {round(hyb_cls / hyb_tot, 4):.4f}")
+        if hyb_cls > hyb_tot:
+            errors.append(f"phase5 hybrid class_correct_count ({hyb_cls}) exceeds total_windows ({hyb_tot})")
+        if hyb_fp > eval_benign:
+            errors.append(f"phase5 hybrid benign_fp_count ({hyb_fp}) exceeds eval_benign_windows ({eval_benign})")
+        if hyb_corr_cnt > eval_corr:
+            errors.append(f"phase5 hybrid correlated_correct_count ({hyb_corr_cnt}) exceeds eval_correlated_windows ({eval_corr})")
+        if hyb_mitre_cnt > mitre_app:
+            errors.append(f"phase5 hybrid mitre_correct_count ({hyb_mitre_cnt}) exceeds mitre_applicable_windows ({mitre_app})")
+        for rlbl, rval, calc_r in (
+            ("escalation_rate", hyb_rate, round(hyb_esc / hyb_tot, 4)),
+            ("class_accuracy", hyb_acc, round(hyb_cls / hyb_tot, 4)),
+            ("benign_fp_rate", hyb_fp_rate, round(hyb_fp / eval_benign, 4)),
+            ("correlated_accuracy", hyb_corr_acc, round(hyb_corr_cnt / eval_corr, 4)),
+            ("mitre_accuracy", hyb_mitre_acc, round(hyb_mitre_cnt / mitre_app, 4)),
+        ):
+            if not (0.0 <= rval <= 1.0):
+                errors.append(f"phase5 hybrid {rlbl} ({rval}) outside [0, 1]")
+            elif f"{rval:.4f}" != f"{calc_r:.4f}":
+                errors.append(f"phase5 hybrid {rlbl} mismatch: stored {rval:.4f}, calc {calc_r:.4f}")
+        if not (0.0 <= hyb_qual <= 1.0):
+            errors.append(f"phase5 hybrid explanation_quality_avg ({hyb_qual}) outside [0, 1]")
+
         raw_hyb = _req_sample_array(hybrid, "raw_blended_samples_ms", eval_total, errors, "hybrid_escalation")
+        esc_flags = hybrid.get("per_sample_escalated")
+        if not isinstance(esc_flags, list) or len(esc_flags) != eval_total or not all(isinstance(x, bool) for x in esc_flags):
+            errors.append(f"phase5 hybrid_escalation.per_sample_escalated must contain {eval_total} booleans")
+        elif sum(1 for x in esc_flags if x) != hyb_esc:
+            errors.append(
+                f"phase5 hybrid per_sample_escalated true count ({sum(1 for x in esc_flags if x)}) != escalated_count ({hyb_esc})"
+            )
+        elif raw_hyb is not None and "smol_lora" in recomputed_models and "gemma_lora" in recomputed_models:
+            smol_raw = recomputed_models["smol_lora"].get("raw_samples")
+            gemma_raw = recomputed_models["gemma_lora"].get("raw_samples")
+            if isinstance(smol_raw, list) and isinstance(gemma_raw, list) and len(smol_raw) == eval_total and len(gemma_raw) == eval_total:
+                for idx_h, (flag, h_ms, s_ms, g_ms) in enumerate(zip(esc_flags, raw_hyb, smol_raw, gemma_raw)):
+                    exp_ms = round(float(s_ms) + float(g_ms), 3) if flag else float(s_ms)
+                    if abs(float(h_ms) - exp_ms) > 0.002:
+                        errors.append(
+                            f"phase5 hybrid_escalation.raw_blended_samples_ms[{idx_h}] ({h_ms}) does not match component sum ({exp_ms}, escalated={flag})"
+                        )
+                        break
+
         if raw_hyb is not None:
             sorted_h = sorted(raw_hyb)
             calc_hp50 = round(_nearest_rank_percentile(sorted_h, 50.0), 3)
             calc_hmean = round(sum(raw_hyb) / len(raw_hyb), 3)
+            eff_hyb_p50 = calc_hp50
             eff_hyb_mean = calc_hmean
             if f"{hyb_p50:.3f}" != f"{calc_hp50:.3f}":
                 errors.append(f"phase5 hybrid blended_p50_ms mismatch: stored {hyb_p50:.3f}, calc {calc_hp50:.3f}")
@@ -1538,8 +1634,11 @@ def independent_recompute_phase5_comparison(
                 errors.append(f"phase5 hybrid blended_mean_ms mismatch: stored {hyb_mean:.3f}, calc {calc_hmean:.3f}")
 
     # Hot-swap benchmark validation
+    peft_cold = _req_num(hotswap, "peft_cold_adapter_load_ms", errors, "live_adapter_hotswap")
     peft_p50 = _req_num(hotswap, "peft_warm_swap_p50_ms", errors, "live_adapter_hotswap")
     peft_max = _req_num(hotswap, "peft_warm_swap_max_ms", errors, "live_adapter_hotswap")
+    if peft_cold is not None and peft_cold <= 0:
+        errors.append(f"phase5 live_adapter_hotswap.peft_cold_adapter_load_ms must be positive, got {peft_cold}")
     raw_peft_swaps = hotswap.get("raw_peft_warm_swap_ms")
     eff_warm_swap = peft_p50
     if isinstance(raw_peft_swaps, list) and raw_peft_swaps and all(_is_finite_num(x) and x > 0 for x in raw_peft_swaps):
@@ -1556,6 +1655,12 @@ def independent_recompute_phase5_comparison(
 
     sc_p50 = _req_num(hotswap, "sentinel_sidecar_verify_swap_p50_ms", errors, "live_adapter_hotswap")
     sc_max = _req_num(hotswap, "sentinel_sidecar_verify_swap_max_ms", errors, "live_adapter_hotswap")
+    sc_rollback = _req_num(hotswap, "sentinel_sidecar_rollback_ms", errors, "live_adapter_hotswap")
+    if sc_rollback is not None and sc_rollback <= 0:
+        errors.append(f"phase5 live_adapter_hotswap.sentinel_sidecar_rollback_ms must be positive, got {sc_rollback}")
+    zero_restart = hotswap.get("zero_restart_verified")
+    if zero_restart is not True:
+        errors.append(f"phase5 live_adapter_hotswap.zero_restart_verified must be boolean True, got {zero_restart!r}")
     raw_sc_swaps = hotswap.get("raw_sidecar_verify_swap_ms")
     if isinstance(raw_sc_swaps, list) and raw_sc_swaps and all(_is_finite_num(x) and x > 0 for x in raw_sc_swaps):
         ss = sorted(float(x) for x in raw_sc_swaps)
@@ -1563,11 +1668,22 @@ def independent_recompute_phase5_comparison(
             errors.append("phase5 sentinel_sidecar_verify_swap_p50_ms raw-sample mismatch")
         if sc_max is not None and f"{sc_max:.2f}" != f"{round(max(ss), 2):.2f}":
             errors.append("phase5 sentinel_sidecar_verify_swap_max_ms raw-sample mismatch")
+        swaps_rec = hotswap.get("adapter_swaps_recorded")
+        if require_governed_fields or "adapter_swaps_recorded" in hotswap:
+            if isinstance(swaps_rec, bool) or not isinstance(swaps_rec, int) or swaps_rec < len(raw_sc_swaps) + 1:
+                errors.append(f"phase5 adapter_swaps_recorded ({swaps_rec!r}) < expected swap+rollback operations ({len(raw_sc_swaps) + 1})")
+        if require_governed_fields or "post_rollback_adapter" in hotswap:
+            post_rb = hotswap.get("post_rollback_adapter")
+            if not isinstance(post_rb, str) or not post_rb.strip():
+                errors.append("phase5 live_adapter_hotswap.post_rollback_adapter must be non-empty when zero_restart_verified=true")
     else:
         errors.append("phase5 live_adapter_hotswap.raw_sidecar_verify_swap_ms must be a non-empty positive array")
 
-    # Cross-model deltas and AST-governed conclusion string
-    if all(k in recomputed_models for k in ("smol_base", "smol_lora", "gemma_base", "gemma_lora")) and eff_hyb_mean is not None and eff_warm_swap is not None and hyb_rate is not None and hyb_acc is not None:
+    # Cross-model deltas and direction-aware governed conclusion string
+    if (
+        all(k in recomputed_models for k in ("smol_base", "smol_lora", "gemma_base", "gemma_lora"))
+        and None not in (hyb_tot, hyb_esc, hyb_cls, hyb_rate, hyb_acc, eff_hyb_mean, eff_warm_swap)
+    ):
         sb, sl, gb, gl = (
             recomputed_models["smol_base"],
             recomputed_models["smol_lora"],
@@ -1575,7 +1691,9 @@ def independent_recompute_phase5_comparison(
             recomputed_models["gemma_lora"],
         )
         exp_slowdown = round(float(gl["p50"]) / max(float(sl["p50"]), 0.001), 2)
-        exp_speedup = round(float(gl["mean"]) / max(float(eff_hyb_mean), 0.001), 2)
+        exp_faster = round(float(sl["p50"]) / max(float(gl["p50"]), 0.001), 2)
+        exp_hyb_ratio = round(float(eff_hyb_mean) / max(float(gl["mean"]), 0.001), 4)
+        exp_hyb_delta_pct = round(((float(eff_hyb_mean) - float(gl["mean"])) / max(float(gl["mean"]), 0.001)) * 100.0, 2)
         checks_cmp = (
             ("lora_accuracy_gain_smol", round(float(sl["acc"]) - float(sb["acc"]), 4), 4),
             ("lora_accuracy_gain_gemma", round(float(gl["acc"]) - float(gb["acc"]), 4), 4),
@@ -1583,7 +1701,8 @@ def independent_recompute_phase5_comparison(
             ("gemma_vs_smol_correlated_accuracy_delta", round(float(gl["corr_acc"]) - float(sl["corr_acc"]), 4), 4),
             ("gemma_vs_smol_explanation_quality_delta", round(float(gl["qual"]) - float(sl["qual"]), 4), 4),
             ("gemma_vs_smol_p50_slowdown_x", exp_slowdown, 2),
-            ("hybrid_vs_gemma_mean_latency_speedup_x", exp_speedup, 2),
+            ("hybrid_vs_gemma_mean_turnaround_ratio", exp_hyb_ratio, 4),
+            ("hybrid_vs_gemma_mean_latency_delta_pct", exp_hyb_delta_pct, 2),
         )
         for field_name, exp_val, dec_places in checks_cmp:
             st_v = _req_num(cmp_sec, field_name, errors, "comparison")
@@ -1613,10 +1732,12 @@ def independent_recompute_phase5_comparison(
                     smol_p50_ms=float(sl["p50"]),
                     gemma_p50_ms=float(gl["p50"]),
                     slowdown_x=exp_slowdown,
+                    faster_x=exp_faster,
                     hybrid_esc_rate=round(hyb_esc / hyb_tot, 4),
                     hybrid_acc=round(hyb_cls / hyb_tot, 4),
                     hybrid_mean_ms=float(eff_hyb_mean),
-                    hybrid_speedup_x=exp_speedup,
+                    gemma_mean_ms=float(gl["mean"]),
+                    hybrid_abs_delta_pct=abs(exp_hyb_delta_pct),
                     warm_swap_ms=float(eff_warm_swap),
                 )
                 if rec_text != exp_rec:
@@ -1624,6 +1745,54 @@ def independent_recompute_phase5_comparison(
                         f"phase5 comparison.recommendation drifted from recomputed metrics:\n"
                         f"  stored  : {rec_text!r}\n  expected: {exp_rec!r}"
                     )
+
+        # Published Markdown report parity cross-check (tables + conclusion)
+        if require_governed_fields or "report_markdown" in meta:
+            report_rel = meta.get("report_markdown")
+            report_path: Path | None = None
+            if not isinstance(report_rel, str) or not report_rel.strip():
+                errors.append(f"phase5 metadata.report_markdown is missing or invalid: {report_rel!r}")
+            elif Path(report_rel).is_absolute():
+                errors.append(f"phase5 report_markdown must be repo-relative, got {report_rel!r}")
+            else:
+                try:
+                    cand = (repo_root / report_rel).resolve()
+                    cand.relative_to(repo_root.resolve())
+                except (ValueError, OSError) as exc:
+                    errors.append(f"phase5 report_markdown escapes repository root: {report_rel!r} ({exc})")
+                else:
+                    if not cand.is_file():
+                        errors.append(f"phase5 report_markdown not found: {report_rel!r}")
+                    else:
+                        report_path = cand
+            if report_path is not None and not errors:
+                try:
+                    md_text = report_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    return False, [f"Failed to read {report_rel}: {exc}"]
+                if _has_personal_host_path_text(md_text):
+                    errors.append(f"Phase 5 Markdown report {report_rel} contains leaked personal host path")
+                published_rows, _, dup_labels = _extract_published_markdown_table_rows(md_text)
+                if dup_labels:
+                    errors.append(f"Phase 5 Markdown report {report_rel} contains duplicate metric rows: {dup_labels}")
+                expected_md_rows: list[str] = []
+                if None not in (peft_cold, sc_rollback, eff_hyb_p50) and raw_sc_swaps:
+                    expected_md_rows = [
+                        f"| `SmolLM2-135M-Instruct` (Base) | {sb['fmt_rate']:.4f} | {sb['acc']:.4f} ({sb['cls_cnt']}/{sb['ev_tot']}) | {sb['fp']} ({sb['fp_rate']:.4f}) | {sb['corr_acc']:.4f} | {sb['mitre_acc']:.4f} | {sb['qual']:.4f} | {sb['rss_after']:.2f} MB (+{sb['rss_delta']:.2f}) | {sb['p50']:.2f} ms | {sb['mean']:.2f} ms |",
+                        f"| `SmolLM2-135M-Instruct` (LoRA) | {sl['fmt_rate']:.4f} | {sl['acc']:.4f} ({sl['cls_cnt']}/{sl['ev_tot']}) | {sl['fp']} ({sl['fp_rate']:.4f}) | {sl['corr_acc']:.4f} | {sl['mitre_acc']:.4f} | {sl['qual']:.4f} | {sl['rss_after']:.2f} MB (+{sl['rss_delta']:.2f}) | {sl['p50']:.2f} ms | {sl['mean']:.2f} ms |",
+                        f"| `google/gemma-2-2b-it` (Base) | {gb['fmt_rate']:.4f} | {gb['acc']:.4f} ({gb['cls_cnt']}/{gb['ev_tot']}) | {gb['fp']} ({gb['fp_rate']:.4f}) | {gb['corr_acc']:.4f} | {gb['mitre_acc']:.4f} | {gb['qual']:.4f} | {gb['rss_after']:.2f} MB (+{gb['rss_delta']:.2f}) | {gb['p50']:.2f} ms | {gb['mean']:.2f} ms |",
+                        f"| `google/gemma-2-2b-it` (LoRA) | {gl['fmt_rate']:.4f} | {gl['acc']:.4f} ({gl['cls_cnt']}/{gl['ev_tot']}) | {gl['fp']} ({gl['fp_rate']:.4f}) | {gl['corr_acc']:.4f} | {gl['mitre_acc']:.4f} | {gl['qual']:.4f} | {gl['rss_after']:.2f} MB (+{gl['rss_delta']:.2f}) | {gl['p50']:.2f} ms | {gl['mean']:.2f} ms |",
+                        f"| **Hybrid Escalation (`{hybrid.get('policy', '')}`, {round(hyb_esc / hyb_tot, 4):.4f} escalated)** | — | **{round(hyb_cls / hyb_tot, 4):.4f} ({hyb_cls}/{hyb_tot})** | **{hyb_fp} ({round(hyb_fp / eval_benign, 4):.4f})** | **{round(hyb_corr_cnt / eval_corr, 4):.4f}** | **{round(hyb_mitre_cnt / mitre_app, 4):.4f}** | **{hyb_qual:.4f}** | Primary {sl['rss_after']:.2f} MB isolated peak RSS (+ Gemma on-demand, not co-measured) | **{eff_hyb_p50:.2f} ms** | **{eff_hyb_mean:.2f} ms** |",
+                        f"| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `{hotswap.get('peft_backend', '')}` | {peft_cold:.2f} ms |",
+                        f"| PyTorch PEFT Resident Adapter Switch (`set_adapter` P50 / Max) | `{hotswap.get('peft_backend', '')}` | {eff_warm_swap:.4f} ms / {calc_smax:.4f} ms |",
+                        f"| Sentinel Sidecar CLI Swap (`sentinel adapter swap --verify`, P50 / Max) | `{hotswap.get('sidecar_cli_backend', '')}` | {round(_nearest_rank_percentile(ss, 50.0), 2):.2f} ms / {round(max(ss), 2):.2f} ms |",
+                        f"| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `{hotswap.get('sidecar_cli_backend', '')}` | {sc_rollback:.2f} ms |",
+                    ]
+                for erow in expected_md_rows:
+                    if erow not in published_rows:
+                        errors.append(f"Phase 5 JSON/Markdown table parity error: expected row {erow!r} missing from {report_rel}")
+                if cmp_sec.get("recommendation", "") not in md_text:
+                    errors.append(f"Phase 5 Markdown report {report_rel} conclusion drifted from JSON comparison.recommendation")
 
     if not errors and validated_json_cache is not None:
         validated_json_cache[phase5_json_path.resolve()] = data

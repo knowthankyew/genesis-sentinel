@@ -3,6 +3,7 @@ package train
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,9 @@ import (
 )
 
 const maxActiveAdapterBytes = 64 * 1024
+
+// MaxAdapterResponseBytes bounds HTTP /adapter status responses returned to the CLI client.
+const MaxAdapterResponseBytes = maxActiveAdapterBytes
 
 // ActiveAdapterFilename persists the operator-activated LoRA adapter reference under DataDir
 // and is wiped cleanly by `sentinel burn`.
@@ -41,6 +45,10 @@ const (
 
 // ErrNoRollbackAvailable is returned when rolling back a slot that has no recorded prior adapter.
 var ErrNoRollbackAvailable = errors.New("no previous adapter snapshot available for rollback")
+
+// ErrRollbackTargetChanged is returned when the persisted rollback snapshot changes
+// between preflight verification and rollback commit.
+var ErrRollbackTargetChanged = errors.New("rollback target changed while preflight verification was pending")
 
 // AdapterSlot identifies a validated base model and relative LoRA adapter path pair
 // persisted for the primary or escalation tier, or preserved as a rollback snapshot.
@@ -182,12 +190,30 @@ func validateAndNormalizeManifest(state *ActiveAdapter) error {
 	return nil
 }
 
+func cloneActiveAdapter(state ActiveAdapter) ActiveAdapter {
+	cp := state
+	if state.Escalation != nil {
+		esc := *state.Escalation
+		cp.Escalation = &esc
+	}
+	if state.Previous != nil {
+		prev := *state.Previous
+		cp.Previous = &prev
+	}
+	if state.PreviousEscalation != nil {
+		prevEsc := *state.PreviousEscalation
+		cp.PreviousEscalation = &prevEsc
+	}
+	return cp
+}
+
 // SaveActiveAdapter validates state and atomically writes active-adapter.json (0600) inside dataDir.
 func SaveActiveAdapter(dataDir string, state ActiveAdapter) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("data_dir is empty")
 	}
-	if err := validateAndNormalizeManifest(&state); err != nil {
+	normalized := cloneActiveAdapter(state)
+	if err := validateAndNormalizeManifest(&normalized); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -198,22 +224,24 @@ func SaveActiveAdapter(dataDir string, state ActiveAdapter) error {
 		return fmt.Errorf("lock data dir %q: %w", dataDir, err)
 	}
 	defer unlockDir()
-	return writeActiveAdapterUnlocked(dataDir, state)
+	_, err = writeActiveAdapterUnlocked(dataDir, normalized)
+	return err
 }
 
-func writeActiveAdapterUnlocked(dataDir string, state ActiveAdapter) error {
+func writeActiveAdapterUnlocked(dataDir string, state ActiveAdapter) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	payload, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return err
+		return zero, err
 	}
 	payload = append(payload, '\n')
 	if len(payload) > maxActiveAdapterBytes {
-		return fmt.Errorf("active adapter manifest (%d bytes) exceeds %d-byte limit", len(payload), maxActiveAdapterBytes)
+		return zero, fmt.Errorf("active adapter manifest (%d bytes) exceeds %d-byte limit", len(payload), maxActiveAdapterBytes)
 	}
 
 	tmp, err := os.CreateTemp(dataDir, ".active-adapter-*.tmp")
 	if err != nil {
-		return err
+		return zero, err
 	}
 	tmpPath := tmp.Name()
 	success := false
@@ -225,149 +253,195 @@ func writeActiveAdapterUnlocked(dataDir string, state ActiveAdapter) error {
 	}()
 
 	if err := tmp.Chmod(0600); err != nil {
-		return err
+		return zero, err
 	}
 	if _, err := tmp.Write(payload); err != nil {
-		return err
+		return zero, err
 	}
 	if err := tmp.Sync(); err != nil {
-		return err
+		return zero, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return zero, err
 	}
 	if err := os.Rename(tmpPath, filepath.Join(dataDir, ActiveAdapterFilename)); err != nil {
-		return err
+		return zero, err
 	}
 	success = true
-	return nil
+	return sha256.Sum256(payload), nil
 }
 
-func readAndValidateManifest(dataDir string) (ActiveAdapter, bool, error) {
+func readAndValidateManifestWithHash(dataDir string) (ActiveAdapter, [sha256.Size]byte, bool, error) {
+	var zero [sha256.Size]byte
 	if strings.TrimSpace(dataDir) == "" {
-		return ActiveAdapter{}, false, nil
+		return ActiveAdapter{}, zero, false, nil
 	}
 	path := filepath.Join(dataDir, ActiveAdapterFilename)
 	f, fi, err := feedback.OpenRegularFileNonBlocking(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return ActiveAdapter{}, false, nil
+			return ActiveAdapter{}, zero, false, nil
 		}
-		return ActiveAdapter{}, true, fmt.Errorf("open active adapter %q: %w", path, err)
+		return ActiveAdapter{}, zero, true, fmt.Errorf("open active adapter %q: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 	if fi.Size() > maxActiveAdapterBytes {
-		return ActiveAdapter{}, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
+		return ActiveAdapter{}, zero, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxActiveAdapterBytes+1))
 	if err != nil {
-		return ActiveAdapter{}, true, fmt.Errorf("read %q: %w", path, err)
+		return ActiveAdapter{}, zero, true, fmt.Errorf("read %q: %w", path, err)
 	}
 	if len(data) > maxActiveAdapterBytes {
-		return ActiveAdapter{}, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
+		return ActiveAdapter{}, zero, true, fmt.Errorf("active adapter manifest %q exceeds %d-byte limit", path, maxActiveAdapterBytes)
 	}
+	hash := sha256.Sum256(data)
 	var state ActiveAdapter
 	if err := json.Unmarshal(data, &state); err != nil {
-		return ActiveAdapter{}, true, fmt.Errorf("parse %q: %w", path, err)
+		return ActiveAdapter{}, hash, true, fmt.Errorf("parse %q: %w", path, err)
 	}
 	if err := validateAndNormalizeManifest(&state); err != nil {
-		return ActiveAdapter{}, true, fmt.Errorf("invalid active adapter in %q: %w", path, err)
+		return ActiveAdapter{}, hash, true, fmt.Errorf("invalid active adapter in %q: %w", path, err)
 	}
-	return state, true, nil
+	return state, hash, true, nil
+}
+
+// LoadActiveAdapterWithHash loads, validates, and SHA-256-hashes active-adapter.json
+// from dataDir under the directory lock so readers never observe half-written transitions.
+func LoadActiveAdapterWithHash(dataDir string) (ActiveAdapter, [sha256.Size]byte, bool, error) {
+	var zero [sha256.Size]byte
+	if strings.TrimSpace(dataDir) == "" {
+		return ActiveAdapter{}, zero, false, nil
+	}
+	if _, err := os.Stat(dataDir); err != nil {
+		if os.IsNotExist(err) {
+			return ActiveAdapter{}, zero, false, nil
+		}
+		return ActiveAdapter{}, zero, false, err
+	}
+	unlockDir, err := feedback.AcquireDirLock(dataDir)
+	if err != nil {
+		return ActiveAdapter{}, zero, false, fmt.Errorf("lock data dir %q: %w", dataDir, err)
+	}
+	defer unlockDir()
+	return readAndValidateManifestWithHash(dataDir)
 }
 
 // LoadActiveAdapter loads and re-validates active-adapter.json from dataDir using a
 // nonblocking regular-file open so a FIFO cannot block startup.
 // Returns (zero, false, nil) when the file does not exist.
 func LoadActiveAdapter(dataDir string) (ActiveAdapter, bool, error) {
-	return readAndValidateManifest(dataDir)
+	state, _, exists, err := LoadActiveAdapterWithHash(dataDir)
+	return state, exists, err
 }
 
-func mutateActiveAdapterUnlocked(dataDir string, fn func(*ActiveAdapter) (remove bool, err error)) (ActiveAdapter, error) {
+func mutateActiveAdapterUnlocked(dataDir string, fn func(*ActiveAdapter, bool) (remove bool, changed bool, err error)) (ActiveAdapter, [sha256.Size]byte, bool, error) {
+	var zero [sha256.Size]byte
 	if strings.TrimSpace(dataDir) == "" {
-		return ActiveAdapter{}, fmt.Errorf("data_dir is empty")
+		return ActiveAdapter{}, zero, false, fmt.Errorf("data_dir is empty")
 	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return ActiveAdapter{}, fmt.Errorf("create data dir %q: %w", dataDir, err)
+		return ActiveAdapter{}, zero, false, fmt.Errorf("create data dir %q: %w", dataDir, err)
 	}
 	unlockDir, err := feedback.AcquireDirLock(dataDir)
 	if err != nil {
-		return ActiveAdapter{}, fmt.Errorf("lock data dir %q: %w", dataDir, err)
+		return ActiveAdapter{}, zero, false, fmt.Errorf("lock data dir %q: %w", dataDir, err)
 	}
 	defer unlockDir()
 
-	cur, exists, err := readAndValidateManifest(dataDir)
+	cur, curHash, exists, err := readAndValidateManifestWithHash(dataDir)
 	if err != nil && exists {
-		return ActiveAdapter{}, err
+		return ActiveAdapter{}, zero, exists, err
 	}
-	remove, err := fn(&cur)
+	remove, changed, err := fn(&cur, exists)
 	if err != nil {
-		return ActiveAdapter{}, err
+		return ActiveAdapter{}, zero, exists, err
+	}
+	if !changed {
+		return cur, curHash, exists, nil
 	}
 	if remove {
 		err := os.Remove(filepath.Join(dataDir, ActiveAdapterFilename))
 		if err != nil && !os.IsNotExist(err) {
-			return ActiveAdapter{}, err
+			return ActiveAdapter{}, zero, true, err
 		}
-		return ActiveAdapter{}, nil
+		return ActiveAdapter{}, zero, false, nil
 	}
 	if err := validateAndNormalizeManifest(&cur); err != nil {
-		return ActiveAdapter{}, err
+		return ActiveAdapter{}, zero, exists, err
 	}
-	if err := writeActiveAdapterUnlocked(dataDir, cur); err != nil {
-		return ActiveAdapter{}, err
+	writtenHash, err := writeActiveAdapterUnlocked(dataDir, cur)
+	if err != nil {
+		return ActiveAdapter{}, zero, exists, err
 	}
-	return cur, nil
+	return cur, writtenHash, true, nil
 }
 
-// UpdateActiveAdapterSlot atomically updates either the primary or escalation slot in
-// active-adapter.json, preserving the sibling slot and recording the displaced adapter
-// for one-command rollback.
-func UpdateActiveAdapterSlot(dataDir, slot string, next AdapterSlot) (ActiveAdapter, error) {
+func rollbackSlotsMatch(a, b AdapterSlot) bool {
+	return a.BaseModel == b.BaseModel && a.AdapterPath == b.AdapterPath && a.JobID == b.JobID
+}
+
+// UpdateActiveAdapterSlotWithHash atomically updates either the primary or escalation slot in
+// active-adapter.json, returning the updated manifest and exact SHA-256 of the written bytes.
+func UpdateActiveAdapterSlotWithHash(dataDir, slot string, next AdapterSlot) (ActiveAdapter, [sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	normSlot, err := NormalizeSlot(slot, false)
 	if err != nil {
-		return ActiveAdapter{}, err
+		return ActiveAdapter{}, zero, err
 	}
 	if err := validateAdapterSlotStruct(&next); err != nil {
-		return ActiveAdapter{}, err
+		return ActiveAdapter{}, zero, err
 	}
 	if next.ActivatedAt.IsZero() {
 		next.ActivatedAt = time.Now().UTC()
 	}
-	return mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter) (bool, error) {
+	updated, hash, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
 		switch normSlot {
 		case SlotPrimary:
-			if prev, ok := cur.PrimarySlot(); ok && (prev.AdapterPath != next.AdapterPath || prev.BaseModel != next.BaseModel || prev.JobID != next.JobID) {
+			if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
 				prevCopy := prev
 				cur.Previous = &prevCopy
 			}
 			cur.SetPrimarySlot(next)
 		case SlotEscalation:
-			if cur.Escalation != nil && (cur.Escalation.AdapterPath != next.AdapterPath || cur.Escalation.BaseModel != next.BaseModel || cur.Escalation.JobID != next.JobID) {
+			if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 			}
 			nextCopy := next
 			cur.Escalation = &nextCopy
 		}
-		return false, nil
+		return false, true, nil
 	})
+	return updated, hash, err
 }
 
-// RollbackActiveAdapterSlot atomically restores the prior adapter for slot ("primary" or
-// "escalation") and swaps the replaced adapter into the rollback snapshot so rollbacks
-// are safely reversible.
-func RollbackActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, AdapterSlot, error) {
+// UpdateActiveAdapterSlot atomically updates either the primary or escalation slot in
+// active-adapter.json, preserving the sibling slot and recording the displaced adapter
+// for one-command rollback.
+func UpdateActiveAdapterSlot(dataDir, slot string, next AdapterSlot) (ActiveAdapter, error) {
+	updated, _, err := UpdateActiveAdapterSlotWithHash(dataDir, slot, next)
+	return updated, err
+}
+
+// RollbackActiveAdapterSlotExpected atomically restores the prior adapter for slot ("primary" or
+// "escalation"), failing with ErrRollbackTargetChanged if expected is non-nil and no longer matches
+// the recorded snapshot under the directory lock.
+func RollbackActiveAdapterSlotExpected(dataDir, slot string, expected *AdapterSlot) (ActiveAdapter, AdapterSlot, [sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	normSlot, err := NormalizeSlot(slot, false)
 	if err != nil {
-		return ActiveAdapter{}, AdapterSlot{}, err
+		return ActiveAdapter{}, AdapterSlot{}, zero, err
 	}
 	var restored AdapterSlot
-	updated, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter) (bool, error) {
+	updated, hash, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
 		switch normSlot {
 		case SlotPrimary:
 			if cur.Previous == nil {
-				return false, ErrNoRollbackAvailable
+				return false, false, ErrNoRollbackAvailable
+			}
+			if expected != nil && !rollbackSlotsMatch(*cur.Previous, *expected) {
+				return false, false, ErrRollbackTargetChanged
 			}
 			restored = *cur.Previous
 			if curPrimary, ok := cur.PrimarySlot(); ok {
@@ -379,7 +453,10 @@ func RollbackActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, AdapterSlot
 			cur.SetPrimarySlot(restored)
 		case SlotEscalation:
 			if cur.PreviousEscalation == nil {
-				return false, ErrNoRollbackAvailable
+				return false, false, ErrNoRollbackAvailable
+			}
+			if expected != nil && !rollbackSlotsMatch(*cur.PreviousEscalation, *expected) {
+				return false, false, ErrRollbackTargetChanged
 			}
 			restored = *cur.PreviousEscalation
 			if cur.Escalation != nil {
@@ -391,26 +468,39 @@ func RollbackActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, AdapterSlot
 			restoredCopy := restored
 			cur.Escalation = &restoredCopy
 		}
-		return false, nil
+		return false, true, nil
 	})
+	return updated, restored, hash, err
+}
+
+// RollbackActiveAdapterSlot atomically restores the prior adapter for slot ("primary" or
+// "escalation") and swaps the replaced adapter into the rollback snapshot so rollbacks
+// are safely reversible.
+func RollbackActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, AdapterSlot, error) {
+	updated, restored, _, err := RollbackActiveAdapterSlotExpected(dataDir, slot, nil)
 	return updated, restored, err
 }
 
-// DeactivateActiveAdapterSlot clears the active adapter for slot ("primary", "escalation", or
-// "all") while retaining its rollback snapshot (unless nothing remains active or snapshotted,
-// in which case active-adapter.json is removed).
-func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, error) {
+// DeactivateActiveAdapterSlotWithHash clears the active adapter for slot ("primary", "escalation", or
+// "all") while retaining its rollback snapshot (unless nothing remains active or snapshotted, in which
+// case active-adapter.json is removed), returning the updated manifest, written hash, changed, hasFile, and error.
+func DeactivateActiveAdapterSlotWithHash(dataDir, slot string) (ActiveAdapter, [sha256.Size]byte, bool, bool, error) {
+	var zero [sha256.Size]byte
 	normSlot, err := NormalizeSlot(slot, true)
 	if err != nil {
-		return ActiveAdapter{}, false, err
+		return ActiveAdapter{}, zero, false, false, err
 	}
-	if _, exists, err := readAndValidateManifest(dataDir); err != nil && !exists {
-		return ActiveAdapter{}, false, err
-	} else if !exists {
-		return ActiveAdapter{}, false, nil
+	if _, statErr := os.Stat(dataDir); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return ActiveAdapter{}, zero, false, false, nil
+		}
+		return ActiveAdapter{}, zero, false, false, statErr
 	}
 	changed := false
-	updated, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter) (bool, error) {
+	updated, hash, hasFile, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, exists bool) (bool, bool, error) {
+		if !exists {
+			return false, false, nil
+		}
 		if normSlot == SlotPrimary || normSlot == SlotAll {
 			if prev, ok := cur.PrimarySlot(); ok {
 				prevCopy := prev
@@ -427,10 +517,57 @@ func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, err
 				changed = true
 			}
 		}
+		if !changed {
+			return false, false, nil
+		}
 		remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil
-		return remove, nil
+		return remove, true, nil
 	})
+	return updated, hash, changed, hasFile, err
+}
+
+// DeactivateActiveAdapterSlot clears the active adapter for slot ("primary", "escalation", or
+// "all") while retaining its rollback snapshot (unless nothing remains active or snapshotted,
+// in which case active-adapter.json is removed).
+func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, error) {
+	updated, _, changed, _, err := DeactivateActiveAdapterSlotWithHash(dataDir, slot)
 	return updated, changed, err
+}
+
+// MirrorDaemonSlotToManifest synchronizes the local manifest's active slot to match a daemon's
+// authoritative AdapterStatusResponse after a remote or separate-directory operation.
+func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fallbackModel, fallbackAdapter, fallbackJob string) (ActiveAdapter, error) {
+	normSlot, err := NormalizeSlot(slot, false)
+	if err != nil {
+		return ActiveAdapter{}, err
+	}
+	bm := strings.TrimSpace(fallbackModel)
+	ap := strings.TrimSpace(fallbackAdapter)
+	jid := strings.TrimSpace(fallbackJob)
+	var dsHash string
+	var swappedAt time.Time
+	if slotState != nil {
+		if strings.TrimSpace(slotState.BaseModel) != "" {
+			bm = strings.TrimSpace(slotState.BaseModel)
+		}
+		ap = strings.TrimSpace(slotState.AdapterPath)
+		if strings.TrimSpace(slotState.JobID) != "" {
+			jid = strings.TrimSpace(slotState.JobID)
+		}
+		dsHash = strings.TrimSpace(slotState.DatasetHash)
+		swappedAt = slotState.SwappedAt
+	}
+	if ap == "" {
+		updated, _, err := DeactivateActiveAdapterSlot(dataDir, normSlot)
+		return updated, err
+	}
+	return UpdateActiveAdapterSlot(dataDir, normSlot, AdapterSlot{
+		JobID:       jid,
+		BaseModel:   bm,
+		AdapterPath: ap,
+		DatasetHash: dsHash,
+		ActivatedAt: swappedAt,
+	})
 }
 
 // AdapterSwapRequest configures a live adapter operation via POST /adapter.

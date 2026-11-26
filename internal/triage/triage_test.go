@@ -756,10 +756,16 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 }
 
 func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
-	var resp HealthStatus
+	var (
+		mu   sync.Mutex
+		resp HealthStatus
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		snapshot := resp
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(snapshot)
 	}))
 	defer srv.Close()
 
@@ -771,22 +777,28 @@ func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	resp = HealthStatus{Status: "Healthy", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: true, Backend: "pytorch-peft"}
+	setResp := func(next HealthStatus) {
+		mu.Lock()
+		resp = next
+		mu.Unlock()
+	}
+
+	setResp(HealthStatus{Status: "Healthy", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: true, Backend: "pytorch-peft"})
 	if st, err := client.VerifyHealth(context.Background(), model.ModelGemma22BIT); err != nil || st.Backend != "pytorch-peft" {
 		t.Fatalf("expected Healthy matching VerifyHealth to pass, got st=%+v err=%v", st, err)
 	}
 
-	resp = HealthStatus{Status: "Healthy", BaseModel: model.ModelSmolLM2135MInstruct, BaseModelLoaded: true}
+	setResp(HealthStatus{Status: "Healthy", BaseModel: model.ModelSmolLM2135MInstruct, BaseModelLoaded: true})
 	if _, err := client.VerifyHealth(context.Background(), model.ModelGemma22BIT); err == nil {
 		t.Fatal("expected base model mismatch to fail VerifyHealth")
 	}
 
-	resp = HealthStatus{Status: "Healthy", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: false}
+	setResp(HealthStatus{Status: "Healthy", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: false})
 	if _, err := client.VerifyHealth(context.Background(), model.ModelGemma22BIT); err == nil {
 		t.Fatal("expected unloaded base model to fail VerifyHealth")
 	}
 
-	resp = HealthStatus{Status: "degraded", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: true}
+	setResp(HealthStatus{Status: "degraded", BaseModel: model.ModelGemma22BIT, BaseModelLoaded: true})
 	if _, err := client.VerifyHealth(context.Background(), model.ModelGemma22BIT); err == nil {
 		t.Fatal("expected degraded status to fail VerifyHealth")
 	}

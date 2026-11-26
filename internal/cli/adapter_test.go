@@ -188,3 +188,105 @@ func TestExecuteScanWithDualTierEscalationFlags(t *testing.T) {
 		t.Fatalf("expected active escalation metrics in ScanReport, got %+v", rep)
 	}
 }
+
+func TestExecuteTrainSubmitSelectsEscalationModelAndRollbackMirrorsDaemon(t *testing.T) {
+	// 1. Verify `train submit --slot escalation` defaults baseModel to cfg.EscalationBaseModel
+	// and preserves existing primary manifest entries on activation.
+	dataDir := t.TempDir()
+	if _, err := train.UpdateActiveAdapterSlot(dataDir, train.SlotPrimary, train.AdapterSlot{
+		JobID:       "existing-primary",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/existing-primary/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed primary slot: %v", err)
+	}
+
+	var seenBaseModel string
+	ftaasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs":
+			if err := r.ParseMultipartForm(4 << 20); err != nil {
+				t.Errorf("ParseMultipartForm: %v", err)
+			}
+			seenBaseModel = r.FormValue("baseModel")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"jobId":"job-esc-9","jobName":"esc","baseModel":"` + seenBaseModel + `","status":"queued","surprisalPreflightStatus":"skipped"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/jobs/job-esc-9":
+			_, _ = w.Write([]byte(`{"jobId":"job-esc-9","status":"completed","baseModel":"` + seenBaseModel + `","adapterPath":"artifacts/job-esc-9/model_adapters","datasetHash":"sha256:abc"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ftaasSrv.Close()
+
+	fbDir := t.TempDir()
+	var out, errBuf bytes.Buffer
+	if err := ExecuteWithOutput([]string{
+		"train", "submit",
+		"--data-dir", dataDir,
+		"--feedback-dir", fbDir,
+		"--ftaas-http", ftaasSrv.URL,
+		"--seed-per-class", "1",
+		"--preflight=false",
+		"--wait",
+		"--activate",
+		"--slot", "escalation",
+		"--poll-interval", "10ms",
+		"--json",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("train submit --slot escalation failed: %v stderr=%s", err, errBuf.String())
+	}
+	if seenBaseModel != model.ModelGemma22BIT {
+		t.Fatalf("expected escalation training submission to select %s, got %q", model.ModelGemma22BIT, seenBaseModel)
+	}
+	loaded, exists, err := train.LoadActiveAdapter(dataDir)
+	if err != nil || !exists || loaded.AdapterPath != "artifacts/existing-primary/model_adapters" ||
+		loaded.Escalation == nil || loaded.Escalation.AdapterPath != "artifacts/job-esc-9/model_adapters" {
+		t.Fatalf("expected both primary and escalation slots preserved, got %+v err=%v", loaded, err)
+	}
+
+	// 2. Verify `adapter rollback` against a daemon with a different data_dir synchronizes
+	// the local manifest to the daemon's restored adapter instead of rolling back independently.
+	daemonDir := t.TempDir()
+	localDivergedDir := t.TempDir()
+	for _, path := range []string{"artifacts/d-1/model_adapters", "artifacts/d-2/model_adapters"} {
+		if _, err := train.UpdateActiveAdapterSlot(daemonDir, train.SlotPrimary, train.AdapterSlot{
+			BaseModel:   model.ModelSmolLM2135MInstruct,
+			AdapterPath: path,
+		}); err != nil {
+			t.Fatalf("seed daemon dir: %v", err)
+		}
+	}
+	// Local dir has NO rollback history at all; previously this failed even after daemon rolled back.
+	if _, err := train.UpdateActiveAdapterSlot(localDivergedDir, train.SlotPrimary, train.AdapterSlot{
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/local-only/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed local dir: %v", err)
+	}
+
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+	dCfg := config.DefaultConfig()
+	dCfg.DataDir = daemonDir
+	dCfg.TriageMode = "off"
+	dPipe := pipeline.New(dCfg, ruleEng, emit.NopSink{}, "file")
+	daemonSrv := httptest.NewServer(newWatchHTTPHandler(dPipe, "tok"))
+	defer daemonSrv.Close()
+
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"adapter", "rollback",
+		"--data-dir", localDivergedDir,
+		"--slot", "primary",
+		"--sentinel-http", daemonSrv.URL,
+		"--auth-token", "tok",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("synchronized rollback failed: %v stderr=%s", err, errBuf.String())
+	}
+	syncedLocal, _, err := train.LoadActiveAdapter(localDivergedDir)
+	if err != nil || syncedLocal.AdapterPath != "artifacts/d-1/model_adapters" {
+		t.Fatalf("expected local manifest synced to daemon rollback result d-1, got %+v err=%v", syncedLocal, err)
+	}
+}

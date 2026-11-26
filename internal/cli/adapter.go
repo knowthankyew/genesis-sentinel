@@ -282,14 +282,30 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 
 	var manifest train.ActiveAdapter
 	if !daemonSavedSameDir {
-		updated, _, rbErr := train.RollbackActiveAdapterSlot(cfg.DataDir, normSlot)
-		if rbErr != nil {
-			if daemonRolledBack {
-				return fmt.Errorf("running daemon rolled back %s slot, but updating local manifest failed: %w", normSlot, rbErr)
+		if daemonRolledBack {
+			slotStatus := daemonResp.Primary
+			if normSlot == train.SlotEscalation {
+				slotStatus = daemonResp.Escalation
 			}
-			return rbErr
+			updated, syncErr := train.MirrorDaemonSlotToManifest(
+				cfg.DataDir,
+				normSlot,
+				slotStatus,
+				daemonResp.BaseModel,
+				daemonResp.AdapterPath,
+				daemonResp.JobID,
+			)
+			if syncErr != nil {
+				return fmt.Errorf("running daemon rolled back %s slot, but synchronizing local manifest failed: %w", normSlot, syncErr)
+			}
+			manifest = updated
+		} else {
+			updated, _, rbErr := train.RollbackActiveAdapterSlot(cfg.DataDir, normSlot)
+			if rbErr != nil {
+				return rbErr
+			}
+			manifest = updated
 		}
-		manifest = updated
 	}
 	if daemonRolledBack {
 		return writeIndentedJSON(stdout, daemonResp)

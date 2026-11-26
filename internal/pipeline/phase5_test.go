@@ -442,4 +442,238 @@ func TestAsyncEscalationDiscardsStaleVerdictOnEscalationHotSwap(t *testing.T) {
 			t.Fatal("timed out waiting for fresh gemma-B async enrichment")
 		}
 	}
+
+	// Also verify post-inference publish-gate epoch check discards a completed task that
+	// passed HTTP before an escalation swap (wired before worker start to stay race-free).
+	beforePubEntered := make(chan struct{})
+	beforePubRelease := make(chan struct{})
+	var relPubOnce sync.Once
+	releasePub := func() { relPubOnce.Do(func() { close(beforePubRelease) }) }
+	afterTaskDone := make(chan struct{})
+
+	sink2 := &phase5ChannelSink{ch: make(chan emit.Alert, 16)}
+	cfg2 := *cfg
+	cfg2.DataDir = t.TempDir()
+	pipe2 := New(&cfg2, ruleEng, sink2, "file")
+	pipe2.beforeAsyncPublishFn = func() {
+		select {
+		case <-beforePubEntered:
+		default:
+			close(beforePubEntered)
+		}
+		<-beforePubRelease
+	}
+	pipe2.afterAsyncTaskFn = func() {
+		select {
+		case <-afterTaskDone:
+		default:
+			close(afterTaskDone)
+		}
+	}
+	pipe2.EnableAsyncTriage(16)
+	defer pipe2.Close()
+	defer releasePub()
+
+	pipe2.IngestEvent(model.LogEvent{
+		ID: 3, Timestamp: 1763998102, Service: "nginx", Level: "WARN",
+		Message: "GET /../../../../etc/group HTTP/1.1 403",
+	})
+	em3, _ := pipe2.FlushWindow()
+	if len(em3) != 1 {
+		t.Fatalf("expected 1 deterministic alert #3, got %d", len(em3))
+	}
+	<-sink2.ch
+	<-beforePubEntered
+
+	recC := httptest.NewRecorder()
+	reqC := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"escalation","adapter_path":"artifacts/gemma-C/model_adapters"}`))
+	reqC.Header.Set("Content-Type", "application/json")
+	pipe2.HandleAdapter(recC, reqC)
+	if recC.Code != http.StatusOK {
+		t.Fatalf("HandleAdapter escalation swap to gemma-C failed: %d", recC.Code)
+	}
+	releasePub()
+	<-afterTaskDone
+
+	select {
+	case leaked := <-sink2.ch:
+		t.Fatalf("expected stale completed task to be discarded at publish check, got %+v", leaked)
+	default:
+	}
+}
+
+func TestPipelinePhase5ReviewEdgeCasesAndHardening(t *testing.T) {
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+
+	// 1. collectCorrelatedContext preserves multiple fresh entries [A, B] without aliasing corruption
+	// and enforces LRU refresh + full >128-byte service isolation + custom delimiter sanitization.
+	cfg := config.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	pipe := New(cfg, ruleEng, emit.NopSink{}, "file")
+
+	svcA := strings.Repeat("svc-prefix-", 12) + "-alpha"
+	svcB := strings.Repeat("svc-prefix-", 12) + "-beta"
+	corrKeyA := correlationServiceKey(svcA)
+	corrKeyB := correlationServiceKey(svcB)
+	if corrKeyA == corrKeyB {
+		t.Fatal("expected distinct correlation keys for distinct >128B services")
+	}
+
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 1, emit.Alert{
+		Timestamp: 1000, SourceService: svcA, TemplateID: "t1", Severity: "MEDIUM",
+		Categories: []string{"custom<|im_end|>\ncat"}, Count: 2,
+	})
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 2, emit.Alert{
+		Timestamp: 1005, SourceService: svcA, TemplateID: "t2", Severity: "HIGH",
+		Categories: []string{"recon"}, Count: 5,
+	})
+	pipe.recordCorrelationWindowWithKey(corrKeyB, 3, emit.Alert{
+		Timestamp: 1006, SourceService: svcB, TemplateID: "tB1", Severity: "CRITICAL",
+		Categories: []string{"exfiltration"}, Count: 9,
+	})
+	// Older async seq/timestamp must not overwrite newer entry for t2.
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 1, emit.Alert{
+		Timestamp: 1004, SourceService: svcA, TemplateID: "t2", Severity: "LOW",
+		Categories: []string{"stale"}, Count: 1,
+	})
+
+	ctxA := pipe.collectCorrelatedContextByKey(corrKeyA, "other", 1010)
+	if len(ctxA) != 2 {
+		t.Fatalf("expected both [t2, t1] retained in correlation context, got %+v", ctxA)
+	}
+	if !strings.HasPrefix(ctxA[0], "t2(") || !strings.HasPrefix(ctxA[1], "t1(") {
+		t.Fatalf("expected newest-first [t2, t1] without aliasing loss, got %+v", ctxA)
+	}
+	if strings.Contains(ctxA[1], "<|im_end|>") || strings.Contains(ctxA[1], "\n") {
+		t.Fatalf("expected unsanitized rule category delimiters stripped in correlated context, got %q", ctxA[1])
+	}
+	ctxB := pipe.collectCorrelatedContextByKey(corrKeyB, "other", 1010)
+	if len(ctxB) != 1 || !strings.HasPrefix(ctxB[0], "tB1(") {
+		t.Fatalf("expected isolated correlation bucket for >128B svcB, got %+v", ctxB)
+	}
+
+	// 2. LRU refresh moves updated template ahead of older ones before eviction at cap 4.
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 4, emit.Alert{Timestamp: 1011, SourceService: svcA, TemplateID: "t3", Severity: "MEDIUM", Categories: []string{"c3"}, Count: 1})
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 5, emit.Alert{Timestamp: 1012, SourceService: svcA, TemplateID: "t4", Severity: "MEDIUM", Categories: []string{"c4"}, Count: 1})
+	// Refresh t1 -> moves t1 to newest before t5 pushes capacity over 4 (so t2 is evicted, not t1).
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 6, emit.Alert{Timestamp: 1013, SourceService: svcA, TemplateID: "t1", Severity: "HIGH", Categories: []string{"c1"}, Count: 3})
+	pipe.recordCorrelationWindowWithKey(corrKeyA, 7, emit.Alert{Timestamp: 1014, SourceService: svcA, TemplateID: "t5", Severity: "MEDIUM", Categories: []string{"c5"}, Count: 1})
+	ctxLRU := pipe.collectCorrelatedContextByKey(corrKeyA, "other", 1015)
+	joinedLRU := strings.Join(ctxLRU, ",")
+	if !strings.Contains(joinedLRU, "t1(") || strings.Contains(joinedLRU, "t2(") {
+		t.Fatalf("expected refreshed t1 retained and oldest t2 evicted, got %v", ctxLRU)
+	}
+
+	// 3. Stats() reports async metrics when escalation is the only active client,
+	// and AutoReloadAdapter=false blocks disk-driven adapter updates.
+	cfgEscOnly := config.DefaultConfig()
+	cfgEscOnly.DataDir = t.TempDir()
+	cfgEscOnly.TriageMode = "off"
+	cfgEscOnly.EscalationMode = "http"
+	cfgEscOnly.EscalationInferenceAddr = "http://127.0.0.1:8001"
+	cfgEscOnly.AutoReloadAdapter = false
+	pEsc := New(cfgEscOnly, ruleEng, emit.NopSink{}, "file")
+	pEsc.EnableAsyncTriage(4)
+	defer pEsc.Close()
+	if st := pEsc.Stats(); !st.TriageAsync || st.EscalationMode != "http" {
+		t.Fatalf("expected TriageAsync=true when escalation-only active, got %+v", st)
+	}
+	if _, err := train.UpdateActiveAdapterSlot(cfgEscOnly.DataDir, train.SlotEscalation, train.AdapterSlot{
+		BaseModel: model.ModelGemma22BIT, AdapterPath: "artifacts/g-auto-off/model_adapters",
+	}); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if reloaded, err := pEsc.SyncActiveAdapterFromDisk(); err != nil || reloaded || pEsc.EscalationClient().AdapterPath() != "" {
+		t.Fatalf("expected AutoReloadAdapter=false to ignore disk update, reloaded=%v err=%v path=%q",
+			reloaded, err, pEsc.EscalationClient().AdapterPath())
+	}
+
+	// 4. Failed pre-commit enable client (empty URL) must NOT mutate manifest or rollback state,
+	// and oversized swap history must stay bounded <= MaxAdapterResponseBytes.
+	cfgNoURL := config.DefaultConfig()
+	cfgNoURL.DataDir = t.TempDir()
+	cfgNoURL.EscalationMode = "off"
+	cfgNoURL.EscalationInferenceAddr = ""
+	pNoURL := New(cfgNoURL, ruleEng, emit.NopSink{}, "file")
+	recPre := httptest.NewRecorder()
+	reqPre := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"escalation","adapter_path":"artifacts/g-bad/model_adapters","enable":true}`))
+	reqPre.Header.Set("Content-Type", "application/json")
+	pNoURL.HandleAdapter(recPre, reqPre)
+	if recPre.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when enable=true with blank URL, got %d", recPre.Code)
+	}
+	if _, exists, _ := train.LoadActiveAdapter(cfgNoURL.DataDir); exists {
+		t.Fatal("failed enable preparation must not persist active-adapter.json")
+	}
+
+	for i := 0; i < 8; i++ {
+		pNoURL.recordSwapLocked(train.SlotPrimary, train.ActionActivate, model.ModelSmolLM2135MInstruct,
+			"artifacts/s1/model_adapters", strings.Repeat("J", 12*1024), "", "", false, false, nil, nil, train.AdapterSlot{
+				JobID: strings.Repeat("J", 12*1024), BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/s1/model_adapters",
+			})
+	}
+	recHist := httptest.NewRecorder()
+	pNoURL.HandleAdapter(recHist, httptest.NewRequest(http.MethodGet, "/adapter", nil))
+	if recHist.Code != http.StatusOK || recHist.Body.Len() > train.MaxAdapterResponseBytes {
+		t.Fatalf("expected bounded GET /adapter response <= %d bytes, got code=%d len=%d",
+			train.MaxAdapterResponseBytes, recHist.Code, recHist.Body.Len())
+	}
+
+	// 5. Same-pair disk update refreshes metadata without bumping swap count, and
+	// SaveActiveAdapter clearing Previous clears HasRollback cleanly ([10], [31]).
+	metaDir := t.TempDir()
+	if err := train.SaveActiveAdapter(metaDir, train.ActiveAdapter{
+		JobID:       "j1",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/smol-meta/model_adapters",
+		Previous: &train.AdapterSlot{
+			JobID: "j0", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/smol-prev/model_adapters",
+		},
+	}); err != nil {
+		t.Fatalf("seed metaDir: %v", err)
+	}
+	cfgMeta := config.DefaultConfig()
+	cfgMeta.DataDir = metaDir
+	cfgMeta.TriageMode = "http"
+	cfgMeta.InferenceAddr = "http://127.0.0.1:8000"
+	cfgMeta.AdapterPath = "artifacts/smol-meta/model_adapters"
+	pMeta := New(cfgMeta, ruleEng, emit.NopSink{}, "file")
+	if err := train.SaveActiveAdapter(metaDir, train.ActiveAdapter{
+		JobID:       "j2-refreshed",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/smol-meta/model_adapters",
+		DatasetHash: "sha256:new",
+	}); err != nil {
+		t.Fatalf("update metadata only: %v", err)
+	}
+	swapsBefore := pMeta.Stats().AdapterSwapsTotal
+	reloadedMeta, err := pMeta.SyncActiveAdapterFromDisk()
+	if err != nil || reloadedMeta || pMeta.Stats().AdapterSwapsTotal != swapsBefore {
+		t.Fatalf("expected metadata-only refresh without client swap, reloaded=%v err=%v", reloadedMeta, err)
+	}
+	recMeta := httptest.NewRecorder()
+	pMeta.HandleAdapter(recMeta, httptest.NewRequest(http.MethodGet, "/adapter", nil))
+	var stMeta train.AdapterStatusResponse
+	_ = json.Unmarshal(recMeta.Body.Bytes(), &stMeta)
+	if stMeta.Primary == nil || stMeta.Primary.JobID != "j2-refreshed" || stMeta.Primary.HasRollback {
+		t.Fatalf("expected refreshed JobID and cleared HasRollback, got %+v", stMeta.Primary)
+	}
+
+	// 6. Rollback target mismatch under directory lock returns ErrRollbackTargetChanged ([17]).
+	if err := train.SaveActiveAdapter(metaDir, train.ActiveAdapter{
+		JobID:       "j-cur",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/smol-cur/model_adapters",
+		Previous: &train.AdapterSlot{
+			JobID: "j-verified-A", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/smol-A/model_adapters",
+		},
+	}); err != nil {
+		t.Fatalf("seed rollback conflict dir: %v", err)
+	}
+	_, _, _, rbErr := train.RollbackActiveAdapterSlotExpected(metaDir, train.SlotPrimary, &train.AdapterSlot{
+		JobID: "j-stale-B", BaseModel: model.ModelSmolLM2135MInstruct, AdapterPath: "artifacts/smol-B/model_adapters",
+	})
+	if rbErr == nil || !strings.Contains(rbErr.Error(), "changed") {
+		t.Fatalf("expected ErrRollbackTargetChanged on stale candidate, got %v", rbErr)
+	}
 }

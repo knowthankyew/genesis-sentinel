@@ -102,6 +102,10 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if *auditOnly && (*wait || *activate) {
 		return fmt.Errorf("--audit-only cannot be combined with --wait or --activate")
 	}
+	normSlot, err := train.NormalizeSlot(*slot, false)
+	if err != nil {
+		return err
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -114,14 +118,28 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if *apiKey != "" {
 		cfg.FTaaSAPIKey = *apiKey
 	}
-	if *baseModel != "" {
-		cfg.BaseModel = *baseModel
+	baseModelExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "base-model" {
+			baseModelExplicit = true
+		}
+	})
+	if baseModelExplicit {
+		if normSlot == train.SlotEscalation {
+			cfg.EscalationBaseModel = *baseModel
+		} else {
+			cfg.BaseModel = *baseModel
+		}
 	}
 	if *allowRemote {
 		cfg.AllowRemoteEndpoints = true
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("configuration validation failed: %w", err)
+	}
+	submitModel := cfg.BaseModel
+	if normSlot == train.SlotEscalation {
+		submitModel = cfg.EscalationBaseModel
 	}
 
 	resolvedDataset := strings.TrimSpace(*datasetPath)
@@ -175,7 +193,7 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 
 	subRes, err := client.SubmitJob(ctx, train.SubmitRequest{
 		JobName:                  *jobName,
-		BaseModel:                cfg.BaseModel,
+		BaseModel:                submitModel,
 		DatasetPath:              resolvedDataset,
 		Hyperparameters:          hp,
 		EnableSurprisalPreflight: *preflight,
@@ -214,10 +232,6 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 	if *activate {
 		if strings.TrimSpace(finalJob.AdapterPath) == "" {
 			return fmt.Errorf("FTaaS job %s completed (%s) but returned an empty adapterPath; cannot activate", finalJob.JobID, finalJob.Status)
-		}
-		normSlot, slotErr := train.NormalizeSlot(*slot, false)
-		if slotErr != nil {
-			return slotErr
 		}
 		slotState := train.AdapterSlot{
 			JobID:       finalJob.JobID,

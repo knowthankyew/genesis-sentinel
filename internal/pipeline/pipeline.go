@@ -45,6 +45,8 @@ const (
 type asyncTriageTask struct {
 	alert     emit.Alert
 	burnEpoch uint64
+	corrKey   string
+	alertSeq  uint64
 }
 
 // Stats exposes live Sentinel Tier 0 + Tier 1 pipeline telemetry over HTTP /stats and CLI output.
@@ -401,6 +403,10 @@ func (p *Pipeline) isAsyncTriageEnabled() bool {
 }
 
 func (p *Pipeline) enqueueAsyncTriage(alert emit.Alert, burnEpoch uint64) {
+	p.enqueueAsyncTriageWithKey(alert, burnEpoch, "", 0)
+}
+
+func (p *Pipeline) enqueueAsyncTriageWithKey(alert emit.Alert, burnEpoch uint64, corrKey string, alertSeq uint64) {
 	p.asyncMu.Lock()
 	defer p.asyncMu.Unlock()
 	if !p.asyncEnabled || p.asyncClosed {
@@ -413,6 +419,8 @@ func (p *Pipeline) enqueueAsyncTriage(alert emit.Alert, burnEpoch uint64) {
 	p.asyncQueue = append(p.asyncQueue, asyncTriageTask{
 		alert:     cloneAlertForAsync(alert),
 		burnEpoch: burnEpoch,
+		corrKey:   corrKey,
+		alertSeq:  alertSeq,
 	})
 	select {
 	case p.asyncNotifyCh <- struct{}{}:
@@ -485,6 +493,8 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 	p.burnMu.RLock()
 	client := p.triageClient
 	escClient := p.escalationClient
+	triageTimeout := p.triageReqTimeout
+	escTimeout := p.escalationTimeout
 	curBurnEpoch := p.burnEpoch.Load()
 	startAdapterEpoch := p.adapterEpoch.Load()
 	startEscEpoch := p.escalationEpoch.Load()
@@ -514,7 +524,7 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 	}()
 
 	enriched := task.alert
-	if !p.enrichWithTier2Dual(reqCtx, client, escClient, &enriched) {
+	if !p.enrichWithTier2DualWithTimeouts(reqCtx, client, triageTimeout, escClient, escTimeout, &enriched) {
 		return
 	}
 	if p.beforeAsyncPublishFn != nil {
@@ -545,7 +555,7 @@ func (p *Pipeline) processAsyncTriageTask(task asyncTriageTask) {
 		return
 	}
 	p.triageUpdatesEmitted.Add(1)
-	p.recordCorrelationWindow(enriched)
+	p.recordCorrelationWindowWithKey(task.corrKey, task.alertSeq, enriched)
 	if p.alertJournal != nil {
 		// Use UpdateIfPresent so a delayed async Tier 2 result updates its existing alert
 		// in-place and never evicts newer alerts if the original record aged out or was burned.
@@ -872,8 +882,17 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		nowUnix = p.nowUnixFn()
 	}
 
+	type queuedAlert struct {
+		alert    emit.Alert
+		corrKey  string
+		alertSeq uint64
+	}
+	var pendingAsync []queuedAlert
+
 	triageClient := p.triageClient
 	escClient := p.escalationClient
+	triageTimeout := p.triageReqTimeout
+	escTimeout := p.escalationTimeout
 	hasTier2 := triageClient != nil || escClient != nil
 	asyncTriage := p.isAsyncTriageEnabled()
 	curBurnEpoch := p.burnEpoch.Load()
@@ -1089,9 +1108,10 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      bestSample,
 		}
 
-		alert.CorrelatedWindows = p.collectCorrelatedContext(alert.SourceService, alert.TemplateID, alert.Timestamp)
+		corrKey := correlationServiceKeyFromHash(k.serviceHash)
+		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, alert.Timestamp)
 		if hasTier2 && !asyncTriage {
-			p.enrichWithTier2Dual(triageCtx, triageClient, escClient, &alert)
+			p.enrichWithTier2DualWithTimeouts(triageCtx, triageClient, triageTimeout, escClient, escTimeout, &alert)
 		}
 
 		emittedWinKeys[k] = true
@@ -1101,8 +1121,11 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
-		p.recordCorrelationWindow(alert)
+		p.recordCorrelationWindowWithKey(corrKey, seq, alert)
 		emitted = append(emitted, alert)
+		if hasTier2 && asyncTriage {
+			pendingAsync = append(pendingAsync, queuedAlert{alert: alert, corrKey: corrKey, alertSeq: seq})
+		}
 	}
 
 	// Emit Tier 1-only alerts for unseen anomalous windows that did not already emit a Tier 0 alert.
@@ -1177,9 +1200,15 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			SanitizedSample:      cleanSample,
 		}
 
-		alert.CorrelatedWindows = p.collectCorrelatedContext(alert.SourceService, alert.TemplateID, alert.Timestamp)
+		var corrKey string
+		if sw.hasKey {
+			corrKey = correlationServiceKeyFromHash(sw.bucketKey.serviceHash)
+		} else {
+			corrKey = correlationServiceKey(w.Service)
+		}
+		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, alert.Timestamp)
 		if hasTier2 && !asyncTriage {
-			p.enrichWithTier2Dual(triageCtx, triageClient, escClient, &alert)
+			p.enrichWithTier2DualWithTimeouts(triageCtx, triageClient, triageTimeout, escClient, escTimeout, &alert)
 		}
 
 		if sw.hasKey {
@@ -1191,8 +1220,11 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
-		p.recordCorrelationWindow(alert)
+		p.recordCorrelationWindowWithKey(corrKey, seq, alert)
 		emitted = append(emitted, alert)
+		if hasTier2 && asyncTriage {
+			pendingAsync = append(pendingAsync, queuedAlert{alert: alert, corrKey: corrKey, alertSeq: seq})
+		}
 	}
 
 	if p.alertJournal != nil && len(emitted) > 0 {
@@ -1203,9 +1235,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 
 	// Enqueue async Tier 2 enrichment AFTER emitting and journaling the deterministic alerts
 	// so every async update strictly follows and upserts on top of its deterministic base alert.
-	if hasTier2 && asyncTriage && len(emitted) > 0 {
-		for _, a := range emitted {
-			p.enqueueAsyncTriage(a, curBurnEpoch)
+	if hasTier2 && asyncTriage && len(pendingAsync) > 0 {
+		for _, item := range pendingAsync {
+			p.enqueueAsyncTriageWithKey(item.alert, curBurnEpoch, item.corrKey, item.alertSeq)
 		}
 	}
 
@@ -1269,17 +1301,19 @@ func (p *Pipeline) Stats() Stats {
 		UptimeSeconds:            int64(time.Since(p.startTime).Seconds()),
 	}
 
+	if triageClient != nil || escClient != nil {
+		st.TriageAsync = p.isAsyncTriageEnabled()
+		st.TriageUpdatesEmitted = p.triageUpdatesEmitted.Load()
+		st.TriageQueueDropped = p.triageQueueDropped.Load()
+	}
 	if triageClient != nil {
 		ts := triageClient.Stats()
 		st.TriageMode = "http"
-		st.TriageAsync = p.isAsyncTriageEnabled()
 		st.TriageModel = ts.BaseModel
 		st.TriageAdapter = ts.AdapterPath
 		st.TriageEvaluated = ts.EvaluatedTotal
 		st.TriageFallbacks = ts.FallbacksTotal
 		st.TriageInjectionOverrides = ts.InjectionOverrides
-		st.TriageUpdatesEmitted = p.triageUpdatesEmitted.Load()
-		st.TriageQueueDropped = p.triageQueueDropped.Load()
 	}
 	if escClient != nil {
 		es := escClient.Stats()
