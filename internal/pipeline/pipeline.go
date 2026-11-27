@@ -338,6 +338,7 @@ func (p *Pipeline) AttachTriageClient(c *triage.Client) {
 	p.burnMu.Lock()
 	p.triageClient = c
 	p.adapterEpoch.Add(1)
+	p.reconcileSlotClientMetaLocked(train.SlotPrimary, c)
 	p.asyncMu.Lock()
 	if p.activeAsyncCancel != nil {
 		p.activeAsyncCancel()
@@ -351,6 +352,7 @@ func (p *Pipeline) AttachEscalationClient(c *triage.Client) {
 	p.burnMu.Lock()
 	p.escalationClient = c
 	p.escalationEpoch.Add(1)
+	p.reconcileSlotClientMetaLocked(train.SlotEscalation, c)
 	p.asyncMu.Lock()
 	if p.activeAsyncCancel != nil {
 		p.activeAsyncCancel()

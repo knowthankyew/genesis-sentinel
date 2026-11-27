@@ -656,14 +656,13 @@ func recordMirrorWatermark(
 	}
 }
 
-func resolveDaemonPreviousSlot(slotState *SlotStatus, fallbackModel string, swappedAt time.Time) *AdapterSlot {
+func resolveDaemonPreviousSlot(slotState *SlotStatus, fallbackModel string) *AdapterSlot {
 	if slotState == nil || strings.TrimSpace(slotState.PreviousAdapterPath) == "" {
 		return nil
 	}
 	prev := AdapterSlot{
 		BaseModel:   strings.TrimSpace(slotState.PreviousBaseModel),
 		AdapterPath: strings.TrimSpace(slotState.PreviousAdapterPath),
-		ActivatedAt: swappedAt,
 	}
 	if prev.BaseModel == "" {
 		prev.BaseModel = strings.TrimSpace(fallbackModel)
@@ -672,6 +671,30 @@ func resolveDaemonPreviousSlot(slotState *SlotStatus, fallbackModel string, swap
 		return nil
 	}
 	return &prev
+}
+
+func mergeKnownPreviousProvenance(daemonPrev, localActive, localPrev *AdapterSlot) *AdapterSlot {
+	if daemonPrev == nil {
+		return nil
+	}
+	merged := *daemonPrev
+	for _, cand := range []*AdapterSlot{localActive, localPrev} {
+		if cand == nil {
+			continue
+		}
+		if strings.EqualFold(cand.BaseModel, merged.BaseModel) && cand.AdapterPath == merged.AdapterPath {
+			if merged.JobID == "" && cand.JobID != "" {
+				merged.JobID = cand.JobID
+			}
+			if merged.DatasetHash == "" && cand.DatasetHash != "" {
+				merged.DatasetHash = cand.DatasetHash
+			}
+			if merged.ActivatedAt.IsZero() && !cand.ActivatedAt.IsZero() {
+				merged.ActivatedAt = cand.ActivatedAt
+			}
+		}
+	}
+	return &merged
 }
 
 // MirrorDaemonSlotToManifest synchronizes the local manifest's active slot to match a daemon's
@@ -703,7 +726,7 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		incomingSeq = slotState.OpSeq
 		incomingHistory = strings.TrimSpace(slotState.HistoryID)
 	}
-	daemonPrev := resolveDaemonPreviousSlot(slotState, bm, swappedAt)
+	daemonPrev := resolveDaemonPreviousSlot(slotState, bm)
 	if ap == "" {
 		updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
 			if normSlot == SlotEscalation {
@@ -714,9 +737,8 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 				if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.EscalationMirrorHistory, cur.EscalationMirrorSeq, cur.EscalationMirrorAt, existingAT, cur.EscalationSupersededHistories) {
 					return false, false, nil
 				}
-				if daemonPrev != nil {
-					prevCopy := *daemonPrev
-					cur.PreviousEscalation = &prevCopy
+				if mergedPrev := mergeKnownPreviousProvenance(daemonPrev, cur.Escalation, cur.PreviousEscalation); mergedPrev != nil {
+					cur.PreviousEscalation = mergedPrev
 				} else if cur.Escalation != nil {
 					prevCopy := *cur.Escalation
 					cur.PreviousEscalation = &prevCopy
@@ -726,15 +748,16 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 				cur.EscalationSeq++
 			} else {
 				var existingAT time.Time
+				var existingPtr *AdapterSlot
 				if prev, ok := cur.PrimarySlot(); ok {
 					existingAT = prev.ActivatedAt
+					existingPtr = &prev
 				}
 				if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.PrimaryMirrorHistory, cur.PrimaryMirrorSeq, cur.PrimaryMirrorAt, existingAT, cur.PrimarySupersededHistories) {
 					return false, false, nil
 				}
-				if daemonPrev != nil {
-					prevCopy := *daemonPrev
-					cur.Previous = &prevCopy
+				if mergedPrev := mergeKnownPreviousProvenance(daemonPrev, existingPtr, cur.Previous); mergedPrev != nil {
+					cur.Previous = mergedPrev
 				} else if prev, ok := cur.PrimarySlot(); ok {
 					prevCopy := prev
 					cur.Previous = &prevCopy
@@ -770,15 +793,16 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		switch normSlot {
 		case SlotPrimary:
 			var existingAT time.Time
+			var existingPtr *AdapterSlot
 			if existing, ok := cur.PrimarySlot(); ok {
 				existingAT = existing.ActivatedAt
+				existingPtr = &existing
 			}
 			if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.PrimaryMirrorHistory, cur.PrimaryMirrorSeq, cur.PrimaryMirrorAt, existingAT, cur.PrimarySupersededHistories) {
 				return false, false, nil
 			}
-			if daemonPrev != nil {
-				prevCopy := *daemonPrev
-				cur.Previous = &prevCopy
+			if mergedPrev := mergeKnownPreviousProvenance(daemonPrev, existingPtr, cur.Previous); mergedPrev != nil {
+				cur.Previous = mergedPrev
 			} else if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
 				prevCopy := prev
 				cur.Previous = &prevCopy
@@ -795,9 +819,8 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 			if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.EscalationMirrorHistory, cur.EscalationMirrorSeq, cur.EscalationMirrorAt, existingAT, cur.EscalationSupersededHistories) {
 				return false, false, nil
 			}
-			if daemonPrev != nil {
-				prevCopy := *daemonPrev
-				cur.PreviousEscalation = &prevCopy
+			if mergedPrev := mergeKnownPreviousProvenance(daemonPrev, cur.Escalation, cur.PreviousEscalation); mergedPrev != nil {
+				cur.PreviousEscalation = mergedPrev
 			} else if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy

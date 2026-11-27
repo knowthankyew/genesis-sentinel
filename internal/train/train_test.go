@@ -617,4 +617,33 @@ func TestMirrorDaemonSlotHistoryEpochAndLocalManifestBump(t *testing.T) {
 	if err != nil || mTS.AdapterPath != "" {
 		t.Fatalf("expected stale timestamp activation t200 rejected after deactivation t300, got %+v err=%v", mTS, err)
 	}
+
+	// Mirroring B while local already holds matching previous A preserves A's known provenance & timestamp ([7]).
+	provDir := t.TempDir()
+	tOrigA := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+	tSwapB := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	if _, err := UpdateActiveAdapterSlot(provDir, SlotPrimary, AdapterSlot{
+		JobID:       "job-A",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/A/model_adapters",
+		DatasetHash: "sha256:dataset-A",
+		ActivatedAt: tOrigA,
+	}); err != nil {
+		t.Fatalf("seed provDir A: %v", err)
+	}
+	mProv, err := MirrorDaemonSlotToManifest(provDir, SlotPrimary, &SlotStatus{
+		Slot:                SlotPrimary,
+		BaseModel:           model.ModelSmolLM2135MInstruct,
+		AdapterPath:         "artifacts/B/model_adapters",
+		JobID:               "job-B",
+		SwappedAt:           tSwapB,
+		HistoryID:           "h-prov",
+		OpSeq:               2,
+		PreviousBaseModel:   model.ModelSmolLM2135MInstruct,
+		PreviousAdapterPath: "artifacts/A/model_adapters",
+	}, "", "", "")
+	if err != nil || mProv.Previous == nil || mProv.Previous.JobID != "job-A" ||
+		mProv.Previous.DatasetHash != "sha256:dataset-A" || !mProv.Previous.ActivatedAt.Equal(tOrigA) {
+		t.Fatalf("expected preserved A provenance & original ActivatedAt on previous snapshot ([7]), got %+v err=%v", mProv.Previous, err)
+	}
 }

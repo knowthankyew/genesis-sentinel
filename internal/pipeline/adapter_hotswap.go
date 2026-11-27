@@ -11,6 +11,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -467,6 +468,15 @@ func (p *Pipeline) recordCorrelationWindowWithKey(corrKey string, alertSeq uint6
 		}
 	}
 	list = append(list, entry)
+	// Keep chronological ascending order by (timestamp, alertSeq) so late arrivals never evict
+	// newer correlation entries when bounding list length to maxCorrelationPerService ([15]).
+	for j := len(list) - 1; j > 0; j-- {
+		a, b := list[j-1], list[j]
+		if a.timestamp < b.timestamp || (a.timestamp == b.timestamp && a.alertSeq <= b.alertSeq) {
+			break
+		}
+		list[j-1], list[j] = b, a
+	}
 	if len(list) > maxCorrelationPerService {
 		list = append([]correlationEntry(nil), list[len(list)-maxCorrelationPerService:]...)
 	}
@@ -1260,7 +1270,12 @@ func (p *Pipeline) handleAdapterRequest(w http.ResponseWriter, r *http.Request) 
 		return
 
 	case http.MethodDelete:
-		rawSlot := r.URL.Query().Get("slot")
+		qVals, qErr := url.ParseQuery(r.URL.RawQuery)
+		if qErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid query string: %v", qErr))
+			return
+		}
+		rawSlot := qVals.Get("slot")
 		slot, err := train.NormalizeSlot(rawSlot, true)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -1352,13 +1367,48 @@ func (p *Pipeline) prepareEnableClient(slot, baseModel, adapterPath string) (*tr
 	return buildSlotClient(baseURL, baseModel, adapterPath, p.cfg.FTaaSAPIKey, timeoutSec, maxTokens, temp, p.cfg.MaxPromptByte, p.cfg.AllowRemoteEndpoints)
 }
 
+func (p *Pipeline) reconcileSlotClientMetaLocked(slot string, c *triage.Client) {
+	p.adapterMu.Lock()
+	defer p.adapterMu.Unlock()
+	meta := &p.primaryMeta
+	fromDisk := &p.primaryFromDisk
+	if slot == train.SlotEscalation {
+		meta = &p.escalationMeta
+		fromDisk = &p.escalationFromDisk
+	}
+	if c == nil {
+		if meta.adapterPath != "" || meta.jobID != "" || meta.datasetHash != "" || *fromDisk {
+			meta.baseModel = ""
+			meta.adapterPath = ""
+			meta.jobID = ""
+			meta.datasetHash = ""
+			*fromDisk = false
+			p.hasSyncedManifest = false
+			p.lastSyncedManifest = [sha256.Size]byte{}
+		}
+		return
+	}
+	newModel, newPath := c.BaseModel(), c.AdapterPath()
+	if meta.baseModel != newModel || meta.adapterPath != newPath {
+		meta.baseModel = newModel
+		meta.adapterPath = newPath
+		meta.jobID = ""
+		meta.datasetHash = ""
+		meta.swappedAt = time.Now().UTC()
+		*fromDisk = false
+		p.hasSyncedManifest = false
+		p.lastSyncedManifest = [sha256.Size]byte{}
+	}
+}
+
 func (p *Pipeline) handleAdapterActivate(w http.ResponseWriter, r *http.Request, slot string, req train.AdapterSwapRequest) {
 	baseModel := strings.TrimSpace(req.BaseModel)
 	if baseModel == "" {
+		primBase, escBase := p.configuredBaseModels()
 		if slot == train.SlotEscalation {
-			baseModel = p.cfg.EscalationBaseModel
+			baseModel = escBase
 		} else {
-			baseModel = p.cfg.BaseModel
+			baseModel = primBase
 		}
 	}
 	if _, err := model.ValidateBaseModel(baseModel); err != nil {

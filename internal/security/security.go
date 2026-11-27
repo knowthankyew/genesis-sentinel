@@ -592,6 +592,12 @@ func SanitizeURLError(err error) error {
 	}
 }
 
+// RedactEndpointURL strips credentials, query parameters, and fragments from raw URLs
+// before surfacing endpoint targets in CLI errors or diagnostics.
+func RedactEndpointURL(raw string) string {
+	return sanitizeSingleURLString(strings.TrimSpace(raw))
+}
+
 func sanitizeSingleURLString(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {

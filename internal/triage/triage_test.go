@@ -744,8 +744,8 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTriagePromptChecked failed: %v", err)
 	}
-	if !strings.Contains(prompt, "correlated=ssh-recon(RECON-SCAN,cnt=40)") {
-		t.Fatalf("expected correlated window context in prompt, got %s", prompt)
+	if !strings.Contains(prompt, "correlated=ssh-recon(RECON-SCAN,cnt=40),sudo-probe(PRIV-ESC)") {
+		t.Fatalf("expected both correlated window items rendered cleanly in prompt, got %s", prompt)
 	}
 	if strings.Count(prompt, "END_UNTRUSTED_LOG_TELEMETRY") != 1 {
 		t.Fatalf("expected spoofed closing fence inside correlated window to be defanged, got %s", prompt)
@@ -794,11 +794,11 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 		t.Fatalf("expected full 30B template and 74B sample preserved untruncated, got:\n%s", tightPrompt)
 	}
 
-	// Surplus budget beyond full current-event reservation sized for first complete correlated summary
+	// Surplus budget beyond full current-event allocation sized for first complete correlated summary
 	// ("priorA(RECON,MEDIUM,cnt=5)") plus 4 extra bytes (< ",priorB(EXFIL,HIGH,cnt=8)") must keep priorA whole and drop priorB ([11]).
 	fullTmpl := "UNIQUE_CURRENT_TEMPLATE failed login for admin"
 	fullSample := "UNIQUE_CURRENT_SAMPLE src=203.0.113.99 user=admin"
-	partialBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 3*len(fullTmpl) + len(" correlated=") + len("priorA(RECON,MEDIUM,cnt=5)") + 4
+	partialBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + len(fullTmpl) + len(fullSample) + len(" correlated=") + len("priorA(RECON,MEDIUM,cnt=5)") + 4
 	partialPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
 		Service:           "auth-svc",
 		Level:             "WARN",
@@ -818,6 +818,42 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 	}
 	if !strings.Contains(partialPrompt, "UNIQUE_CURRENT_TEMPLATE") || !strings.Contains(partialPrompt, "UNIQUE_CURRENT_SAMPLE") {
 		t.Fatalf("expected current event template & sample preserved alongside fitted correlated prefix, got:\n%s", partialPrompt)
+	}
+
+	// Frozen current-event template allocation: 180B avail with 100B template & 1B sample reserves 60B
+	// template allocation intact when appending a 30B correlation item ([10]).
+	tmpl100 := strings.Repeat("T", 100)
+	avail180Budget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 180
+	avail180Prompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:           "auth-svc",
+		Level:             "WARN",
+		Template:          tmpl100,
+		SampleLine:        "S",
+		Count:             9,
+		CorrelatedWindows: []string{strings.Repeat("C", 30)},
+	}, avail180Budget)
+	if err != nil {
+		t.Fatalf("180B avail BuildTriagePromptChecked failed: %v", err)
+	}
+	if !strings.Contains(avail180Prompt, "template="+strings.Repeat("T", 60)+"\n") || !strings.Contains(avail180Prompt, "correlated="+strings.Repeat("C", 30)) {
+		t.Fatalf("expected full 60B template allocation preserved alongside 30B correlation ([10]), got:\n%s", avail180Prompt)
+	}
+
+	// Consistent 32B minimum reserve stops a 32B correlation summary when 70B avail only leaves 26B ([11]).
+	avail70Budget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 70
+	avail70Prompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:           "auth-svc",
+		Level:             "WARN",
+		Template:          "t",
+		SampleLine:        strings.Repeat("s", 10),
+		Count:             9,
+		CorrelatedWindows: []string{strings.Repeat("D", 32)},
+	}, avail70Budget)
+	if err != nil {
+		t.Fatalf("70B avail BuildTriagePromptChecked failed: %v", err)
+	}
+	if strings.Contains(avail70Prompt, "correlated=") || !strings.Contains(avail70Prompt, "sample="+strings.Repeat("s", 10)) {
+		t.Fatalf("expected 32B correlation item omitted cleanly under consistent 32B reserve ([11]), got:\n%s", avail70Prompt)
 	}
 }
 

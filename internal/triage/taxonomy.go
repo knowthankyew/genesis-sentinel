@@ -286,9 +286,13 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	metaSignals = append(metaSignals, featSigs...)
 	signals := mergeSignals(in.InjectionSignals, sigSvc, sigLvl, sigTmpl, sigSample, metaSignals)
 	injSuspected := in.InjectionSuspected || len(signals) > 0
-	// Allocate bounded priority budget for current-event template and sample FIRST so
-	// optional correlated history only consumes leftover unused budget ([7], [9], [11]).
-	const fieldLabelsLen = len("\ntemplate=\nsample=")
+	// Allocate bounded priority budget for current-event template and sample FIRST using a single
+	// consistent 32-byte minimum reserve, then pack only complete optional correlated summaries
+	// into truly unused surplus bytes so event text never shrinks to accommodate history ([7], [10], [11]).
+	const (
+		fieldLabelsLen     = len("\ntemplate=\nsample=")
+		minEventTextBudget = 32
+	)
 	framingLen := len(promptHeader) + len(promptFooter)
 	bodyBudget := maxPromptBytes - framingLen
 
@@ -302,26 +306,36 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	if injSuspected {
 		metaLine += " injection_flag=true"
 	}
+
+	avail := bodyBudget - len(metaLine) - fieldLabelsLen
+	if avail < minEventTextBudget && bodyBudget >= fieldLabelsLen+minEventTextBudget {
+		maxMetaLen := bodyBudget - fieldLabelsLen - minEventTextBudget
+		if len(metaLine) > maxMetaLen {
+			metaLine = truncateUTF8(metaLine, maxMetaLen)
+		}
+		avail = bodyBudget - len(metaLine) - fieldLabelsLen
+	}
+	if avail < 16 {
+		if len(metaLine) > bodyBudget {
+			metaLine = truncateUTF8(metaLine, bodyBudget)
+		}
+		return promptHeader + metaLine + promptFooter, injSuspected, signals, nil
+	}
+
+	tmplBudget := min(avail/3, 384)
+	if len(cleanTmpl) > tmplBudget {
+		cleanTmpl = truncateUTF8(cleanTmpl, tmplBudget)
+	}
+	sampleBudget := avail - len(cleanTmpl)
+	if len(cleanSample) > sampleBudget {
+		cleanSample = truncateUTF8(cleanSample, sampleBudget)
+	}
+
 	if len(corrItems) > 0 {
 		corrPrefix := " correlated="
-		baseAvail := bodyBudget - fieldLabelsLen - len(metaLine)
-		effTmpl := 0
-		effSample := 0
-		if baseAvail >= 16 {
-			maxTmplBase := min(baseAvail/3, 384)
-			effTmpl = min(len(cleanTmpl), maxTmplBase)
-			effSample = min(len(cleanSample), baseAvail-effTmpl)
-		}
-		reservedEventBudget := effTmpl + effSample
-		if effTmpl == len(cleanTmpl) && effTmpl < 384 && reservedEventBudget < 3*effTmpl {
-			reservedEventBudget = 3 * effTmpl
-		}
-		if reservedEventBudget < 16 {
-			reservedEventBudget = 16
-		}
-		maxCorrBudget := baseAvail - reservedEventBudget - len(corrPrefix)
+		reservedEventBudget := max(len(cleanTmpl)+len(cleanSample), minEventTextBudget)
+		maxCorrBudget := avail - reservedEventBudget - len(corrPrefix)
 		if maxCorrBudget >= 16 {
-			// Append only whole correlated summaries that fit cleanly ([11]).
 			fitted := make([]string, 0, len(corrItems))
 			used := 0
 			for _, item := range corrItems {
@@ -339,35 +353,6 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 				metaLine += corrPrefix + strings.Join(fitted, ",")
 			}
 		}
-	}
-
-	avail := bodyBudget - len(metaLine) - fieldLabelsLen
-	if avail < 32 && bodyBudget >= fieldLabelsLen+32 {
-		// Reserve at least 32 bytes for template/sample event text if core metadata itself
-		// exceeds the prompt budget on minimal MinPromptBytes configurations.
-		maxMetaLen := bodyBudget - fieldLabelsLen - 32
-		if len(metaLine) > maxMetaLen {
-			metaLine = truncateUTF8(metaLine, maxMetaLen)
-		}
-		avail = bodyBudget - len(metaLine) - fieldLabelsLen
-	}
-	if avail < 16 {
-		if len(metaLine) > bodyBudget {
-			metaLine = truncateUTF8(metaLine, bodyBudget)
-		}
-		return promptHeader + metaLine + promptFooter, injSuspected, signals, nil
-	}
-
-	tmplBudget := avail / 3
-	if tmplBudget > 384 {
-		tmplBudget = 384
-	}
-	if len(cleanTmpl) > tmplBudget {
-		cleanTmpl = truncateUTF8(cleanTmpl, tmplBudget)
-	}
-	sampleBudget := avail - len(cleanTmpl)
-	if len(cleanSample) > sampleBudget {
-		cleanSample = truncateUTF8(cleanSample, sampleBudget)
 	}
 
 	prompt := promptHeader + metaLine + "\ntemplate=" + cleanTmpl + "\nsample=" + cleanSample + promptFooter

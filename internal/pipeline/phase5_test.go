@@ -1335,4 +1335,56 @@ func TestPipelinePhase5Round4Invariants(t *testing.T) {
 		t.Fatalf("expected published OpSeq strictly monotonic within same HistoryID after manifest deletion ([14]), before=%+v after=%+v",
 			beforeRemove, afterRemoveResp.Primary)
 	}
+
+	// 7. AttachEscalationClient updates escalation metadata & clears stale provenance ([6]),
+	// POST /adapter omitting base_model uses SetConfiguredBaseModels ([13]),
+	// late correlation alert (t=1000) does not evict newer 1800..1803 entries ([15]),
+	// and malformed DELETE query string fails 400 Bad Request rather than defaulting primary ([16]).
+	escRec := httptest.NewRecorder()
+	escReq := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"escalation","job_id":"esc-old","dataset_hash":"sha256:old-esc","adapter_path":"artifacts/esc-old/model_adapters"}`))
+	escReq.Header.Set("Content-Type", "application/json")
+	p14m.HandleAdapter(escRec, escReq)
+	repClient, err := triage.NewClient(triage.ClientOptions{
+		BaseURL:     "http://127.0.0.1:8001",
+		BaseModel:   model.ModelGemma22BIT,
+		AdapterPath: "artifacts/esc-replaced/model_adapters",
+	})
+	if err != nil {
+		t.Fatalf("NewClient replacement: %v", err)
+	}
+	p14m.AttachEscalationClient(repClient)
+	escSt := p14m.snapshotSlotStatusLocked(train.SlotEscalation)
+	if escSt.AdapterPath != "artifacts/esc-replaced/model_adapters" || escSt.JobID != "" || escSt.DatasetHash != "" {
+		t.Fatalf("expected AttachEscalationClient to reconcile escalation metadata and clear stale provenance ([6]), got %+v", escSt)
+	}
+
+	// Configured SmolLM2 vs hydrated Gemma base_model -> POST without base_model after DELETE uses SmolLM2 ([13]).
+	recPostOmit := httptest.NewRecorder()
+	reqPostOmit := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","adapter_path":"artifacts/omitted-bm/model_adapters"}`))
+	reqPostOmit.Header.Set("Content-Type", "application/json")
+	p10.HandleAdapter(recPostOmit, reqPostOmit)
+	if recPostOmit.Code != http.StatusOK || p10.TriageClient().BaseModel() != model.ModelSmolLM2135MInstruct {
+		t.Fatalf("expected POST omitting base_model after DELETE to select configured %s ([13]), got code=%d model=%s",
+			model.ModelSmolLM2135MInstruct, recPostOmit.Code, p10.TriageClient().BaseModel())
+	}
+
+	// Late alert t=1000 must not evict newer 1800..1803 entries when filling overflowed cache ([15]).
+	for ts := int64(1800); ts <= 1803; ts++ {
+		pCorr.recordCorrelationWindow(emit.Alert{
+			Timestamp: ts, SourceService: "svc-late", TemplateID: fmt.Sprintf("t-%d", ts), Categories: []string{"recon"}, Severity: "MEDIUM", Count: 1,
+		})
+	}
+	pCorr.recordCorrelationWindow(emit.Alert{
+		Timestamp: 1000, SourceService: "svc-late", TemplateID: "t-1000", Categories: []string{"recon"}, Severity: "MEDIUM", Count: 1,
+	})
+	if gotLate := pCorr.collectCorrelatedContext("svc-late", "t-other", 1804); len(gotLate) != 4 {
+		t.Fatalf("expected all 4 entries 1800..1803 preserved after late t=1000 insert ([15]), got %v", gotLate)
+	}
+
+	// Malformed DELETE /adapter?slot=%zz must fail with 400 Bad Request instead of defaulting to primary ([16]).
+	recBadDel := httptest.NewRecorder()
+	p14m.HandleAdapter(recBadDel, httptest.NewRequest(http.MethodDelete, "/adapter?slot=%zz", nil))
+	if recBadDel.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on malformed DELETE query string ([16]), got %d: %s", recBadDel.Code, recBadDel.Body.String())
+	}
 }

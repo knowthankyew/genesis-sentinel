@@ -288,8 +288,9 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 	var manifest train.ActiveAdapter
 	if !daemonSavedSameDir {
 		if daemonRolledBack {
+			statusHint := fmt.Sprintf("sentinel adapter status --sentinel-http %s", security.RedactEndpointURL(*sentinelHTTP))
 			if daemonResp.Truncated {
-				return fmt.Errorf("running daemon already rolled back %s slot (do NOT re-run 'sentinel adapter rollback', as the daemon already swapped previous; inspect with 'sentinel adapter status'), but slot metadata exceeded 64 KiB wire limit (truncated=true); synchronize local manifest in %q manually", normSlot, cfg.DataDir)
+				return fmt.Errorf("running daemon already rolled back %s slot (do NOT re-run 'sentinel adapter rollback', as the daemon already swapped previous; inspect with '%s' and matching auth/remote flags), but slot metadata exceeded 64 KiB wire limit (truncated=true); synchronize local manifest in %q manually", normSlot, statusHint, cfg.DataDir)
 			}
 			slotStatus := daemonResp.Primary
 			if normSlot == train.SlotEscalation {
@@ -304,7 +305,7 @@ func runAdapterRollback(args []string, stdout, stderr io.Writer) error {
 				daemonResp.JobID,
 			)
 			if syncErr != nil {
-				return fmt.Errorf("running daemon already rolled back %s slot (do NOT re-run 'sentinel adapter rollback', as the daemon already swapped previous; inspect with 'sentinel adapter status'), but synchronizing local manifest failed: %w", normSlot, syncErr)
+				return fmt.Errorf("running daemon already rolled back %s slot (do NOT re-run 'sentinel adapter rollback', as the daemon already swapped previous; inspect with '%s' and matching auth/remote flags), but synchronizing local manifest failed: %w", normSlot, statusHint, syncErr)
 			}
 			manifest = updated
 		} else {
