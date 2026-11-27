@@ -578,9 +578,9 @@ def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
             continue
 
         # CommonMark §4.6 Type 2 raw HTML blocks (<!-- ... --> starting at up to 3 spaces)
-        # discard trailing text on the closing line so comments cannot mask table headers ([31]).
+        # Check full line for "-->" so self-closing <!--> terminates on its own line ([26]).
         if re.match(r"^ {0,3}<!--", line):
-            if "-->" not in line[line.find("<!--") + 4 :]:
+            if "-->" not in line:
                 in_html_type2 = True
             cleaned_lines.append("")
             can_start_indented_code = True
@@ -628,6 +628,19 @@ def _strip_markdown_non_visible_regions(md_text: str) -> list[str]:
     return cleaned_lines
 
 
+_GFM_TABLE_BREAK_RE = re.compile(
+    r"^(?:"
+    r" {0,3}#{1,6}(?:[ \t]|$)"
+    r"| {0,3}>"
+    r"| {0,3}(?:`{3,}|~{3,})"
+    r"| {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)"
+    r"| {0,3}(?:\*[ \t]*){3,}$"
+    r"| {0,3}(?:-[ \t]*){3,}$"
+    r"| {0,3}(?:_[ \t]*){3,}$"
+    r")"
+)
+
+
 def _iter_gfm_table_body_rows(cleaned_lines: list[str]):
     """Yield (rendered_line, rendered_parts, table_header_parts) for every visible GFM body row."""
     i = 0
@@ -640,10 +653,16 @@ def _iter_gfm_table_body_rows(cleaned_lines: list[str]):
                 header_cols = len(hdr[1])
                 i += 2
                 while i < total_lines:
-                    body = _parse_gfm_row(cleaned_lines[i], require_outer_pipes=False, min_cells=1)
-                    if body is None:
+                    raw_line = cleaned_lines[i]
+                    body = _parse_gfm_row(raw_line, require_outer_pipes=False, min_cells=1)
+                    if body is not None:
+                        line, parts = body
+                    elif raw_line.startswith(("    ", "\t")) or not raw_line.strip() or _GFM_TABLE_BREAK_RE.match(raw_line):
                         break
-                    line, parts = body
+                    else:
+                        # Valid non-piped GFM table row continuation belongs to the active table ([25]).
+                        line = raw_line.strip()
+                        parts = [line]
                     # GFM §4.10 discards body cells beyond the header column width.
                     if len(parts) > header_cols:
                         rendered_parts = parts[:header_cols]
@@ -1663,12 +1682,16 @@ def independent_recompute_phase5_comparison(
                     re_smol_fmt = re_smol_cls = re_smol_fp = re_smol_tp = re_smol_corr = re_smol_mitre = 0
                     re_gemma_fmt = re_gemma_cls = re_gemma_fp = re_gemma_tp = re_gemma_corr = re_gemma_mitre = 0
                     re_hyb_cls = re_hyb_fp = re_hyb_tp = re_hyb_corr = re_hyb_mitre = 0
+                    re_benign_tot = re_attack_tot = re_nr_tot = re_corr_tot = re_mitre_tot = 0
+                    req_replay_keys = [
+                        "partition", "truth_class", "truth_mitre", "tier1_sev",
+                        "smol_format_valid", "smol_class", "smol_sev", "smol_mitre",
+                        "gemma_format_valid", "gemma_class", "gemma_sev", "gemma_mitre",
+                    ]
+                    if require_governed_fields:
+                        req_replay_keys.extend(["smol_nonempty", "gemma_nonempty"])
                     full_replay_fields = all(
-                        all(k in d for k in (
-                            "partition", "truth_class", "truth_mitre", "tier1_sev",
-                            "smol_format_valid", "smol_class", "smol_sev", "smol_mitre",
-                            "gemma_format_valid", "gemma_class", "gemma_sev", "gemma_mitre",
-                        ))
+                        all(k in d for k in req_replay_keys)
                         for d in decisions
                     )
                     if require_governed_fields and not full_replay_fields:
@@ -1681,6 +1704,9 @@ def independent_recompute_phase5_comparison(
                         corr_f = dec_row.get("correlated_case")
                         if not isinstance(inj_f, bool) or not isinstance(corr_f, bool) or not isinstance(dec_row.get("escalated"), bool):
                             errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid boolean flags")
+                            break
+                        if t1_sev not in sev_rank or p_sev not in sev_rank:
+                            errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid severity value (tier1={t1_sev!r}, primary={p_sev!r})")
                             break
                         recomp_esc = (
                             t1_sev in ("HIGH", "CRITICAL")
@@ -1699,16 +1725,34 @@ def independent_recompute_phase5_comparison(
                             part = dec_row["partition"]
                             t_cls = dec_row["truth_class"]
                             t_mit = dec_row["truth_mitre"]
-                            s_fv = bool(dec_row["smol_format_valid"])
-                            s_ne = bool(dec_row.get("smol_nonempty", True))
+                            s_fv_raw = dec_row["smol_format_valid"]
+                            s_ne_raw = dec_row["smol_nonempty"] if "smol_nonempty" in dec_row else True
                             s_cls = dec_row["smol_class"]
                             s_sev = dec_row["smol_sev"]
                             s_mit = dec_row["smol_mitre"]
-                            g_fv = bool(dec_row["gemma_format_valid"])
-                            g_ne = bool(dec_row.get("gemma_nonempty", True))
+                            g_fv_raw = dec_row["gemma_format_valid"]
+                            g_ne_raw = dec_row["gemma_nonempty"] if "gemma_nonempty" in dec_row else True
                             g_cls = dec_row["gemma_class"]
                             g_sev = dec_row["gemma_sev"]
                             g_mit = dec_row["gemma_mitre"]
+                            if not all(isinstance(b, bool) for b in (s_fv_raw, s_ne_raw, g_fv_raw, g_ne_raw)):
+                                errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has non-boolean format/nonempty flag")
+                                break
+                            if part not in ("benign", "attack", "needs_review") or s_sev not in sev_rank or g_sev not in sev_rank or not isinstance(t_mit, str):
+                                errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid partition/severity/truth_mitre field")
+                                break
+                            s_fv, s_ne = s_fv_raw, s_ne_raw
+                            g_fv, g_ne = g_fv_raw, g_ne_raw
+                            if part == "benign":
+                                re_benign_tot += 1
+                            elif part == "attack":
+                                re_attack_tot += 1
+                            else:
+                                re_nr_tot += 1
+                            if corr_f:
+                                re_corr_tot += 1
+                            if t_mit != "NONE":
+                                re_mitre_tot += 1
 
                             if s_fv:
                                 re_smol_fmt += 1
@@ -1736,14 +1780,14 @@ def independent_recompute_phase5_comparison(
                             if part == "benign" and ((not g_fv) or g_cls != "BENIGN-NOISE"):
                                 re_gemma_fp += 1
 
-                            if flag and (g_ne or not s_fv):
+                            if flag and (g_ne or not s_ne):
                                 c_fv, c_cls, c_sev, c_mit = g_fv, g_cls, g_sev, g_mit
                             else:
                                 c_fv, c_cls, c_sev, c_mit = s_fv, s_cls, s_sev, s_mit
                             if inj_f and c_cls == "BENIGN-NOISE":
                                 c_cls = "NEEDS-REVIEW"
                                 c_sev = "HIGH"
-                            if sev_rank.get(t1_sev, 0) > sev_rank.get(c_sev, 0):
+                            if sev_rank[t1_sev] > sev_rank[c_sev]:
                                 c_sev = t1_sev
                             if c_fv:
                                 if c_cls == t_cls:
@@ -1758,6 +1802,14 @@ def independent_recompute_phase5_comparison(
                                 re_hyb_fp += 1
                     else:
                         if full_replay_fields:
+                            if (re_benign_tot, re_attack_tot, re_nr_tot, re_corr_tot, re_mitre_tot) != (
+                                eval_benign, eval_attack, eval_nr, eval_corr, mitre_app
+                            ):
+                                errors.append(
+                                    f"phase5 hybrid per_sample_decisions partition/applicable counts "
+                                    f"{(re_benign_tot, re_attack_tot, re_nr_tot, re_corr_tot, re_mitre_tot)} != "
+                                    f"dataset {(eval_benign, eval_attack, eval_nr, eval_corr, mitre_app)}"
+                                )
                             if "smol_lora" in recomputed_models:
                                 slm = recomputed_models["smol_lora"]
                                 if (slm["fmt_cnt"], slm["cls_cnt"], slm["fp"], slm["tp_cnt"], slm["corr_cnt"], slm["mitre_cnt"]) != (
@@ -1959,26 +2011,30 @@ def independent_recompute_phase5_comparison(
                 first_cell_counts: dict[str, int] = {}
                 row_to_headers: dict[str, list[list[str]]] = {}
                 table_headers_seen: list[list[str]] = []
+                canonical_row_patterns = (
+                    (re.compile(r"^`SmolLM2-135M-Instruct`\s*\(Base\b", re.IGNORECASE), "`SmolLM2-135M-Instruct` (Base)"),
+                    (re.compile(r"^`SmolLM2-135M-Instruct`\s*\(LoRA\b", re.IGNORECASE), "`SmolLM2-135M-Instruct` (LoRA)"),
+                    (re.compile(r"^`google/gemma-2-2b-it`\s*\(Base\b", re.IGNORECASE), "`google/gemma-2-2b-it` (Base)"),
+                    (re.compile(r"^`google/gemma-2-2b-it`\s*\(LoRA\b", re.IGNORECASE), "`google/gemma-2-2b-it` (LoRA)"),
+                    (re.compile(r"^\*\*Hybrid Escalation\b"), "**Hybrid Escalation**"),
+                    (re.compile(r"^PyTorch PEFT Additional Adapter Load\b"), "PyTorch PEFT Additional Adapter Load"),
+                    (re.compile(r"^PyTorch PEFT Resident Adapter Switch\b"), "PyTorch PEFT Resident Adapter Switch"),
+                    (re.compile(r"^Sentinel Sidecar CLI Swap\b"), "Sentinel Sidecar CLI Swap"),
+                    (re.compile(r"^Sentinel Sidecar CLI Rollback\b"), "Sentinel Sidecar CLI Rollback"),
+                )
+                canonical_keys = {canon for _, canon in canonical_row_patterns}
                 for rline, rparts, hparts in _iter_gfm_table_body_rows(cleaned_lines):
                     table_headers_seen.append(hparts)
                     row_to_headers.setdefault(rline, []).append(hparts)
-                    lbl_key = re.sub(r"\s+", " ", rparts[0]).strip()
-                    if lbl_key.startswith("**Hybrid Escalation"):
-                        lbl_key = "**Hybrid Escalation**"
+                    lbl_norm = re.sub(r"\s+", " ", rparts[0]).strip()
+                    lbl_key = lbl_norm
+                    for pat, canon in canonical_row_patterns:
+                        if pat.match(lbl_norm):
+                            lbl_key = canon
+                            break
                     first_cell_counts[lbl_key] = first_cell_counts.get(lbl_key, 0) + 1
-                expected_unique_prefixes = (
-                    "`SmolLM2-135M-Instruct` (Base)",
-                    "`SmolLM2-135M-Instruct` (LoRA)",
-                    "`google/gemma-2-2b-it` (Base)",
-                    "`google/gemma-2-2b-it` (LoRA)",
-                    "**Hybrid Escalation**",
-                    "PyTorch PEFT Additional Adapter Load",
-                    "PyTorch PEFT Resident Adapter Switch",
-                    "Sentinel Sidecar CLI Swap",
-                    "Sentinel Sidecar CLI Rollback",
-                )
                 for lbl_key, cnt in first_cell_counts.items():
-                    if cnt > 1 and any(lbl_key.startswith(pref) for pref in expected_unique_prefixes):
+                    if cnt > 1 and lbl_key in canonical_keys:
                         errors.append(f"Phase 5 Markdown report {report_rel} contains duplicate row for {lbl_key!r} ({cnt} occurrences)")
                 if any("Benign FP (Rate)" in h for h in table_headers_seen):
                     errors.append(f"Phase 5 Markdown report {report_rel} uses deprecated ambiguous header 'Benign FP (Rate)'; expected 'Benign Error (Rate)'")
@@ -2035,6 +2091,16 @@ def independent_recompute_phase5_comparison(
                     hw_frag = f"(`{meta['cpu_brand']}`, `{meta['cpu_logical_cores']}` logical cores, `torch_threads={meta['torch_num_threads']}`)"
                     if hw_frag not in visible_text:
                         errors.append(f"Phase 5 Markdown hardware metadata mismatch: expected {hw_frag!r}")
+
+                # Validate visible Markdown title and Commit bullet match metadata.git_commit ([23]).
+                git_commit_str = meta.get("git_commit")
+                if require_governed_fields or (isinstance(git_commit_str, str) and git_commit_str.strip()):
+                    exp_title = f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({git_commit_str})"
+                    exp_commit_bullet = f"- **Commit:** `{git_commit_str}`"
+                    if exp_title not in visible_text:
+                        errors.append(f"Phase 5 Markdown title/commit mismatch: expected {exp_title!r}")
+                    if exp_commit_bullet not in visible_text:
+                        errors.append(f"Phase 5 Markdown commit bullet mismatch: expected {exp_commit_bullet!r}")
 
                 # Validate a single visible `## Conclusion` section including optional GFM closing hashes ([36]).
                 conc_indices = [

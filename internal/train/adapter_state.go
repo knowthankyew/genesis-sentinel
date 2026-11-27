@@ -64,16 +64,20 @@ type AdapterSlot struct {
 // ActiveAdapter records the currently activated local LoRA adapter references for Tier 2
 // (primary SmolLM2 + optional Phase 5 escalation Gemma 2 2B IT) and previous rollback snapshots.
 type ActiveAdapter struct {
-	JobID              string       `json:"job_id,omitempty"`
-	BaseModel          string       `json:"base_model,omitempty"`
-	AdapterPath        string       `json:"adapter_path,omitempty"`
-	DatasetHash        string       `json:"dataset_hash,omitempty"`
-	ActivatedAt        time.Time    `json:"activated_at,omitempty"`
-	PrimarySeq         uint64       `json:"primary_seq,omitempty"`
-	EscalationSeq      uint64       `json:"escalation_seq,omitempty"`
-	Escalation         *AdapterSlot `json:"escalation,omitempty"`
-	Previous           *AdapterSlot `json:"previous,omitempty"`
-	PreviousEscalation *AdapterSlot `json:"previous_escalation,omitempty"`
+	JobID                   string       `json:"job_id,omitempty"`
+	BaseModel               string       `json:"base_model,omitempty"`
+	AdapterPath             string       `json:"adapter_path,omitempty"`
+	DatasetHash             string       `json:"dataset_hash,omitempty"`
+	ActivatedAt             time.Time    `json:"activated_at,omitempty"`
+	PrimarySeq              uint64       `json:"primary_seq,omitempty"`
+	EscalationSeq           uint64       `json:"escalation_seq,omitempty"`
+	PrimaryMirrorHistory    string       `json:"primary_mirror_history,omitempty"`
+	PrimaryMirrorSeq        uint64       `json:"primary_mirror_seq,omitempty"`
+	EscalationMirrorHistory string       `json:"escalation_mirror_history,omitempty"`
+	EscalationMirrorSeq     uint64       `json:"escalation_mirror_seq,omitempty"`
+	Escalation              *AdapterSlot `json:"escalation,omitempty"`
+	Previous                *AdapterSlot `json:"previous,omitempty"`
+	PreviousEscalation      *AdapterSlot `json:"previous_escalation,omitempty"`
 }
 
 // PrimarySlot returns the populated primary AdapterSlot when a primary adapter is active.
@@ -188,7 +192,8 @@ func validateAndNormalizeManifest(state *ActiveAdapter) error {
 	}
 
 	if state.AdapterPath == "" && state.Escalation == nil && state.Previous == nil && state.PreviousEscalation == nil &&
-		state.PrimarySeq == 0 && state.EscalationSeq == 0 {
+		state.PrimarySeq == 0 && state.EscalationSeq == 0 &&
+		state.PrimaryMirrorSeq == 0 && state.EscalationMirrorSeq == 0 {
 		return fmt.Errorf("adapter_path is required")
 	}
 	return nil
@@ -535,7 +540,8 @@ func DeactivateActiveAdapterSlotWithHash(dataDir, slot string) (ActiveAdapter, [
 			return false, false, nil
 		}
 		remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
-			cur.PrimarySeq == 0 && cur.EscalationSeq == 0
+			cur.PrimarySeq == 0 && cur.EscalationSeq == 0 &&
+			cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0
 		return remove, true, nil
 	})
 	return updated, hash, changed, hasFile, err
@@ -561,7 +567,7 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 	bm := strings.TrimSpace(fallbackModel)
 	ap := strings.TrimSpace(fallbackAdapter)
 	jid := strings.TrimSpace(fallbackJob)
-	var dsHash string
+	var dsHash, incomingHistory string
 	var swappedAt time.Time
 	var incomingSeq uint64
 	if slotState != nil {
@@ -575,43 +581,42 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		dsHash = strings.TrimSpace(slotState.DatasetHash)
 		swappedAt = slotState.SwappedAt
 		incomingSeq = slotState.OpSeq
+		incomingHistory = strings.TrimSpace(slotState.HistoryID)
 	}
 	if ap == "" {
 		updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
-			var curSeq uint64
 			if normSlot == SlotEscalation {
-				curSeq = cur.EscalationSeq
-			} else {
-				curSeq = cur.PrimarySeq
-			}
-			if incomingSeq > 0 && incomingSeq <= curSeq {
-				return false, false, nil
-			}
-			if normSlot == SlotEscalation {
+				if incomingSeq > 0 && incomingHistory == cur.EscalationMirrorHistory && incomingSeq <= cur.EscalationMirrorSeq {
+					return false, false, nil
+				}
 				if cur.Escalation != nil {
 					prevCopy := *cur.Escalation
 					cur.PreviousEscalation = &prevCopy
 					cur.Escalation = nil
 				}
-				if incomingSeq > cur.EscalationSeq {
-					cur.EscalationSeq = incomingSeq
-				} else {
-					cur.EscalationSeq++
+				if incomingSeq > 0 {
+					cur.EscalationMirrorHistory = incomingHistory
+					cur.EscalationMirrorSeq = incomingSeq
 				}
+				cur.EscalationSeq++
 			} else {
+				if incomingSeq > 0 && incomingHistory == cur.PrimaryMirrorHistory && incomingSeq <= cur.PrimaryMirrorSeq {
+					return false, false, nil
+				}
 				if prev, ok := cur.PrimarySlot(); ok {
 					prevCopy := prev
 					cur.Previous = &prevCopy
 					cur.ClearPrimarySlot()
 				}
-				if incomingSeq > cur.PrimarySeq {
-					cur.PrimarySeq = incomingSeq
-				} else {
-					cur.PrimarySeq++
+				if incomingSeq > 0 {
+					cur.PrimaryMirrorHistory = incomingHistory
+					cur.PrimaryMirrorSeq = incomingSeq
 				}
+				cur.PrimarySeq++
 			}
 			remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
-				cur.PrimarySeq == 0 && cur.EscalationSeq == 0
+				cur.PrimarySeq == 0 && cur.EscalationSeq == 0 &&
+				cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0
 			return remove, true, nil
 		})
 		return updated, err
@@ -634,7 +639,7 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		switch normSlot {
 		case SlotPrimary:
 			if incomingSeq > 0 {
-				if incomingSeq <= cur.PrimarySeq {
+				if incomingHistory == cur.PrimaryMirrorHistory && incomingSeq <= cur.PrimaryMirrorSeq {
 					return false, false, nil
 				}
 			} else if existing, ok := cur.PrimarySlot(); ok && !existing.ActivatedAt.IsZero() && next.ActivatedAt.Before(existing.ActivatedAt) {
@@ -644,16 +649,16 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 				prevCopy := prev
 				cur.Previous = &prevCopy
 			}
-			if incomingSeq > cur.PrimarySeq {
-				cur.PrimarySeq = incomingSeq
-			} else {
-				cur.PrimarySeq++
+			if incomingSeq > 0 {
+				cur.PrimaryMirrorHistory = incomingHistory
+				cur.PrimaryMirrorSeq = incomingSeq
 			}
+			cur.PrimarySeq++
 			next.OpSeq = cur.PrimarySeq
 			cur.SetPrimarySlot(next)
 		case SlotEscalation:
 			if incomingSeq > 0 {
-				if incomingSeq <= cur.EscalationSeq {
+				if incomingHistory == cur.EscalationMirrorHistory && incomingSeq <= cur.EscalationMirrorSeq {
 					return false, false, nil
 				}
 			} else if cur.Escalation != nil && !cur.Escalation.ActivatedAt.IsZero() && next.ActivatedAt.Before(cur.Escalation.ActivatedAt) {
@@ -663,11 +668,11 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 			}
-			if incomingSeq > cur.EscalationSeq {
-				cur.EscalationSeq = incomingSeq
-			} else {
-				cur.EscalationSeq++
+			if incomingSeq > 0 {
+				cur.EscalationMirrorHistory = incomingHistory
+				cur.EscalationMirrorSeq = incomingSeq
 			}
+			cur.EscalationSeq++
 			next.OpSeq = cur.EscalationSeq
 			nextCopy := next
 			cur.Escalation = &nextCopy
@@ -713,6 +718,7 @@ type SlotStatus struct {
 	DatasetHash         string    `json:"dataset_hash,omitempty"`
 	InferenceURL        string    `json:"inference_url,omitempty"`
 	SwappedAt           time.Time `json:"swapped_at,omitempty"`
+	HistoryID           string    `json:"history_id,omitempty"`
 	OpSeq               uint64    `json:"op_seq,omitempty"`
 	HasRollback         bool      `json:"has_rollback"`
 	PreviousBaseModel   string    `json:"previous_base_model,omitempty"`
@@ -728,6 +734,7 @@ type AdapterStatusResponse struct {
 	BaseModel         string              `json:"base_model,omitempty"`
 	AdapterPath       string              `json:"adapter_path,omitempty"`
 	DataDir           string              `json:"data_dir,omitempty"`
+	Truncated         bool                `json:"truncated,omitempty"`
 	TriageEnabled     bool                `json:"triage_enabled"`
 	EscalationEnabled bool                `json:"escalation_enabled"`
 	Verified          bool                `json:"verified,omitempty"`

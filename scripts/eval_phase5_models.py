@@ -31,21 +31,53 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import peft  # noqa: E402
-import torch  # noqa: E402
-from peft import LoraConfig, PeftModel, get_peft_model  # noqa: E402
-from transformers import (  # noqa: E402
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    StoppingCriteria,
-    StoppingCriteriaList,
-    get_cosine_schedule_with_warmup,
-)
+_ML_LOADED = False
+torch: Any = None
+peft: Any = None
+LoraConfig: Any = None
+PeftModel: Any = None
+get_peft_model: Any = None
+AutoModelForCausalLM: Any = None
+AutoTokenizer: Any = None
+StoppingCriteria: Any = None
+StoppingCriteriaList: Any = None
+get_cosine_schedule_with_warmup: Any = None
+
+
+def _load_ml_libs() -> None:
+    """Lazily import torch/peft/transformers only inside inference/training worker paths ([30])."""
+    global _ML_LOADED, torch, peft, LoraConfig, PeftModel, get_peft_model
+    global AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, get_cosine_schedule_with_warmup
+    if _ML_LOADED:
+        return
+    import peft as _peft
+    import torch as _torch
+    from peft import LoraConfig as _LoraConfig, PeftModel as _PeftModel, get_peft_model as _get_peft_model
+    from transformers import (
+        AutoModelForCausalLM as _AutoModelForCausalLM,
+        AutoTokenizer as _AutoTokenizer,
+        StoppingCriteria as _StoppingCriteria,
+        StoppingCriteriaList as _StoppingCriteriaList,
+        get_cosine_schedule_with_warmup as _get_cosine_schedule_with_warmup,
+    )
+
+    torch = _torch
+    peft = _peft
+    LoraConfig = _LoraConfig
+    PeftModel = _PeftModel
+    get_peft_model = _get_peft_model
+    AutoModelForCausalLM = _AutoModelForCausalLM
+    AutoTokenizer = _AutoTokenizer
+    StoppingCriteria = _StoppingCriteria
+    StoppingCriteriaList = _StoppingCriteriaList
+    get_cosine_schedule_with_warmup = _get_cosine_schedule_with_warmup
+    _ML_LOADED = True
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SMOL_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -356,26 +388,30 @@ def build_phase5_corpora() -> tuple[list[dict], list[dict]]:
     return train_records, eval_records
 
 
-class SingleLineStopCriteria(StoppingCriteria):
-    """Stop autoregressive decoding right after the first non-empty verdict line closes."""
+def make_single_line_stop_criteria(tokenizer, prompt_len: int, stop_token_ids: set[int]):
+    """Build a StoppingCriteria that halts decoding right after the first non-empty verdict line."""
+    _load_ml_libs()
 
-    def __init__(self, tokenizer, prompt_len: int, stop_token_ids: set[int]):
-        self.tokenizer = tokenizer
-        self.prompt_len = prompt_len
-        self.stop_token_ids = stop_token_ids
+    class _SingleLineStopCriteria(StoppingCriteria):
+        def __init__(self, tok, p_len: int, stop_ids: set[int]):
+            self.tokenizer = tok
+            self.prompt_len = p_len
+            self.stop_token_ids = stop_ids
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        gen_ids = input_ids[0][self.prompt_len :]
-        if gen_ids.numel() == 0:
-            return False
-        last_id = int(gen_ids[-1].item())
-        if last_id in self.stop_token_ids:
-            return True
-        if gen_ids.numel() >= 10:
-            text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
-            if "\n" in text.lstrip():
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+            gen_ids = input_ids[0][self.prompt_len :]
+            if gen_ids.numel() == 0:
+                return False
+            last_id = int(gen_ids[-1].item())
+            if last_id in self.stop_token_ids:
                 return True
-        return False
+            if gen_ids.numel() >= 10:
+                text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                if "\n" in text.lstrip():
+                    return True
+            return False
+
+    return _SingleLineStopCriteria(tokenizer, prompt_len, stop_token_ids)
 
 
 DEFAULT_SEVERITY_FOR_CLASS = {
@@ -447,6 +483,8 @@ def parse_sentinel_completion(raw_completion: str) -> dict:
 def score_explanation_quality(parsed: dict, row: dict) -> float:
     """Deterministic 0.0-1.0 explanation quality rubric (non-empty clarity + domain cues + alignment)."""
     exp = parsed["explanation"]
+    if not exp.strip():
+        return 0.0
     exp_lower = exp.lower()
     words = [w for w in re.split(r"\s+", exp) if w]
     score = 0.0
@@ -470,6 +508,7 @@ def score_explanation_quality(parsed: dict, row: dict) -> float:
 
 
 def run_eval_pass(model, tokenizer, model_id: str, eval_rows: list[dict], max_new_tokens: int = 40) -> tuple[list[dict], list[float]]:
+    _load_ml_libs()
     model.eval()
     stop_ids = set()
     if tokenizer.eos_token_id is not None:
@@ -501,7 +540,7 @@ def run_eval_pass(model, tokenizer, model_id: str, eval_rows: list[dict], max_ne
         chat_prompt = format_chat_prompt(tokenizer, row["prompt"])
         enc = tokenizer(chat_prompt, return_tensors="pt", truncation=True, max_length=448, add_special_tokens=False)
         prompt_len = int(enc["input_ids"].shape[1])
-        stopping = StoppingCriteriaList([SingleLineStopCriteria(tokenizer, prompt_len, stop_ids)])
+        stopping = StoppingCriteriaList([make_single_line_stop_criteria(tokenizer, prompt_len, stop_ids)])
 
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -650,6 +689,7 @@ def train_lora_adapter(
     max_length: int,
     mid_snapshot_dir: Path | None = None,
 ) -> tuple[PeftModel, dict]:
+    _load_ml_libs()
     is_gemma = "gemma" in model_id.lower()
     target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"] if is_gemma else ["q_proj", "v_proj"]
     if is_gemma:
@@ -750,6 +790,7 @@ def train_lora_adapter(
 
 
 def load_model_and_tokenizer(model_id: str) -> tuple:
+    _load_ml_libs()
     tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
@@ -763,6 +804,7 @@ def load_model_and_tokenizer(model_id: str) -> tuple:
 
 
 def run_worker_phase(args: argparse.Namespace) -> int:
+    _load_ml_libs()
     torch.manual_seed(42)
     train_records, eval_rows = build_phase5_corpora()
     rss_before = rss_mb()
@@ -783,6 +825,12 @@ def run_worker_phase(args: argparse.Namespace) -> int:
             "rss_after_model_mb": rss_after,
             "rss_delta_mb": round(max(rss_after - rss_before, 0.0), 2),
         })
+        if args.phase == "smol_base":
+            summary["runtime_versions"] = {
+                "torch_version": torch.__version__,
+                "peft_version": peft.__version__,
+                "torch_num_threads": int(torch.get_num_threads()),
+            }
         args.worker_out.write_text(json.dumps(summary), encoding="utf-8")
         return 0
 
@@ -939,9 +987,9 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
         if needs_esc:
             escalated_count += 1
             # Match Go runtime escalation callback in internal/pipeline/adapter_hotswap.go:
-            # escalation Verdict applies whenever escalation returns a non-empty completion (escErr == nil),
-            # failing closed to NEEDS-REVIEW inside ParseCompletion if fields are malformed ([35]).
-            if gr.get("nonempty", True) or not sr["format_valid"]:
+            # escalation verdict applies whenever escalation returns a non-empty completion (escErr == nil),
+            # or when primary itself failed (empty output); otherwise primary stands ([20]).
+            if gr.get("nonempty", True) or not sr.get("nonempty", True):
                 chosen = dict(gr)
             else:
                 chosen = dict(sr)
@@ -1084,42 +1132,62 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
 
     proc = None
     try:
-        watch_port = _find_free_port()
-        tcp_port = _find_free_port()
-        watch_url = f"http://127.0.0.1:{watch_port}"
-        with open(watch_stderr_log, "w", encoding="utf-8") as stderr_fh:
-            proc = subprocess.Popen(
-                [
-                    str(sentinel_bin),
-                    "watch",
-                    "--http", f"127.0.0.1:{watch_port}",
-                    "--data-dir", str(data_dir),
-                    "--genesis-data-dir", str(seg_dir),
-                    "--genesis-tcp", f"127.0.0.1:{tcp_port}",
-                    "--triage-mode", "http",
-                    "--inference-http", f"http://127.0.0.1:{inf_port}",
-                    "--base-model", SMOL_MODEL_ID,
-                    "--dry-run",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_fh,
-            )
+        watch_url = ""
+        for attempt in range(3):
+            watch_port = _find_free_port()
+            tcp_port = _find_free_port()
+            watch_url = f"http://127.0.0.1:{watch_port}"
+            with open(watch_stderr_log, "w", encoding="utf-8") as stderr_fh:
+                proc = subprocess.Popen(
+                    [
+                        str(sentinel_bin),
+                        "watch",
+                        "--http", f"127.0.0.1:{watch_port}",
+                        "--data-dir", str(data_dir),
+                        "--genesis-data-dir", str(seg_dir),
+                        "--genesis-tcp", f"127.0.0.1:{tcp_port}",
+                        "--triage-mode", "http",
+                        "--inference-http", f"http://127.0.0.1:{inf_port}",
+                        "--base-model", SMOL_MODEL_ID,
+                        "--dry-run",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_fh,
+                )
 
-        ready = False
-        for _ in range(50):
-            if proc.poll() is not None:
-                diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
-                raise RuntimeError(f"sentinel watch sidecar exited early with code {proc.returncode}: {diag.strip()}")
-            try:
-                with no_proxy_opener.open(f"{watch_url}/healthz", timeout=0.5) as resp:
-                    if resp.status == 200:
-                        ready = True
+            ready = False
+            retry_bind = False
+            for _ in range(50):
+                if proc.poll() is not None:
+                    diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
+                    if "address already in use" in diag.lower() and attempt < 2:
+                        retry_bind = True
                         break
-            except Exception:
-                time.sleep(0.05)
-        if not ready:
-            diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
-            raise RuntimeError(f"sentinel watch sidecar failed to become ready for live hot-swap test: {diag.strip()}")
+                    raise RuntimeError(f"sentinel watch sidecar exited early with code {proc.returncode}: {diag.strip()}")
+                try:
+                    with no_proxy_opener.open(f"{watch_url}/healthz", timeout=0.5) as resp:
+                        if resp.status == 200:
+                            ready = True
+                            break
+                except Exception:
+                    time.sleep(0.05)
+            if retry_bind:
+                proc = None
+                continue
+            if not ready:
+                diag = watch_stderr_log.read_text(encoding="utf-8", errors="replace")[-2000:] if watch_stderr_log.exists() else ""
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                proc = None
+                if "address already in use" in diag.lower() and attempt < 2:
+                    continue
+                raise RuntimeError(f"sentinel watch sidecar failed to become ready for live hot-swap test: {diag.strip()}")
+            break
 
         swap_latencies: list[float] = []
         for idx in range(5):
@@ -1289,7 +1357,7 @@ def _atomic_publish_pair(path_a: Path, content_a: str, path_b: Path, content_b: 
                 replaced_a = True
                 os.replace(tmp_b, path_b)
                 committed = True
-            except Exception:
+            except BaseException:
                 if replaced_a and not committed:
                     if had_a and bak_a.exists():
                         os.replace(bak_a, path_a)
@@ -1300,9 +1368,12 @@ def _atomic_publish_pair(path_a: Path, content_a: str, path_b: Path, content_b: 
                 if not committed:
                     bak_a.unlink(missing_ok=True)
                 raise
-            # Post-commit backup cleanup failure raises directly without reverting committed pair.
+            # Post-commit backup cleanup warns on OSError rather than failing after pair commitment ([28]).
             if bak_a.exists():
-                bak_a.unlink()
+                try:
+                    bak_a.unlink()
+                except OSError as exc:
+                    print(f"Warning: failed removing post-commit backup {bak_a}: {exc}", file=sys.stderr)
         finally:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
@@ -1361,16 +1432,17 @@ def main() -> int:
 
     train_records, eval_rows = build_phase5_corpora()
     explicit_sentinel_bin: Path | None = None
+    explicit_bin_label = "<custom-sentinel-bin>"
     recorded_bin_flag = ""
     if args.sentinel_bin is not None:
         explicit_sentinel_bin = (REPO_ROOT / args.sentinel_bin) if not args.sentinel_bin.is_absolute() else args.sentinel_bin
         if not explicit_sentinel_bin.is_file():
             raise FileNotFoundError(f"Sentinel binary not found at {explicit_sentinel_bin}; build it first")
         try:
-            rel_bin = explicit_sentinel_bin.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
-            recorded_bin_flag = f" --sentinel-bin {rel_bin}"
+            explicit_bin_label = explicit_sentinel_bin.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
         except ValueError:
-            recorded_bin_flag = " --sentinel-bin <custom-sentinel-bin>"
+            explicit_bin_label = "<custom-sentinel-bin>"
+        recorded_bin_flag = f" --sentinel-bin {explicit_bin_label}"
 
     try:
         git_rev = subprocess.check_output(
@@ -1415,7 +1487,7 @@ def main() -> int:
             binary_source = f"go build ./cmd/sentinel @ {git_rev}"
         else:
             sentinel_bin = explicit_sentinel_bin
-            binary_source = f"explicit:{args.sentinel_bin.as_posix()}"
+            binary_source = f"explicit:{explicit_bin_label}"
         sentinel_sha256 = hashlib.sha256(sentinel_bin.read_bytes()).hexdigest()[:16]
 
         print("Running isolated worker 1/6: SmolLM2-135M-Instruct (Base)...", file=sys.stderr, flush=True)
@@ -1481,7 +1553,10 @@ def main() -> int:
 
     cpu_brand = _detect_cpu_brand()
     cpu_cores = os.cpu_count() or 1
-    torch_threads = int(torch.get_num_threads())
+    rt_vers = smol_base.pop("runtime_versions", {})
+    torch_threads = int(rt_vers.get("torch_num_threads", 0))
+    torch_version = str(rt_vers.get("torch_version", "unknown"))
+    peft_version = str(rt_vers.get("peft_version", "unknown"))
 
     out_data = {
         "metadata": {
@@ -1497,8 +1572,8 @@ def main() -> int:
             "cpu_logical_cores": cpu_cores,
             "torch_num_threads": torch_threads,
             "python_version": platform.python_version(),
-            "torch_version": torch.__version__,
-            "peft_version": peft.__version__,
+            "torch_version": torch_version,
+            "peft_version": peft_version,
             "sentinel_binary_source": binary_source,
             "sentinel_binary_sha256_prefix": sentinel_sha256,
             "isolated_subprocess_per_model": True,

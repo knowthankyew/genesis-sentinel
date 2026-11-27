@@ -7,6 +7,7 @@ host path leak guards fail closed cleanly.
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1264,8 +1265,8 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("sentinel_sidecar_rollback_ms" in e for e in errs_b), errs_b)
 
             # Reject inconsistent model counts (corr > cls), non-high_critical policy,
-            # mismatched per_sample_decisions, wrong hybrid attack_recall, tampered hybrid replay counts,
-            # null training field, and wrong post_rollback_adapter ([24], [25], [28], [32], [35]).
+            # mismatched per_sample_decisions, wrong hybrid attack_recall, tampered hybrid counts ([22]),
+            # null training field, and wrong post_rollback_adapter.
             bad_inv = json.loads(json.dumps(valid_payload))
             bad_inv["dataset"]["eval_correlated_windows"] = 2
             bad_inv["models"]["smol_base"]["correlated_correct_count"] = 2
@@ -1279,8 +1280,6 @@ class TestClaimsLinter(unittest.TestCase):
             bad_inv["models"]["gemma_lora"]["correlated_accuracy"] = 1.0
             bad_inv["hybrid_escalation"]["policy"] = "always"
             bad_inv["hybrid_escalation"]["attack_recall"] = 2.0
-            bad_inv["hybrid_escalation"]["class_correct_count"] = 2
-            bad_inv["hybrid_escalation"]["class_accuracy"] = 0.5
             bad_inv["hybrid_escalation"]["per_sample_decisions"][0]["smol_sev"] = "HIGH"
             bad_inv["live_adapter_hotswap"]["post_rollback_adapter"] = "artifacts/smol-v1/model_adapters"
             inv_path = Path(tmp) / "bad_inv.json"
@@ -1292,6 +1291,43 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("attack_recall" in e for e in errs_inv), errs_inv)
             self.assertTrue(any("per_sample_decisions[0] mismatch" in e for e in errs_inv), errs_inv)
             self.assertTrue(any("post_rollback_adapter must equal" in e for e in errs_inv), errs_inv)
+
+            # Separate mutation test for tampered hybrid aggregate count without triggering
+            # earlier per-sample escalation mismatch break ([22]).
+            bad_hc = json.loads(json.dumps(valid_payload))
+            bad_hc["hybrid_escalation"]["class_correct_count"] = 2
+            bad_hc["hybrid_escalation"]["class_accuracy"] = 0.5
+            hc_path = Path(tmp) / "bad_hc.json"
+            hc_path.write_text(json.dumps(bad_hc), encoding="utf-8")
+            ok_hc, errs_hc = sync_docs.independent_recompute_phase5_comparison(hc_path)
+            self.assertFalse(ok_hc)
+            self.assertTrue(any("hybrid aggregate counts mismatch per_sample_decisions replay" in e for e in errs_hc), errs_hc)
+
+            # Reject dataset partition drift across per_sample_decisions ([16]), non-boolean flags ([27]),
+            # and invalid severity values ([21]).
+            bad_part = json.loads(json.dumps(valid_payload))
+            bad_part["hybrid_escalation"]["per_sample_decisions"][1]["partition"] = "needs_review"
+            bad_part_path = Path(tmp) / "bad_part.json"
+            bad_part_path.write_text(json.dumps(bad_part), encoding="utf-8")
+            ok_bp, errs_bp = sync_docs.independent_recompute_phase5_comparison(bad_part_path)
+            self.assertFalse(ok_bp)
+            self.assertTrue(any("partition/applicable counts" in e for e in errs_bp), errs_bp)
+
+            bad_bool = json.loads(json.dumps(valid_payload))
+            bad_bool["hybrid_escalation"]["per_sample_decisions"][0]["gemma_nonempty"] = "false"
+            bad_bool_path = Path(tmp) / "bad_bool.json"
+            bad_bool_path.write_text(json.dumps(bad_bool), encoding="utf-8")
+            ok_bb, errs_bb = sync_docs.independent_recompute_phase5_comparison(bad_bool_path)
+            self.assertFalse(ok_bb)
+            self.assertTrue(any("non-boolean format/nonempty flag" in e for e in errs_bb), errs_bb)
+
+            bad_sev = json.loads(json.dumps(valid_payload))
+            bad_sev["hybrid_escalation"]["per_sample_decisions"][0]["tier1_sev"] = "EXTREME"
+            bad_sev_path = Path(tmp) / "bad_sev.json"
+            bad_sev_path.write_text(json.dumps(bad_sev), encoding="utf-8")
+            ok_bs, errs_bs = sync_docs.independent_recompute_phase5_comparison(bad_sev_path)
+            self.assertFalse(ok_bs)
+            self.assertTrue(any("invalid severity value" in e for e in errs_bs), errs_bs)
 
             # Positive & negative Markdown checks ([1], [23], [26], [31], [32], [33], [36], [37], [39], [42]).
             md_path = Path(tmp) / "2026-11-26-phase5-comparison.md"
@@ -1360,6 +1396,132 @@ class TestClaimsLinter(unittest.TestCase):
             ok_nl, errs_nl = sync_docs.independent_recompute_phase5_comparison(null_loss_path, repo_root=Path(tmp))
             self.assertFalse(ok_nl)
             self.assertTrue(any("initial_loss" in e for e in errs_nl), errs_nl)
+
+            # Self-closing HTML comment <!--> terminates on its own line without masking the table ([26]),
+            # non-piped GFM continuation rows stay inside the table ([25]), and parenthetical
+            # duplicate metric labels still fail duplicate detection ([29]).
+            md_self_close = md_text_orig.replace(
+                "## LoRA Fine-Tuning Provenance",
+                "<!-->\n## LoRA Fine-Tuning Provenance",
+            )
+            md_path.write_text(md_self_close, encoding="utf-8")
+            ok_sc, errs_sc = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertTrue(ok_sc, errs_sc)
+
+            md_nonpiped_dup = md_text_orig.replace(
+                "| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `mock-inference-healthz` | 11.50 ms |",
+                "| Sentinel Sidecar CLI Rollback (`sentinel adapter rollback --verify`) | `mock-inference-healthz` | 11.50 ms |\nSentinel Sidecar CLI Rollback (continuation)",
+            )
+            md_path.write_text(md_nonpiped_dup, encoding="utf-8")
+            ok_np, errs_np = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_np)
+            self.assertTrue(any("duplicate row for 'Sentinel Sidecar CLI Rollback'" in e for e in errs_np), errs_np)
+
+            md_paren_dup = md_text_orig.replace(
+                "| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `pytorch-peft` | 15.00 ms |",
+                "| PyTorch PEFT Additional Adapter Load (alt-1) | `pytorch-peft` | 99.00 ms |\n| PyTorch PEFT Additional Adapter Load (`load_adapter`) | `pytorch-peft` | 15.00 ms |",
+            )
+            md_path.write_text(md_paren_dup, encoding="utf-8")
+            ok_pd, errs_pd = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_pd)
+            self.assertTrue(any("duplicate row for 'PyTorch PEFT Additional Adapter Load'" in e for e in errs_pd), errs_pd)
+
+        # Positive & negative require_governed_fields=True checks using a real temp git repo ([17], [23], [27]).
+        with tempfile.TemporaryDirectory() as gtmp:
+            grepo = Path(gtmp)
+            subprocess.run(["git", "init"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            (grepo / "README.md").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "commit", "-m", "seed"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            commit_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=grepo, text=True).strip()
+
+            gmd_path = grepo / "2026-11-26-phase5-comparison.md"
+            gmd_lines = [
+                f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({commit_sha})",
+                "",
+                f"- **Commit:** `{commit_sha}`",
+                *md_lines,
+            ]
+            gmd_path.write_text("\n".join(gmd_lines) + "\n", encoding="utf-8")
+            gov_payload = json.loads(json.dumps(valid_payload))
+            gov_payload["metadata"].update({
+                "git_commit": commit_sha,
+                "report_markdown": gmd_path.name,
+            })
+            gov_json = grepo / "phase5.json"
+            gov_json.write_text(json.dumps(gov_payload), encoding="utf-8")
+            ok_gov, errs_gov = sync_docs.independent_recompute_phase5_comparison(
+                gov_json, repo_root=grepo, require_governed_fields=True,
+            )
+            self.assertTrue(ok_gov, errs_gov)
+
+            # Missing gemma_nonempty or drifted Markdown title commit must fail require_governed_fields=True ([23], [27]).
+            gov_bad = json.loads(json.dumps(gov_payload))
+            gov_bad["hybrid_escalation"]["per_sample_decisions"][0].pop("gemma_nonempty")
+            gov_bad_json = grepo / "phase5_bad.json"
+            gov_bad_json.write_text(json.dumps(gov_bad), encoding="utf-8")
+            ok_gb, errs_gb = sync_docs.independent_recompute_phase5_comparison(
+                gov_bad_json, repo_root=grepo, require_governed_fields=True,
+            )
+            self.assertFalse(ok_gb)
+            self.assertTrue(any("missing required replay verdict/truth fields" in e for e in errs_gb), errs_gb)
+
+            gmd_path.write_text(
+                gmd_path.read_text(encoding="utf-8").replace(f"({commit_sha})", "(deadbeef)"),
+                encoding="utf-8",
+            )
+            ok_gt, errs_gt = sync_docs.independent_recompute_phase5_comparison(
+                gov_json, repo_root=grepo, require_governed_fields=True,
+            )
+            self.assertFalse(ok_gt)
+            self.assertTrue(any("title/commit mismatch" in e for e in errs_gt), errs_gt)
+
+
+class TestPhase5EvalScriptHelpers(unittest.TestCase):
+    def test_lazy_ml_imports_and_scoring_publish_guards(self):
+        """Verify eval_phase5_models keeps ML libs lazy ([30]), scores empty exp as 0 ([19]), and handles publish ([28])."""
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import eval_phase5_models  # noqa: E402
+
+        self.assertEqual(
+            eval_phase5_models.score_explanation_quality(
+                {"format_valid": False, "label": "NEEDS-REVIEW", "severity": "MEDIUM", "explanation": "   "},
+                {"truth_class": "NEEDS-REVIEW", "truth_sev": "MEDIUM", "keywords": ("probe",)},
+            ),
+            0.0,
+        )
+
+        # Escalation fallback prefers primary ONLY when gemma is empty AND primary is non-empty ([20]).
+        hyb = eval_phase5_models.compute_hybrid_escalation(
+            {
+                "per_sample": [{
+                    "id": 1, "partition": "attack", "correlated_case": False, "inj": False,
+                    "truth_class": "RECON-SCAN", "truth_sev": "HIGH", "truth_mitre": "TA0043",
+                    "tier1_sev": "HIGH", "pred_class": "RECON-SCAN", "pred_sev": "HIGH",
+                    "pred_mitre": "TA0043", "format_valid": True, "nonempty": True,
+                    "explanation": "port scan detected", "latency_ms": 10.0,
+                }],
+            },
+            {
+                "per_sample": [{
+                    "id": 1, "partition": "attack", "correlated_case": False, "inj": False,
+                    "truth_class": "RECON-SCAN", "truth_sev": "HIGH", "truth_mitre": "TA0043",
+                    "tier1_sev": "HIGH", "pred_class": "NEEDS-REVIEW", "pred_sev": "HIGH",
+                    "pred_mitre": "NONE", "format_valid": False, "nonempty": False,
+                    "explanation": "", "latency_ms": 50.0,
+                }],
+            },
+        )
+        self.assertEqual(hyb["class_correct_count"], 1)
+
+        with tempfile.TemporaryDirectory() as td:
+            p_a = Path(td) / "a.json"
+            p_b = Path(td) / "b.md"
+            eval_phase5_models._atomic_publish_pair(p_a, "json-v1", p_b, "md-v1")
+            self.assertEqual(p_a.read_text(encoding="utf-8"), "json-v1")
+            self.assertEqual(p_b.read_text(encoding="utf-8"), "md-v1")
 
 
 if __name__ == "__main__":

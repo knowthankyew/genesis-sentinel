@@ -372,3 +372,58 @@ func TestExecuteAdapterPositionalArgsAndIsolatedLocalManifest(t *testing.T) {
 		t.Fatalf("expected defaultDataDir preserved, got %+v err=%v", keptLocal, err)
 	}
 }
+
+func TestExecuteAdapterRollbackMirrorFailureAndTruncatedResponse(t *testing.T) {
+	// 1. Daemon rollback succeeds on server, local mirror fails -> operator error must warn NOT to re-run rollback ([2]).
+	rbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"rolled_back","slot":"primary","action":"rollback","job_id":"rb-1","base_model":"SmolLM2-135M-Instruct","adapter_path":"artifacts/rb-1/model_adapters","triage_enabled":true,"escalation_enabled":false,"primary":{"slot":"primary","mode":"http","enabled":true,"base_model":"SmolLM2-135M-Instruct","adapter_path":"artifacts/rb-1/model_adapters","job_id":"rb-1","op_seq":2,"history_id":"h-1"}}` + "\n"))
+	}))
+	defer rbSrv.Close()
+
+	blockerFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blockerFile, []byte("file"), 0600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	var out, errBuf bytes.Buffer
+	err := ExecuteWithOutput([]string{
+		"adapter", "rollback",
+		"--slot", "primary",
+		"--data-dir", blockerFile,
+		"--sentinel-http", rbSrv.URL,
+	}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "do NOT re-run 'sentinel adapter rollback'") {
+		t.Fatalf("expected non-retry warning when daemon rollback succeeded but local mirror failed, got: %v", err)
+	}
+
+	// 2. Truncated daemon rollback response (Truncated: true) must NOT overwrite or corrupt local manifest ([13]).
+	truncSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"rolled_back","slot":"primary","action":"rollback","truncated":true,"triage_enabled":true,"escalation_enabled":false}` + "\n"))
+	}))
+	defer truncSrv.Close()
+
+	localDir := t.TempDir()
+	if err := train.SaveActiveAdapter(localDir, train.ActiveAdapter{
+		JobID:       "before-trunc",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/before-trunc/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed localDir: %v", err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	err = ExecuteWithOutput([]string{
+		"adapter", "rollback",
+		"--slot", "primary",
+		"--data-dir", localDir,
+		"--sentinel-http", truncSrv.URL,
+	}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "truncated=true") || !strings.Contains(err.Error(), "do NOT re-run 'sentinel adapter rollback'") {
+		t.Fatalf("expected truncated wire error with no-retry guidance, got: %v", err)
+	}
+	after, _, loadErr := train.LoadActiveAdapter(localDir)
+	if loadErr != nil || after.AdapterPath != "artifacts/before-trunc/model_adapters" {
+		t.Fatalf("expected localDir preserved untouched on truncated response, got %+v err=%v", after, loadErr)
+	}
+}

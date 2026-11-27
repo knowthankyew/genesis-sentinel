@@ -196,18 +196,21 @@ type Pipeline struct {
 	beforeAsyncPublishFn func() // optional test hook invoked right before publish check
 	afterAsyncTaskFn     func() // optional test hook invoked right after task completes
 
-	adapterMu              sync.Mutex
-	adapterHistory         []train.AdapterSwapRecord
-	primaryMeta            slotRuntimeMeta
-	escalationMeta         slotRuntimeMeta
-	primaryLockedByCLI     bool
-	escalationLockedByCLI  bool
-	primaryFromDisk        bool
-	escalationFromDisk     bool
-	pinnedPrimaryModel     string
-	pinnedEscalationModel  string
-	lastSyncedManifest     [sha256.Size]byte
-	hasSyncedManifest      bool
+	adapterMu                sync.Mutex
+	adapterHistory           []train.AdapterSwapRecord
+	adapterHistoryEpoch      uint64
+	primaryMeta              slotRuntimeMeta
+	escalationMeta           slotRuntimeMeta
+	primaryLockedByCLI       bool
+	escalationLockedByCLI    bool
+	primaryFromDisk          bool
+	escalationFromDisk       bool
+	configuredPrimaryBase    string
+	configuredEscalationBase string
+	pinnedPrimaryModel       string
+	pinnedEscalationModel    string
+	lastSyncedManifest       [sha256.Size]byte
+	hasSyncedManifest        bool
 
 	corrMu            sync.Mutex
 	serviceCorrelator map[string][]correlationEntry
@@ -294,14 +297,16 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 	instanceID := hex.EncodeToString(idBytes[:])
 
 	p := &Pipeline{
-		cfg:                   cfg,
-		agg:                   template.NewAggregator(template.DefaultMaxClusters),
-		ruleEng:               ruleEng,
-		surprisalEng:          surpEng,
-		triageClient:          triageClient,
-		escalationClient:      escalationClient,
-		sink:                  sink,
-		activeSource:          activeSource,
+		cfg:                      cfg,
+		agg:                      template.NewAggregator(template.DefaultMaxClusters),
+		ruleEng:                  ruleEng,
+		surprisalEng:             surpEng,
+		triageClient:             triageClient,
+		escalationClient:         escalationClient,
+		configuredPrimaryBase:    cfg.BaseModel,
+		configuredEscalationBase: cfg.EscalationBaseModel,
+		sink:                     sink,
+		activeSource:             activeSource,
 		instanceID:            instanceID,
 		startTime:             time.Now(),
 		triageReqTimeout:      reqTimeout,
@@ -1115,7 +1120,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		}
 
 		corrKey := correlationServiceKeyFromHash(k.serviceHash)
-		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, alert.Timestamp)
+		corrTS := clampCorrelationTimestamp(alert.Timestamp, nowUnix)
+		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, corrTS)
 		if hasTier2 && !asyncTriage {
 			p.enrichWithTier2DualWithTimeouts(triageCtx, triageClient, triageTimeout, escClient, escTimeout, &alert)
 		}
@@ -1127,7 +1133,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
-		p.recordCorrelationWindowWithKey(corrKey, seq, alert)
+		corrAlert := alert
+		corrAlert.Timestamp = corrTS
+		p.recordCorrelationWindowWithKey(corrKey, seq, corrAlert)
 		emitted = append(emitted, alert)
 		if hasTier2 && asyncTriage {
 			pendingAsync = append(pendingAsync, queuedAlert{alert: alert, corrKey: corrKey, alertSeq: seq})
@@ -1212,7 +1220,8 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 		} else {
 			corrKey = correlationServiceKey(w.Service)
 		}
-		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, alert.Timestamp)
+		corrTS := clampCorrelationTimestamp(alert.Timestamp, nowUnix)
+		alert.CorrelatedWindows = p.collectCorrelatedContextByKey(corrKey, alert.TemplateID, corrTS)
 		if hasTier2 && !asyncTriage {
 			p.enrichWithTier2DualWithTimeouts(triageCtx, triageClient, triageTimeout, escClient, escTimeout, &alert)
 		}
@@ -1226,7 +1235,9 @@ func (p *Pipeline) FlushWindow() ([]emit.Alert, []FailedAlert) {
 			continue
 		}
 		p.alertsEmitted.Add(1)
-		p.recordCorrelationWindowWithKey(corrKey, seq, alert)
+		corrAlert := alert
+		corrAlert.Timestamp = corrTS
+		p.recordCorrelationWindowWithKey(corrKey, seq, corrAlert)
 		emitted = append(emitted, alert)
 		if hasTier2 && asyncTriage {
 			pendingAsync = append(pendingAsync, queuedAlert{alert: alert, corrKey: corrKey, alertSeq: seq})
@@ -1408,17 +1419,19 @@ func (p *Pipeline) Burn() (BurnReport, error) {
 	if p.surprisalEng != nil {
 		p.surprisalEng.Reset()
 	}
+	primBase, escBase := p.configuredBaseModels()
 	if p.triageClient != nil {
-		p.triageClient.ResetAdapterToBase(p.cfg.BaseModel)
+		p.triageClient.ResetAdapterToBase(primBase)
 	}
 	if p.escalationClient != nil {
-		p.escalationClient.ResetAdapterToBase(p.cfg.EscalationBaseModel)
+		p.escalationClient.ResetAdapterToBase(escBase)
 	}
 	p.escalationEpoch.Add(1)
 	p.corrMu.Lock()
 	p.serviceCorrelator = nil
 	p.corrMu.Unlock()
 	p.adapterMu.Lock()
+	p.adapterHistoryEpoch++
 	p.primaryMeta = slotRuntimeMeta{}
 	p.escalationMeta = slotRuntimeMeta{}
 	p.primaryFromDisk = false
@@ -1791,6 +1804,14 @@ func normalizeAlertTimestamp(ts, fallbackUnix int64) int64 {
 		return fallbackUnix
 	}
 	return ts
+}
+
+func clampCorrelationTimestamp(alertTS, nowUnix int64) int64 {
+	const maxCorrelationFutureLeadSec = 5
+	if alertTS > nowUnix+maxCorrelationFutureLeadSec {
+		return nowUnix
+	}
+	return alertTS
 }
 
 func isTemplateInList(list []string, tmpl string) bool {

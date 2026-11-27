@@ -769,6 +769,32 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 	if !strings.Contains(smallPrompt, "UNIQUE_CURRENT_TEMPLATE") || !strings.Contains(smallPrompt, "UNIQUE_CURRENT_SAMPLE") {
 		t.Fatalf("expected current event template & sample preserved before optional correlated history, got:\n%s", smallPrompt)
 	}
+
+	// Budget sized for the first complete correlated summary ("priorA(RECON,MEDIUM,cnt=5)") plus
+	// 12 extra bytes (enough for full 23-byte UNIQUE_CURRENT_TEMPLATE, still < ",priorB(EXFIL,HIGH,cnt=8)" = 26 bytes)
+	// must keep priorA whole and drop priorB ([11]).
+	metaPrefix := "service=auth-svc level=WARN count=9 entropy=0.00 surprisal=0.00/0.00 rules=none categories=none"
+	partialBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 64 + len(" correlated=") + len("priorA(RECON,MEDIUM,cnt=5)") + 12
+	partialPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:           "auth-svc",
+		Level:             "WARN",
+		Template:          "UNIQUE_CURRENT_TEMPLATE failed login for admin",
+		SampleLine:        "UNIQUE_CURRENT_SAMPLE src=203.0.113.99 user=admin",
+		Count:             9,
+		CorrelatedWindows: []string{"priorA(RECON,MEDIUM,cnt=5)", "priorB(EXFIL,HIGH,cnt=8)"},
+	}, partialBudget)
+	if err != nil {
+		t.Fatalf("partial correlated prompt BuildTriagePromptChecked failed: %v", err)
+	}
+	if !strings.Contains(partialPrompt, "correlated=priorA(RECON,MEDIUM,cnt=5)") {
+		t.Fatalf("expected complete first correlated item priorA, got:\n%s", partialPrompt)
+	}
+	if strings.Contains(partialPrompt, "priorB") || strings.Contains(partialPrompt, "priorB(") {
+		t.Fatalf("expected second incomplete correlated item priorB to be omitted whole without truncation, got:\n%s", partialPrompt)
+	}
+	if !strings.Contains(partialPrompt, "UNIQUE_CURRENT_TEMPLATE") || !strings.Contains(partialPrompt, "UNIQUE_CURRENT_SAMPLE") {
+		t.Fatalf("expected current event template & sample preserved alongside fitted correlated prefix, got:\n%s", partialPrompt)
+	}
 }
 
 func TestClientVerifyHealthChecksModelAndStatus(t *testing.T) {

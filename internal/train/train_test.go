@@ -465,3 +465,82 @@ func TestDualSlotManifestUpdateRollbackAndDeactivate(t *testing.T) {
 		t.Fatalf("unexpected manifest after escalation deactivate: changed=%v err=%v manifest=%+v", changed, err, m)
 	}
 }
+
+func TestMirrorDaemonSlotHistoryEpochAndLocalManifestBump(t *testing.T) {
+	dir := t.TempDir()
+
+	// Daemon mirrors op_seq=1 in history A.
+	m, err := MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/daemon-v1/model_adapters",
+		JobID:       "j1",
+		HistoryID:   "d1-0",
+		OpSeq:       1,
+	}, "", "", "")
+	if err != nil {
+		t.Fatalf("initial MirrorDaemonSlotToManifest failed: %v", err)
+	}
+	if m.PrimaryMirrorHistory != "d1-0" || m.PrimaryMirrorSeq != 1 || m.PrimarySeq != 1 {
+		t.Fatalf("expected initial mirror state (d1-0, 1) and PrimarySeq=1, got %+v", m)
+	}
+
+	// Simulate local offline swaps advancing local PrimarySeq well past daemon OpSeq=2.
+	for i := 1; i <= 5; i++ {
+		if _, err := UpdateActiveAdapterSlot(dir, SlotPrimary, AdapterSlot{
+			JobID:       "local-" + string(rune('0'+i)),
+			BaseModel:   model.ModelSmolLM2135MInstruct,
+			AdapterPath: "artifacts/local/model_adapters",
+		}); err != nil {
+			t.Fatalf("local swap %d failed: %v", i, err)
+		}
+	}
+
+	// Daemon mirrors op_seq=2 (still > PrimaryMirrorSeq=1, even though < local PrimarySeq=6).
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/daemon-v2/model_adapters",
+		JobID:       "j2",
+		HistoryID:   "d1-0",
+		OpSeq:       2,
+	}, "", "", "")
+	if err != nil {
+		t.Fatalf("MirrorDaemonSlotToManifest op_seq=2 failed: %v", err)
+	}
+	if m.AdapterPath != "artifacts/daemon-v2/model_adapters" || m.PrimaryMirrorSeq != 2 {
+		t.Fatalf("expected daemon op_seq=2 accepted alongside higher local PrimarySeq, got %+v", m)
+	}
+
+	// Stale out-of-order op_seq=1 from the same history epoch must be ignored.
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/stale-v1/model_adapters",
+		JobID:       "j-stale",
+		HistoryID:   "d1-0",
+		OpSeq:       1,
+	}, "", "", "")
+	if err != nil {
+		t.Fatalf("stale MirrorDaemonSlotToManifest returned unexpected error: %v", err)
+	}
+	if m.AdapterPath != "artifacts/daemon-v2/model_adapters" {
+		t.Fatalf("expected stale op_seq=1 in same history ignored, got %s", m.AdapterPath)
+	}
+
+	// Burn()/restart changes HistoryID ("d1-1") and resets daemon OpSeq=1 -> must be accepted!
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/post-burn/model_adapters",
+		JobID:       "j-burn",
+		HistoryID:   "d1-1",
+		OpSeq:       1,
+	}, "", "", "")
+	if err != nil {
+		t.Fatalf("post-burn HistoryID reset MirrorDaemonSlotToManifest failed: %v", err)
+	}
+	if m.AdapterPath != "artifacts/post-burn/model_adapters" || m.PrimaryMirrorHistory != "d1-1" || m.PrimaryMirrorSeq != 1 {
+		t.Fatalf("expected post-burn HistoryID reset accepted, got %+v", m)
+	}
+}

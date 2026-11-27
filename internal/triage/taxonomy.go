@@ -280,7 +280,7 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 
 	rulesStr := joinSanitizedPromptTokens(in.RuleIDs, 96, 48, 0, "none", &metaSignals)
 	catsStr := joinSanitizedPromptTokens(in.Categories, 96, 48, 0, "none", &metaSignals)
-	corrStr := joinSanitizedPromptTokens(in.CorrelatedWindows, 128, 96, 4, "", &metaSignals)
+	corrItems := sanitizePromptTokens(in.CorrelatedWindows, 128, 96, 4, &metaSignals)
 
 	topFeatStr, featSigs := formatTopFeatures(in.TopSurprisalFeatures)
 	metaSignals = append(metaSignals, featSigs...)
@@ -305,19 +305,26 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	if injSuspected {
 		metaLine += " injection_flag=true"
 	}
-	if corrStr != "" {
+	if len(corrItems) > 0 {
 		corrPrefix := " correlated="
 		maxCorrBudget := bodyBudget - fieldLabelsLen - minEventTextBudget - len(metaLine) - len(corrPrefix)
 		if maxCorrBudget >= 16 {
-			if len(corrStr) > maxCorrBudget {
-				trimmed := truncateUTF8(corrStr, maxCorrBudget)
-				if comma := strings.LastIndex(trimmed, ","); comma >= 12 {
-					trimmed = trimmed[:comma]
+			// Append only whole correlated summaries that fit cleanly ([11]).
+			fitted := make([]string, 0, len(corrItems))
+			used := 0
+			for _, item := range corrItems {
+				add := len(item)
+				if len(fitted) > 0 {
+					add++ // comma separator
 				}
-				corrStr = strings.TrimSpace(trimmed)
+				if used+add > maxCorrBudget {
+					break
+				}
+				fitted = append(fitted, item)
+				used += add
 			}
-			if corrStr != "" {
-				metaLine += corrPrefix + corrStr
+			if len(fitted) > 0 {
+				metaLine += corrPrefix + strings.Join(fitted, ",")
 			}
 		}
 	}
@@ -502,9 +509,9 @@ func defangFenceMarkers(s string) string {
 	return s
 }
 
-func joinSanitizedPromptTokens(items []string, rawLimit, itemLimit, maxItems int, emptyFallback string, metaSignals *[]string) string {
+func sanitizePromptTokens(items []string, rawLimit, itemLimit, maxItems int, metaSignals *[]string) []string {
 	if len(items) == 0 {
-		return emptyFallback
+		return nil
 	}
 	clean := make([]string, 0, len(items))
 	for _, raw := range items {
@@ -517,6 +524,11 @@ func joinSanitizedPromptTokens(items []string, rawLimit, itemLimit, maxItems int
 			}
 		}
 	}
+	return clean
+}
+
+func joinSanitizedPromptTokens(items []string, rawLimit, itemLimit, maxItems int, emptyFallback string, metaSignals *[]string) string {
+	clean := sanitizePromptTokens(items, rawLimit, itemLimit, maxItems, metaSignals)
 	if len(clean) == 0 {
 		return emptyFallback
 	}
