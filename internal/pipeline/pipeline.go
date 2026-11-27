@@ -307,13 +307,13 @@ func New(cfg *config.Config, ruleEng *rules.Engine, sink emit.Sink, activeSource
 		configuredEscalationBase: cfg.EscalationBaseModel,
 		sink:                     sink,
 		activeSource:             activeSource,
-		instanceID:            instanceID,
-		startTime:             time.Now(),
-		triageReqTimeout:      reqTimeout,
-		escalationTimeout:     escalationTimeout,
-		activeTriageCancel:    make(map[uint64]context.CancelFunc),
-		maxPendingRuleBuckets: defaultMaxPendingRuleBuckets,
-		pendingHits:           make(map[ruleBucketKey]*bucketAccumulator, 64),
+		instanceID:               instanceID,
+		startTime:                time.Now(),
+		triageReqTimeout:         reqTimeout,
+		escalationTimeout:        escalationTimeout,
+		activeTriageCancel:       make(map[uint64]context.CancelFunc),
+		maxPendingRuleBuckets:    defaultMaxPendingRuleBuckets,
+		pendingHits:              make(map[ruleBucketKey]*bucketAccumulator, 64),
 	}
 	p.initAdapterTracking()
 	return p
