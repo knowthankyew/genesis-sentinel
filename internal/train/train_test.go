@@ -543,4 +543,78 @@ func TestMirrorDaemonSlotHistoryEpochAndLocalManifestBump(t *testing.T) {
 	if m.AdapterPath != "artifacts/post-burn/model_adapters" || m.PrimaryMirrorHistory != "d1-1" || m.PrimaryMirrorSeq != 1 {
 		t.Fatalf("expected post-burn HistoryID reset accepted, got %+v", m)
 	}
+
+	// Delayed response from superseded pre-Burn history ("d1-0", OpSeq=9) must be rejected ([16]).
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/stale-preburn/model_adapters",
+		JobID:       "j-old",
+		HistoryID:   "d1-0",
+		OpSeq:       9,
+	}, "", "", "")
+	if err != nil || m.AdapterPath != "artifacts/post-burn/model_adapters" || m.PrimaryMirrorHistory != "d1-1" {
+		t.Fatalf("expected superseded d1-0 response rejected after d1-1, got %+v err=%v", m, err)
+	}
+
+	// Cross-instance history switch ("d2-0") also rejects delayed messages from superseded "d1-1" ([16]).
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/d2-first/model_adapters",
+		JobID:       "j-d2",
+		HistoryID:   "d2-0",
+		OpSeq:       1,
+	}, "", "", "")
+	if err != nil || m.AdapterPath != "artifacts/d2-first/model_adapters" {
+		t.Fatalf("expected new daemon d2-0 accepted, got %+v err=%v", m, err)
+	}
+	m, err = MirrorDaemonSlotToManifest(dir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/stale-d1-1/model_adapters",
+		JobID:       "j-stale-d1",
+		HistoryID:   "d1-1",
+		OpSeq:       5,
+	}, "", "", "")
+	if err != nil || m.AdapterPath != "artifacts/d2-first/model_adapters" {
+		t.Fatalf("expected delayed superseded d1-1 rejected after d2-0, got %+v err=%v", m, err)
+	}
+
+	// Timestamp-only ordering blocks older deactivation after newer activation and vice versa ([15]).
+	tsDir := t.TempDir()
+	t200 := time.Date(2026, 11, 26, 12, 0, 200, 0, time.UTC)
+	t100 := time.Date(2026, 11, 26, 12, 0, 100, 0, time.UTC)
+	t300 := time.Date(2026, 11, 26, 12, 0, 300, 0, time.UTC)
+	if _, err := MirrorDaemonSlotToManifest(tsDir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/ts-200/model_adapters",
+		SwappedAt:   t200,
+	}, "", "", ""); err != nil {
+		t.Fatalf("timestamp activation t200 failed: %v", err)
+	}
+	mTS, err := MirrorDaemonSlotToManifest(tsDir, SlotPrimary, &SlotStatus{
+		Slot:      SlotPrimary,
+		SwappedAt: t100,
+	}, "", "", "")
+	if err != nil || mTS.AdapterPath != "artifacts/ts-200/model_adapters" {
+		t.Fatalf("expected stale timestamp deactivation t100 rejected, got %+v err=%v", mTS, err)
+	}
+	mTS, err = MirrorDaemonSlotToManifest(tsDir, SlotPrimary, &SlotStatus{
+		Slot:      SlotPrimary,
+		SwappedAt: t300,
+	}, "", "", "")
+	if err != nil || mTS.AdapterPath != "" {
+		t.Fatalf("expected newer timestamp deactivation t300 accepted, got %+v err=%v", mTS, err)
+	}
+	mTS, err = MirrorDaemonSlotToManifest(tsDir, SlotPrimary, &SlotStatus{
+		Slot:        SlotPrimary,
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/ts-200-late/model_adapters",
+		SwappedAt:   t200,
+	}, "", "", "")
+	if err != nil || mTS.AdapterPath != "" {
+		t.Fatalf("expected stale timestamp activation t200 rejected after deactivation t300, got %+v err=%v", mTS, err)
+	}
 }

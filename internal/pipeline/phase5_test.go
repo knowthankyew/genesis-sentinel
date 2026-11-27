@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -405,7 +407,11 @@ func TestAsyncEscalationDiscardsStaleVerdictOnEscalationHotSwap(t *testing.T) {
 	if len(em1) != 1 {
 		t.Fatalf("expected 1 deterministic alert #1, got %d", len(em1))
 	}
-	<-sink.ch
+	select {
+	case <-sink.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected sink emission for alert #1")
+	}
 	select {
 	case <-reqAStarted:
 	case <-time.After(2 * time.Second):
@@ -1234,5 +1240,99 @@ func TestPipelinePhase5Round4Invariants(t *testing.T) {
 	p14.adapterMu.Unlock()
 	if gotEscHash != "sha256:esc-v2" {
 		t.Fatalf("expected sibling dataset_hash updated to sha256:esc-v2 after primary swap, got %q", gotEscHash)
+	}
+
+	// 6. Alert correlation lookup does not destructively evict earlier windows ([10]),
+	// diskless swaps with changed job_id/model preserve displaced slot for rollback ([12]),
+	// initAdapterTracking requires matching base_model ([13]), and disk manifest removal mid-epoch
+	// keeps opSeq monotonic within the same HistoryID ([14]).
+	cfgCorr := config.DefaultConfig()
+	cfgCorr.DataDir = ""
+	cfgCorr.TriageMode = "off"
+	pCorr := New(cfgCorr, ruleEng, emit.NopSink{}, "file")
+	pCorr.recordCorrelationWindow(emit.Alert{
+		Timestamp: 1000, SourceService: "svc-c", TemplateID: "t-1000", Categories: []string{"recon"}, Severity: "MEDIUM", Count: 2,
+	})
+	_ = pCorr.collectCorrelatedContext("svc-c", "t-other", 1601)
+	if ctx1597 := pCorr.collectCorrelatedContext("svc-c", "t-other", 1597); len(ctx1597) == 0 {
+		t.Fatalf("expected window at t=1000 preserved for alert at t=1597 even after lookup at t=1601 ([10])")
+	}
+
+	cfgDL := config.DefaultConfig()
+	cfgDL.DataDir = ""
+	cfgDL.TriageMode = "http"
+	cfgDL.InferenceAddr = "http://127.0.0.1:8000"
+	pDL := New(cfgDL, ruleEng, emit.NopSink{}, "file")
+	for _, jid := range []string{"same-path-j1", "same-path-j2"} {
+		recDL := httptest.NewRecorder()
+		reqDL := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(
+			fmt.Sprintf(`{"slot":"primary","job_id":%q,"adapter_path":"artifacts/shared/model_adapters"}`, jid),
+		))
+		reqDL.Header.Set("Content-Type", "application/json")
+		pDL.HandleAdapter(recDL, reqDL)
+		if recDL.Code != http.StatusOK {
+			t.Fatalf("diskless same-path swap %s failed: %d", jid, recDL.Code)
+		}
+	}
+	recDLRB := httptest.NewRecorder()
+	reqDLRB := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","action":"rollback"}`))
+	reqDLRB.Header.Set("Content-Type", "application/json")
+	pDL.HandleAdapter(recDLRB, reqDLRB)
+	var dlRB train.AdapterStatusResponse
+	_ = json.Unmarshal(recDLRB.Body.Bytes(), &dlRB)
+	if recDLRB.Code != http.StatusOK || dlRB.JobID != "same-path-j1" {
+		t.Fatalf("expected diskless same-path job change to preserve same-path-j1 for rollback ([12]), got code=%d resp=%+v", recDLRB.Code, dlRB)
+	}
+
+	dir13 := t.TempDir()
+	if err := train.SaveActiveAdapter(dir13, train.ActiveAdapter{
+		JobID:       "smol-provenance",
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/shared-path/model_adapters",
+		DatasetHash: "sha256:smol-only",
+	}); err != nil {
+		t.Fatalf("seed dir13: %v", err)
+	}
+	cfg13 := config.DefaultConfig()
+	cfg13.DataDir = dir13
+	cfg13.TriageMode = "http"
+	cfg13.InferenceAddr = "http://127.0.0.1:8000"
+	cfg13.BaseModel = model.ModelGemma22BIT // mismatch with disk manifest's SmolLM2-135M-Instruct!
+	cfg13.AdapterPath = "artifacts/shared-path/model_adapters"
+	p13 := New(cfg13, ruleEng, emit.NopSink{}, "file")
+	st13 := p13.snapshotSlotStatusLocked(train.SlotPrimary)
+	if st13.JobID != "" || st13.DatasetHash != "" {
+		t.Fatalf("expected initAdapterTracking not to assign SmolLM2 provenance to Gemma client ([13]), got %+v", st13)
+	}
+
+	// Deleting manifest mid-epoch without Burn() must keep published OpSeq monotonic within the same HistoryID ([14]).
+	dir14m := t.TempDir()
+	cfg14m := config.DefaultConfig()
+	cfg14m.DataDir = dir14m
+	cfg14m.TriageMode = "http"
+	cfg14m.InferenceAddr = "http://127.0.0.1:8000"
+	p14m := New(cfg14m, ruleEng, emit.NopSink{}, "file")
+	for _, ap := range []string{"artifacts/m1/model_adapters", "artifacts/m2/model_adapters"} {
+		recM := httptest.NewRecorder()
+		reqM := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(
+			fmt.Sprintf(`{"slot":"primary","adapter_path":%q}`, ap),
+		))
+		reqM.Header.Set("Content-Type", "application/json")
+		p14m.HandleAdapter(recM, reqM)
+	}
+	beforeRemove := p14m.snapshotSlotStatusLocked(train.SlotPrimary)
+	if rmErr := os.Remove(filepath.Join(dir14m, train.ActiveAdapterFilename)); rmErr != nil {
+		t.Fatalf("remove active-adapter.json: %v", rmErr)
+	}
+	recAfterRemove := httptest.NewRecorder()
+	reqAfterRemove := httptest.NewRequest(http.MethodPost, "/adapter", strings.NewReader(`{"slot":"primary","adapter_path":"artifacts/m3/model_adapters"}`))
+	reqAfterRemove.Header.Set("Content-Type", "application/json")
+	p14m.HandleAdapter(recAfterRemove, reqAfterRemove)
+	var afterRemoveResp train.AdapterStatusResponse
+	_ = json.Unmarshal(recAfterRemove.Body.Bytes(), &afterRemoveResp)
+	if afterRemoveResp.Primary == nil || afterRemoveResp.Primary.HistoryID != beforeRemove.HistoryID ||
+		afterRemoveResp.Primary.OpSeq <= beforeRemove.OpSeq {
+		t.Fatalf("expected published OpSeq strictly monotonic within same HistoryID after manifest deletion ([14]), before=%+v after=%+v",
+			beforeRemove, afterRemoveResp.Primary)
 	}
 }

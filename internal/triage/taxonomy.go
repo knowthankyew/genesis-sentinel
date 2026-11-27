@@ -286,12 +286,9 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	metaSignals = append(metaSignals, featSigs...)
 	signals := mergeSignals(in.InjectionSignals, sigSvc, sigLvl, sigTmpl, sigSample, metaSignals)
 	injSuspected := in.InjectionSuspected || len(signals) > 0
-	// Reserve budget for required current-event framing, top features, injection flag,
-	// template, and sample BEFORE appending optional correlated history ([9]).
-	const (
-		fieldLabelsLen     = len("\ntemplate=\nsample=")
-		minEventTextBudget = 64
-	)
+	// Allocate bounded priority budget for current-event template and sample FIRST so
+	// optional correlated history only consumes leftover unused budget ([7], [9], [11]).
+	const fieldLabelsLen = len("\ntemplate=\nsample=")
 	framingLen := len(promptHeader) + len(promptFooter)
 	bodyBudget := maxPromptBytes - framingLen
 
@@ -307,7 +304,22 @@ func BuildTriagePromptChecked(in PromptInput, maxPromptBytes int) (string, bool,
 	}
 	if len(corrItems) > 0 {
 		corrPrefix := " correlated="
-		maxCorrBudget := bodyBudget - fieldLabelsLen - minEventTextBudget - len(metaLine) - len(corrPrefix)
+		baseAvail := bodyBudget - fieldLabelsLen - len(metaLine)
+		effTmpl := 0
+		effSample := 0
+		if baseAvail >= 16 {
+			maxTmplBase := min(baseAvail/3, 384)
+			effTmpl = min(len(cleanTmpl), maxTmplBase)
+			effSample = min(len(cleanSample), baseAvail-effTmpl)
+		}
+		reservedEventBudget := effTmpl + effSample
+		if effTmpl == len(cleanTmpl) && effTmpl < 384 && reservedEventBudget < 3*effTmpl {
+			reservedEventBudget = 3 * effTmpl
+		}
+		if reservedEventBudget < 16 {
+			reservedEventBudget = 16
+		}
+		maxCorrBudget := baseAvail - reservedEventBudget - len(corrPrefix)
 		if maxCorrBudget >= 16 {
 			// Append only whole correlated summaries that fit cleanly ([11]).
 			fitted := make([]string, 0, len(corrItems))

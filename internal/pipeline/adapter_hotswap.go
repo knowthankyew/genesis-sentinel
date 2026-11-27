@@ -129,7 +129,7 @@ func (p *Pipeline) initAdapterTracking() {
 	var psPtr *train.AdapterSlot
 	if ps, ok := manifest.PrimarySlot(); ok {
 		psPtr = &ps
-		if p.triageClient == nil || ps.AdapterPath == p.cfg.AdapterPath {
+		if p.triageClient == nil || (ps.AdapterPath == p.cfg.AdapterPath && strings.EqualFold(ps.BaseModel, p.triageClient.BaseModel())) {
 			p.primaryMeta.baseModel = ps.BaseModel
 			p.primaryMeta.adapterPath = ps.AdapterPath
 			p.primaryMeta.jobID = ps.JobID
@@ -139,7 +139,7 @@ func (p *Pipeline) initAdapterTracking() {
 	}
 	p.primaryMeta.opSeq = manifest.PrimarySeq
 	p.primaryMeta.previous = cloneSlotPtr(manifest.Previous)
-	if manifest.Escalation != nil && (p.escalationClient == nil || manifest.Escalation.AdapterPath == p.cfg.EscalationAdapterPath) {
+	if manifest.Escalation != nil && (p.escalationClient == nil || (manifest.Escalation.AdapterPath == p.cfg.EscalationAdapterPath && strings.EqualFold(manifest.Escalation.BaseModel, p.escalationClient.BaseModel()))) {
 		p.escalationMeta.baseModel = manifest.Escalation.BaseModel
 		p.escalationMeta.adapterPath = manifest.Escalation.AdapterPath
 		p.escalationMeta.jobID = manifest.Escalation.JobID
@@ -377,25 +377,12 @@ func (p *Pipeline) collectCorrelatedContextByKey(corrKey, excludeTemplateID stri
 		return nil
 	}
 
-	// Compact only expired entries strictly in forward index order so slice aliasing cannot
-	// overwrite unread elements; retain future windows intact for subsequent alerts.
-	kept := entries[:0]
-	for _, e := range entries {
-		if nowUnix-e.timestamp > correlationWindowTTLSec {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	if len(kept) == 0 {
-		delete(p.serviceCorrelator, corrKey)
-		return nil
-	}
-	p.serviceCorrelator[corrKey] = kept
-
+	// Filter read-only against the caller's window timestamp without mutating or evicting
+	// earlier entries during lookup ([10]); cache size stays bounded by maxCorrelationPerService.
 	out := make([]string, 0, maxCorrelationPerService)
-	for i := len(kept) - 1; i >= 0 && len(out) < maxCorrelationPerService; i-- {
-		e := kept[i]
-		if e.timestamp > nowUnix || e.templateID == excludeTemplateID {
+	for i := len(entries) - 1; i >= 0 && len(out) < maxCorrelationPerService; i-- {
+		e := entries[i]
+		if e.timestamp > nowUnix || nowUnix-e.timestamp > correlationWindowTTLSec || e.templateID == excludeTemplateID {
 			continue
 		}
 		tidShort := e.templateID
@@ -719,7 +706,9 @@ func (p *Pipeline) refreshUnchangedSlotMetaLocked(slot string, meta *train.Adapt
 		target.datasetHash = ""
 		target.swappedAt = time.Time{}
 	}
-	target.opSeq = opSeq
+	if opSeq > target.opSeq {
+		target.opSeq = opSeq
+	}
 	target.previous = cloneSlotPtr(diskPrev)
 }
 
@@ -973,16 +962,18 @@ func (p *Pipeline) recordSwapLocked(
 		p.primaryMeta.datasetHash = newSlotMeta.DatasetHash
 		if !newSlotMeta.ActivatedAt.IsZero() {
 			p.primaryMeta.swappedAt = newSlotMeta.ActivatedAt
-		} else if action != train.ActionDeactivate {
-			p.primaryMeta.swappedAt = now
 		} else {
-			p.primaryMeta.swappedAt = time.Time{}
+			p.primaryMeta.swappedAt = now
 		}
 		if hasDiskManifest {
 			p.primaryMeta.previous = cloneSlotPtr(diskPrevPrimary)
-			p.primaryMeta.opSeq = diskPrimarySeq
+			if diskPrimarySeq > priorMeta.opSeq {
+				p.primaryMeta.opSeq = diskPrimarySeq
+			} else {
+				p.primaryMeta.opSeq = priorMeta.opSeq + 1
+			}
 		} else {
-			p.primaryMeta.opSeq++
+			p.primaryMeta.opSeq = priorMeta.opSeq + 1
 			if action != train.ActionRollback {
 				oldAdapter := priorMeta.adapterPath
 				oldModel := priorMeta.baseModel
@@ -990,14 +981,16 @@ func (p *Pipeline) recordSwapLocked(
 					oldAdapter = prevAdapter
 					oldModel = prevModel
 				}
-				if oldAdapter != "" && oldAdapter != adapterPath {
-					oldTS := priorMeta.swappedAt
-					if oldTS.IsZero() {
-						oldTS = now
-					}
-					if oldModel == "" {
-						oldModel = baseModel
-					}
+				oldTS := priorMeta.swappedAt
+				if oldTS.IsZero() {
+					oldTS = now
+				}
+				if oldModel == "" {
+					oldModel = baseModel
+				}
+				priorSlot := train.AdapterSlot{JobID: priorMeta.jobID, BaseModel: oldModel, AdapterPath: oldAdapter}
+				nextSlot := train.AdapterSlot{JobID: newSlotMeta.JobID, BaseModel: baseModel, AdapterPath: adapterPath}
+				if oldAdapter != "" && !slotsEqual(priorSlot, nextSlot) {
 					p.primaryMeta.previous = &train.AdapterSlot{
 						JobID:       priorMeta.jobID,
 						BaseModel:   oldModel,
@@ -1022,16 +1015,18 @@ func (p *Pipeline) recordSwapLocked(
 		p.escalationMeta.datasetHash = newSlotMeta.DatasetHash
 		if !newSlotMeta.ActivatedAt.IsZero() {
 			p.escalationMeta.swappedAt = newSlotMeta.ActivatedAt
-		} else if action != train.ActionDeactivate {
-			p.escalationMeta.swappedAt = now
 		} else {
-			p.escalationMeta.swappedAt = time.Time{}
+			p.escalationMeta.swappedAt = now
 		}
 		if hasDiskManifest {
 			p.escalationMeta.previous = cloneSlotPtr(diskPrevEsc)
-			p.escalationMeta.opSeq = diskEscSeq
+			if diskEscSeq > priorMeta.opSeq {
+				p.escalationMeta.opSeq = diskEscSeq
+			} else {
+				p.escalationMeta.opSeq = priorMeta.opSeq + 1
+			}
 		} else {
-			p.escalationMeta.opSeq++
+			p.escalationMeta.opSeq = priorMeta.opSeq + 1
 			if action != train.ActionRollback {
 				oldAdapter := priorMeta.adapterPath
 				oldModel := priorMeta.baseModel
@@ -1039,14 +1034,16 @@ func (p *Pipeline) recordSwapLocked(
 					oldAdapter = prevAdapter
 					oldModel = prevModel
 				}
-				if oldAdapter != "" && oldAdapter != adapterPath {
-					oldTS := priorMeta.swappedAt
-					if oldTS.IsZero() {
-						oldTS = now
-					}
-					if oldModel == "" {
-						oldModel = baseModel
-					}
+				oldTS := priorMeta.swappedAt
+				if oldTS.IsZero() {
+					oldTS = now
+				}
+				if oldModel == "" {
+					oldModel = baseModel
+				}
+				priorSlot := train.AdapterSlot{JobID: priorMeta.jobID, BaseModel: oldModel, AdapterPath: oldAdapter}
+				nextSlot := train.AdapterSlot{JobID: newSlotMeta.JobID, BaseModel: baseModel, AdapterPath: adapterPath}
+				if oldAdapter != "" && !slotsEqual(priorSlot, nextSlot) {
 					p.escalationMeta.previous = &train.AdapterSlot{
 						JobID:       priorMeta.jobID,
 						BaseModel:   oldModel,

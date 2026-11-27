@@ -362,15 +362,37 @@ func runAdapterDeactivate(args []string, stdout, stderr io.Writer) error {
 		daemonSavedSameDir = shouldSkipLocalManifestMirror(*sentinelHTTP, resp.DataDir, *dataDir != "")
 	}
 	if !daemonSavedSameDir {
+		if daemonCalled {
+			if daemonResp.Truncated {
+				return fmt.Errorf("running daemon deactivated %s slot, but response metadata exceeded 64 KiB wire limit (truncated=true); inspect with 'sentinel adapter status' and synchronize %q manually", normSlot, cfg.DataDir)
+			}
+			var slots []string
+			if normSlot == train.SlotPrimary || normSlot == train.SlotAll {
+				slots = append(slots, train.SlotPrimary)
+			}
+			if normSlot == train.SlotEscalation || normSlot == train.SlotAll {
+				slots = append(slots, train.SlotEscalation)
+			}
+			for _, s := range slots {
+				slotStatus := daemonResp.Primary
+				if s == train.SlotEscalation {
+					slotStatus = daemonResp.Escalation
+				}
+				if slotStatus == nil {
+					slotStatus = &train.SlotStatus{
+						Slot:      s,
+						SwappedAt: time.Now().UTC(),
+					}
+				}
+				if _, mirrorErr := train.MirrorDaemonSlotToManifest(cfg.DataDir, s, slotStatus, daemonResp.BaseModel, "", daemonResp.JobID); mirrorErr != nil {
+					return fmt.Errorf("running daemon deactivated %s slot, but updating local manifest failed: %w", normSlot, mirrorErr)
+				}
+			}
+			return writeIndentedJSON(stdout, daemonResp)
+		}
 		updated, changed, err := train.DeactivateActiveAdapterSlot(cfg.DataDir, normSlot)
 		if err != nil {
-			if daemonCalled {
-				return fmt.Errorf("running daemon deactivated %s slot, but updating local manifest failed: %w", normSlot, err)
-			}
 			return err
-		}
-		if daemonCalled {
-			return writeIndentedJSON(stdout, daemonResp)
 		}
 		return writeIndentedJSON(stdout, map[string]any{
 			"status":   "deactivated",
@@ -407,7 +429,10 @@ func activateSlotWithOptionalDaemon(
 	var daemonResp train.AdapterStatusResponse
 
 	if sentinelHTTP != "" {
-		if normSlot == train.SlotPrimary && !verify && !enable {
+		// Use the lightweight /adapter/reload fast path only for unverified local loopback
+		// primary swaps without an explicit local --data-dir; otherwise query /adapter so
+		// the full daemon slot state and rollback metadata can be mirrored accurately ([4]).
+		if normSlot == train.SlotPrimary && !verify && !enable && !dataDirExplicit && security.IsLoopbackEndpoint(sentinelHTTP) {
 			daemonDir, notifyErr := train.NotifyDaemonAdapter(ctx, sentinelHTTP, authToken, train.ActiveAdapter{
 				JobID:       slotState.JobID,
 				BaseModel:   slotState.BaseModel,

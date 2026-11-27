@@ -654,11 +654,11 @@ def _iter_gfm_table_body_rows(cleaned_lines: list[str]):
                 i += 2
                 while i < total_lines:
                     raw_line = cleaned_lines[i]
+                    if raw_line.startswith(("    ", "\t")) or not raw_line.strip() or _GFM_TABLE_BREAK_RE.match(raw_line):
+                        break
                     body = _parse_gfm_row(raw_line, require_outer_pipes=False, min_cells=1)
                     if body is not None:
                         line, parts = body
-                    elif raw_line.startswith(("    ", "\t")) or not raw_line.strip() or _GFM_TABLE_BREAK_RE.match(raw_line):
-                        break
                     else:
                         # Valid non-piped GFM table row continuation belongs to the active table ([25]).
                         line = raw_line.strip()
@@ -1458,8 +1458,13 @@ def independent_recompute_phase5_comparison(
     eval_nr = _req_int(ds, "eval_needs_review_windows", errors, "dataset", min_val=0)
     eval_corr = _req_int(ds, "eval_correlated_windows", errors, "dataset", min_val=1)
     mitre_app = _req_int(ds, "mitre_applicable_windows", errors, "dataset", min_val=1)
+    eval_inj = None
+    if require_governed_fields or "eval_injection_windows" in ds:
+        eval_inj = _req_int(ds, "eval_injection_windows", errors, "dataset", min_val=0)
     if None in (train_records, eval_total, eval_benign, eval_attack, eval_nr, eval_corr, mitre_app):
         return False, errors
+    if eval_inj is not None and eval_inj > eval_attack:
+        errors.append(f"phase5 dataset eval_injection_windows ({eval_inj}) exceeds eval_attack_windows ({eval_attack})")
     if eval_benign + eval_attack + eval_nr != eval_total:
         errors.append(
             f"phase5 dataset partition inconsistent: benign({eval_benign}) + attack({eval_attack}) + needs_review({eval_nr}) != total({eval_total})"
@@ -1682,7 +1687,7 @@ def independent_recompute_phase5_comparison(
                     re_smol_fmt = re_smol_cls = re_smol_fp = re_smol_tp = re_smol_corr = re_smol_mitre = 0
                     re_gemma_fmt = re_gemma_cls = re_gemma_fp = re_gemma_tp = re_gemma_corr = re_gemma_mitre = 0
                     re_hyb_cls = re_hyb_fp = re_hyb_tp = re_hyb_corr = re_hyb_mitre = 0
-                    re_benign_tot = re_attack_tot = re_nr_tot = re_corr_tot = re_mitre_tot = 0
+                    re_benign_tot = re_attack_tot = re_nr_tot = re_corr_tot = re_mitre_tot = re_inj_tot = 0
                     req_replay_keys = [
                         "partition", "truth_class", "truth_mitre", "tier1_sev",
                         "smol_format_valid", "smol_class", "smol_sev", "smol_mitre",
@@ -1705,7 +1710,9 @@ def independent_recompute_phase5_comparison(
                         if not isinstance(inj_f, bool) or not isinstance(corr_f, bool) or not isinstance(dec_row.get("escalated"), bool):
                             errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid boolean flags")
                             break
-                        if t1_sev not in sev_rank or p_sev not in sev_rank:
+                        if inj_f:
+                            re_inj_tot += 1
+                        if not isinstance(t1_sev, str) or not isinstance(p_sev, str) or t1_sev not in sev_rank or p_sev not in sev_rank:
                             errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid severity value (tier1={t1_sev!r}, primary={p_sev!r})")
                             break
                         recomp_esc = (
@@ -1738,7 +1745,13 @@ def independent_recompute_phase5_comparison(
                             if not all(isinstance(b, bool) for b in (s_fv_raw, s_ne_raw, g_fv_raw, g_ne_raw)):
                                 errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has non-boolean format/nonempty flag")
                                 break
-                            if part not in ("benign", "attack", "needs_review") or s_sev not in sev_rank or g_sev not in sev_rank or not isinstance(t_mit, str):
+                            if (not s_ne_raw and s_fv_raw) or (not g_ne_raw and g_fv_raw):
+                                errors.append(
+                                    f"phase5 hybrid per_sample_decisions[{idx_d}] marks empty completion format_valid "
+                                    f"(smol=({s_ne_raw},{s_fv_raw}), gemma=({g_ne_raw},{g_fv_raw}))"
+                                )
+                                break
+                            if part not in ("benign", "attack", "needs_review") or not isinstance(s_sev, str) or not isinstance(g_sev, str) or s_sev not in sev_rank or g_sev not in sev_rank or not isinstance(t_mit, str):
                                 errors.append(f"phase5 hybrid per_sample_decisions[{idx_d}] has invalid partition/severity/truth_mitre field")
                                 break
                             s_fv, s_ne = s_fv_raw, s_ne_raw
@@ -1809,6 +1822,11 @@ def independent_recompute_phase5_comparison(
                                     f"phase5 hybrid per_sample_decisions partition/applicable counts "
                                     f"{(re_benign_tot, re_attack_tot, re_nr_tot, re_corr_tot, re_mitre_tot)} != "
                                     f"dataset {(eval_benign, eval_attack, eval_nr, eval_corr, mitre_app)}"
+                                )
+                            if eval_inj is not None and re_inj_tot != eval_inj:
+                                errors.append(
+                                    f"phase5 hybrid per_sample_decisions injection count ({re_inj_tot}) != "
+                                    f"dataset.eval_injection_windows ({eval_inj})"
                                 )
                             if "smol_lora" in recomputed_models:
                                 slm = recomputed_models["smol_lora"]
@@ -2092,15 +2110,27 @@ def independent_recompute_phase5_comparison(
                     if hw_frag not in visible_text:
                         errors.append(f"Phase 5 Markdown hardware metadata mismatch: expected {hw_frag!r}")
 
-                # Validate visible Markdown title and Commit bullet match metadata.git_commit ([23]).
+                # Validate visible Markdown title, Dataset bullet, and Commit bullet line-by-line ([17], [20], [23]).
+                visible_stripped_lines = [cl.strip() for cl in cleaned_lines]
+                non_empty_lines = [cl for cl in visible_stripped_lines if cl]
                 git_commit_str = meta.get("git_commit")
                 if require_governed_fields or (isinstance(git_commit_str, str) and git_commit_str.strip()):
                     exp_title = f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({git_commit_str})"
                     exp_commit_bullet = f"- **Commit:** `{git_commit_str}`"
-                    if exp_title not in visible_text:
-                        errors.append(f"Phase 5 Markdown title/commit mismatch: expected {exp_title!r}")
-                    if exp_commit_bullet not in visible_text:
-                        errors.append(f"Phase 5 Markdown commit bullet mismatch: expected {exp_commit_bullet!r}")
+                    if not non_empty_lines or non_empty_lines[0] != exp_title:
+                        errors.append(f"Phase 5 Markdown title/commit mismatch: expected leading heading {exp_title!r}")
+                    if exp_commit_bullet not in visible_stripped_lines:
+                        errors.append(f"Phase 5 Markdown commit bullet mismatch: expected line {exp_commit_bullet!r}")
+                if eval_inj is not None and "train_classes" in ds and (
+                    require_governed_fields or any(cl.startswith("- **Dataset:**") for cl in visible_stripped_lines)
+                ):
+                    exp_ds_line = (
+                        f"- **Dataset:** {train_records} balanced training windows ({ds.get('train_classes')} classes) / "
+                        f"{eval_total} unseen holdout windows ({eval_benign} benign-cohort windows: 1 LOW control + 4 Tier-1 FP traps, "
+                        f"{eval_attack} attacks incl. {eval_corr} correlated chains & {eval_inj} injections, {eval_nr} ambiguous)"
+                    )
+                    if exp_ds_line not in visible_stripped_lines:
+                        errors.append(f"Phase 5 Markdown dataset summary mismatch: expected line {exp_ds_line!r}")
 
                 # Validate a single visible `## Conclusion` section including optional GFM closing hashes ([36]).
                 conc_indices = [

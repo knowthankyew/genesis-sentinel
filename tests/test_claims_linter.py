@@ -1160,11 +1160,13 @@ class TestClaimsLinter(unittest.TestCase):
             },
             "dataset": {
                 "train_records": 8,
+                "train_classes": 8,
                 "eval_total_windows": 4,
                 "eval_benign_windows": 2,
                 "eval_attack_windows": 2,
                 "eval_needs_review_windows": 0,
                 "eval_correlated_windows": 1,
+                "eval_injection_windows": sum(1 for w in fixture_windows if w["inj"]),
                 "mitre_applicable_windows": 2,
             },
             "models": {"smol_base": sb, "smol_lora": sl, "gemma_base": gb, "gemma_lora": gl},
@@ -1322,12 +1324,21 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertTrue(any("non-boolean format/nonempty flag" in e for e in errs_bb), errs_bb)
 
             bad_sev = json.loads(json.dumps(valid_payload))
-            bad_sev["hybrid_escalation"]["per_sample_decisions"][0]["tier1_sev"] = "EXTREME"
+            bad_sev["hybrid_escalation"]["per_sample_decisions"][0]["tier1_sev"] = []
             bad_sev_path = Path(tmp) / "bad_sev.json"
             bad_sev_path.write_text(json.dumps(bad_sev), encoding="utf-8")
             ok_bs, errs_bs = sync_docs.independent_recompute_phase5_comparison(bad_sev_path)
             self.assertFalse(ok_bs)
             self.assertTrue(any("invalid severity value" in e for e in errs_bs), errs_bs)
+
+            # Empty completion with format_valid=True must fail validation ([22]).
+            bad_empty_fv = json.loads(json.dumps(valid_payload))
+            bad_empty_fv["hybrid_escalation"]["per_sample_decisions"][0]["gemma_nonempty"] = False
+            bad_empty_fv_path = Path(tmp) / "bad_empty_fv.json"
+            bad_empty_fv_path.write_text(json.dumps(bad_empty_fv), encoding="utf-8")
+            ok_efv, errs_efv = sync_docs.independent_recompute_phase5_comparison(bad_empty_fv_path)
+            self.assertFalse(ok_efv)
+            self.assertTrue(any("marks empty completion format_valid" in e for e in errs_efv), errs_efv)
 
             # Positive & negative Markdown checks ([1], [23], [26], [31], [32], [33], [36], [37], [39], [42]).
             md_path = Path(tmp) / "2026-11-26-phase5-comparison.md"
@@ -1426,7 +1437,17 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok_pd)
             self.assertTrue(any("duplicate row for 'PyTorch PEFT Additional Adapter Load'" in e for e in errs_pd), errs_pd)
 
-        # Positive & negative require_governed_fields=True checks using a real temp git repo ([17], [23], [27]).
+            # GFM blockquote containing '|' terminates active table before subsequent metric rows ([24]).
+            md_bq_break = md_text_orig.replace(
+                "| Sentinel Sidecar CLI Swap",
+                "> Note | interrupts table\n| Sentinel Sidecar CLI Swap",
+            )
+            md_path.write_text(md_bq_break, encoding="utf-8")
+            ok_bq, errs_bq = sync_docs.independent_recompute_phase5_comparison(with_md_path, repo_root=Path(tmp))
+            self.assertFalse(ok_bq)
+            self.assertTrue(any("table parity error" in e for e in errs_bq), errs_bq)
+
+        # Positive & negative require_governed_fields=True checks using a real temp git repo ([17], [18], [20], [23], [27]).
         with tempfile.TemporaryDirectory() as gtmp:
             grepo = Path(gtmp)
             subprocess.run(["git", "init"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1434,14 +1455,16 @@ class TestClaimsLinter(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             (grepo / "README.md").write_text("seed\n", encoding="utf-8")
             subprocess.run(["git", "add", "README.md"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "commit", "-m", "seed"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "commit", "--no-gpg-sign", "-m", "seed"], cwd=grepo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             commit_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=grepo, text=True).strip()
 
+            inj_cnt = valid_payload["dataset"]["eval_injection_windows"]
             gmd_path = grepo / "2026-11-26-phase5-comparison.md"
             gmd_lines = [
                 f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({commit_sha})",
                 "",
                 f"- **Commit:** `{commit_sha}`",
+                f"- **Dataset:** 8 balanced training windows (8 classes) / 4 unseen holdout windows (2 benign-cohort windows: 1 LOW control + 4 Tier-1 FP traps, 2 attacks incl. 1 correlated chains & {inj_cnt} injections, 0 ambiguous)",
                 *md_lines,
             ]
             gmd_path.write_text("\n".join(gmd_lines) + "\n", encoding="utf-8")
@@ -1457,9 +1480,10 @@ class TestClaimsLinter(unittest.TestCase):
             )
             self.assertTrue(ok_gov, errs_gov)
 
-            # Missing gemma_nonempty or drifted Markdown title commit must fail require_governed_fields=True ([23], [27]).
+            # Missing gemma_nonempty or drifted eval_injection_windows must fail require_governed_fields=True ([17], [27]).
             gov_bad = json.loads(json.dumps(gov_payload))
             gov_bad["hybrid_escalation"]["per_sample_decisions"][0].pop("gemma_nonempty")
+            gov_bad["dataset"]["eval_injection_windows"] = 1
             gov_bad_json = grepo / "phase5_bad.json"
             gov_bad_json.write_text(json.dumps(gov_bad), encoding="utf-8")
             ok_gb, errs_gb = sync_docs.independent_recompute_phase5_comparison(
@@ -1468,8 +1492,22 @@ class TestClaimsLinter(unittest.TestCase):
             self.assertFalse(ok_gb)
             self.assertTrue(any("missing required replay verdict/truth fields" in e for e in errs_gb), errs_gb)
 
+            gov_inj = json.loads(json.dumps(gov_payload))
+            gov_inj["dataset"]["eval_injection_windows"] = 1
+            gov_inj_json = grepo / "phase5_inj.json"
+            gov_inj_json.write_text(json.dumps(gov_inj), encoding="utf-8")
+            ok_gi, errs_gi = sync_docs.independent_recompute_phase5_comparison(
+                gov_inj_json, repo_root=grepo, require_governed_fields=True,
+            )
+            self.assertFalse(ok_gi)
+            self.assertTrue(any("eval_injection_windows" in e for e in errs_gi), errs_gi)
+
+            # Spoofed commit heading only in paragraph prose instead of line 1 heading must fail ([20], [23]).
             gmd_path.write_text(
-                gmd_path.read_text(encoding="utf-8").replace(f"({commit_sha})", "(deadbeef)"),
+                gmd_path.read_text(encoding="utf-8").replace(
+                    f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({commit_sha})",
+                    f"# Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT (deadbeef)\n\nProse quoting # Phase 5 Empirical Model Comparison: SmolLM2-135M-Instruct vs Gemma 2 2B IT ({commit_sha})",
+                ),
                 encoding="utf-8",
             )
             ok_gt, errs_gt = sync_docs.independent_recompute_phase5_comparison(
@@ -1522,6 +1560,19 @@ class TestPhase5EvalScriptHelpers(unittest.TestCase):
             eval_phase5_models._atomic_publish_pair(p_a, "json-v1", p_b, "md-v1")
             self.assertEqual(p_a.read_text(encoding="utf-8"), "json-v1")
             self.assertEqual(p_b.read_text(encoding="utf-8"), "md-v1")
+
+        # Loopback probe handler rejects redirects ([28]).
+        import urllib.error
+        import urllib.request
+        with self.assertRaises(urllib.error.HTTPError):
+            eval_phase5_models._NoRedirectHandler().redirect_request(
+                urllib.request.Request("http://127.0.0.1:8080/healthz"),
+                None,
+                302,
+                "Found",
+                {},
+                "http://example.com/",
+            )
 
 
 if __name__ == "__main__":

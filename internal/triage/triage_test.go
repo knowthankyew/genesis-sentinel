@@ -770,16 +770,40 @@ func TestBuildTriagePromptIncludesSanitizedCorrelatedWindows(t *testing.T) {
 		t.Fatalf("expected current event template & sample preserved before optional correlated history, got:\n%s", smallPrompt)
 	}
 
-	// Budget sized for the first complete correlated summary ("priorA(RECON,MEDIUM,cnt=5)") plus
-	// 12 extra bytes (enough for full 23-byte UNIQUE_CURRENT_TEMPLATE, still < ",priorB(EXFIL,HIGH,cnt=8)" = 26 bytes)
-	// must keep priorA whole and drop priorB ([11]).
+	// Exact-fit current event budget (30B template + 74B sample = 104B) must omit optional
+	// correlated history rather than truncating either current-event field ([7]).
 	metaPrefix := "service=auth-svc level=WARN count=9 entropy=0.00 surprisal=0.00/0.00 rules=none categories=none"
-	partialBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 64 + len(" correlated=") + len("priorA(RECON,MEDIUM,cnt=5)") + 12
+	tmpl30 := "TMPL_EXACT_30_BYTES_CURRENT_OK"
+	samp74 := "SAMPLE_EXACT_74_BYTES_CURRENT_LINE_SHOULD_REMAIN_COMPLETELY_UNTRUNCATED_OK"
+	tightBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + len(tmpl30) + len(samp74)
+	tightPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
+		Service:           "auth-svc",
+		Level:             "WARN",
+		Template:          tmpl30,
+		SampleLine:        samp74,
+		Count:             9,
+		CorrelatedWindows: []string{"priorA(RECON,MEDIUM,cnt=5)"},
+	}, tightBudget)
+	if err != nil {
+		t.Fatalf("tight current-event prompt BuildTriagePromptChecked failed: %v", err)
+	}
+	if strings.Contains(tightPrompt, "correlated=") {
+		t.Fatalf("expected optional correlated history omitted when exact current event fills budget, got:\n%s", tightPrompt)
+	}
+	if !strings.Contains(tightPrompt, tmpl30) || !strings.Contains(tightPrompt, samp74) {
+		t.Fatalf("expected full 30B template and 74B sample preserved untruncated, got:\n%s", tightPrompt)
+	}
+
+	// Surplus budget beyond full current-event reservation sized for first complete correlated summary
+	// ("priorA(RECON,MEDIUM,cnt=5)") plus 4 extra bytes (< ",priorB(EXFIL,HIGH,cnt=8)") must keep priorA whole and drop priorB ([11]).
+	fullTmpl := "UNIQUE_CURRENT_TEMPLATE failed login for admin"
+	fullSample := "UNIQUE_CURRENT_SAMPLE src=203.0.113.99 user=admin"
+	partialBudget := (MinPromptBytes - 64) + len(metaPrefix) + len("\ntemplate=\nsample=") + 3*len(fullTmpl) + len(" correlated=") + len("priorA(RECON,MEDIUM,cnt=5)") + 4
 	partialPrompt, _, _, err := BuildTriagePromptChecked(PromptInput{
 		Service:           "auth-svc",
 		Level:             "WARN",
-		Template:          "UNIQUE_CURRENT_TEMPLATE failed login for admin",
-		SampleLine:        "UNIQUE_CURRENT_SAMPLE src=203.0.113.99 user=admin",
+		Template:          fullTmpl,
+		SampleLine:        fullSample,
 		Count:             9,
 		CorrelatedWindows: []string{"priorA(RECON,MEDIUM,cnt=5)", "priorB(EXFIL,HIGH,cnt=8)"},
 	}, partialBudget)

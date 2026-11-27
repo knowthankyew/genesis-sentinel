@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1053,6 +1054,13 @@ def compute_hybrid_escalation(smol_res: dict, gemma_res: dict) -> dict:
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects on loopback probe requests ([28])."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, f"redirects disabled: {msg}", headers, fp)
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -1124,7 +1132,7 @@ def benchmark_live_sidecar_hotswap(sentinel_bin: Path, tmp_dir: Path) -> dict:
         def log_message(self, format, *args):
             return
 
-    no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
     inf_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockInfHandler)
     inf_port = int(inf_srv.server_address[1])
     inf_thread = threading.Thread(target=inf_srv.serve_forever, daemon=True)
@@ -1421,12 +1429,12 @@ def main() -> int:
             f"got smol={args.train_epochs_smol}, gemma={args.train_epochs_gemma}"
         )
 
-    out_json_abs = (REPO_ROOT / args.out_json) if not args.out_json.is_absolute() else args.out_json
-    out_md_abs = (REPO_ROOT / args.out_md) if not args.out_md.is_absolute() else args.out_md
-    if out_json_abs.resolve() == out_md_abs.resolve():
-        raise ValueError(f"--out-json and --out-md must not resolve to the same file: {out_json_abs.resolve()}")
+    out_json_abs = ((REPO_ROOT / args.out_json) if not args.out_json.is_absolute() else args.out_json).resolve()
+    out_md_abs = ((REPO_ROOT / args.out_md) if not args.out_md.is_absolute() else args.out_md).resolve()
+    if out_json_abs == out_md_abs:
+        raise ValueError(f"--out-json and --out-md must not resolve to the same file: {out_json_abs}")
     try:
-        report_rel = out_md_abs.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+        report_rel = out_md_abs.relative_to(REPO_ROOT.resolve()).as_posix()
     except ValueError as exc:
         raise ValueError(f"--out-md must resolve inside repository root {REPO_ROOT}: {out_md_abs}") from exc
 

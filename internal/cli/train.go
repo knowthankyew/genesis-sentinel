@@ -258,12 +258,18 @@ func runTrainSubmit(args []string, stdout, stderr io.Writer) error {
 			}
 			return fmt.Errorf("save active adapter: %w", actErr)
 		}
-		state := train.ActiveAdapter{
-			JobID:       finalJob.JobID,
-			BaseModel:   finalJob.BaseModel,
-			AdapterPath: finalJob.AdapterPath,
-			DatasetHash: finalJob.DatasetHash,
-			ActivatedAt: slotState.ActivatedAt,
+		var state train.ActiveAdapter
+		if normSlot == train.SlotEscalation {
+			slotCopy := slotState
+			state = train.ActiveAdapter{Escalation: &slotCopy}
+		} else {
+			state = train.ActiveAdapter{
+				JobID:       finalJob.JobID,
+				BaseModel:   finalJob.BaseModel,
+				AdapterPath: finalJob.AdapterPath,
+				DatasetHash: finalJob.DatasetHash,
+				ActivatedAt: slotState.ActivatedAt,
+			}
 		}
 		activatedState = &state
 	}

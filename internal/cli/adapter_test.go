@@ -242,6 +242,16 @@ func TestExecuteTrainSubmitSelectsEscalationModelAndRollbackMirrorsDaemon(t *tes
 	if seenBaseModel != model.ModelGemma22BIT {
 		t.Fatalf("expected escalation training submission to select %s, got %q", model.ModelGemma22BIT, seenBaseModel)
 	}
+	var trainJSON struct {
+		Activated *train.ActiveAdapter `json:"activated"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &trainJSON); err != nil {
+		t.Fatalf("decode train submit --json output: %v", err)
+	}
+	if trainJSON.Activated == nil || trainJSON.Activated.AdapterPath != "" ||
+		trainJSON.Activated.Escalation == nil || trainJSON.Activated.Escalation.AdapterPath != "artifacts/job-esc-9/model_adapters" {
+		t.Fatalf("expected --slot escalation JSON output under Escalation slot rather than flat primary fields ([6]), got %+v", trainJSON.Activated)
+	}
 	loaded, exists, err := train.LoadActiveAdapter(dataDir)
 	if err != nil || !exists || loaded.AdapterPath != "artifacts/existing-primary/model_adapters" ||
 		loaded.Escalation == nil || loaded.Escalation.AdapterPath != "artifacts/job-esc-9/model_adapters" {
@@ -425,5 +435,82 @@ func TestExecuteAdapterRollbackMirrorFailureAndTruncatedResponse(t *testing.T) {
 	after, _, loadErr := train.LoadActiveAdapter(localDir)
 	if loadErr != nil || after.AdapterPath != "artifacts/before-trunc/model_adapters" {
 		t.Fatalf("expected localDir preserved untouched on truncated response, got %+v err=%v", after, loadErr)
+	}
+
+	// 3. Explicit --data-dir primary swap without --verify/--enable & daemon deactivation copy
+	// daemon rollback snapshot rather than leaving empty or stale local snapshot ([2], [4]).
+	localMirrorDir := t.TempDir()
+	if _, err := train.UpdateActiveAdapterSlot(localMirrorDir, train.SlotPrimary, train.AdapterSlot{
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/stale-local/model_adapters",
+	}); err != nil {
+		t.Fatalf("seed localMirrorDir: %v", err)
+	}
+	cfgR6 := config.DefaultConfig()
+	cfgR6.DataDir = "" // diskless daemon forces local manifest mirroring even over loopback
+	cfgR6.TriageMode = "off"
+	ruleEng, _ := rules.NewEngine(rules.DefaultRulePack())
+	pipeR6 := pipeline.New(cfgR6, ruleEng, emit.NopSink{}, "file")
+	srvR6 := httptest.NewServer(newWatchHTTPHandler(pipeR6, "tok-r6"))
+	defer srvR6.Close()
+
+	// Seed daemon runtime history d1 -> d2 without touching localMirrorDir yet.
+	seedMirrorDir := t.TempDir()
+	for _, path := range []string{"artifacts/d1/model_adapters", "artifacts/d2/model_adapters"} {
+		out.Reset()
+		errBuf.Reset()
+		if err := ExecuteWithOutput([]string{
+			"adapter", "swap",
+			"--data-dir", seedMirrorDir,
+			"--slot", "primary",
+			"--adapter-path", path,
+			"--sentinel-http", srvR6.URL,
+			"--auth-token", "tok-r6",
+		}, &out, &errBuf); err != nil {
+			t.Fatalf("seed daemon swap %s failed: %v stderr=%s", path, err, errBuf.String())
+		}
+	}
+
+	// Unverified swap to d3 with explicit --data-dir localMirrorDir must mirror daemon's d2 rollback target ([4]).
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"adapter", "swap",
+		"--data-dir", localMirrorDir,
+		"--slot", "primary",
+		"--adapter-path", "artifacts/d3/model_adapters",
+		"--sentinel-http", srvR6.URL,
+		"--auth-token", "tok-r6",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("adapter swap d3 failed: %v stderr=%s", err, errBuf.String())
+	}
+	mirroredSwap, _, err := train.LoadActiveAdapter(localMirrorDir)
+	if err != nil || mirroredSwap.AdapterPath != "artifacts/d3/model_adapters" ||
+		mirroredSwap.Previous == nil || mirroredSwap.Previous.AdapterPath != "artifacts/d2/model_adapters" {
+		t.Fatalf("expected mirrored swap to carry daemon d2 rollback target, got %+v err=%v", mirroredSwap, err)
+	}
+
+	// Simulate diverged local manifest ("stale-local-2") before deactivate against daemon still at d3 ([2]).
+	if _, err := train.UpdateActiveAdapterSlot(localMirrorDir, train.SlotPrimary, train.AdapterSlot{
+		BaseModel:   model.ModelSmolLM2135MInstruct,
+		AdapterPath: "artifacts/stale-local-2/model_adapters",
+	}); err != nil {
+		t.Fatalf("diverge localMirrorDir: %v", err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if err := ExecuteWithOutput([]string{
+		"adapter", "deactivate",
+		"--data-dir", localMirrorDir,
+		"--slot", "primary",
+		"--sentinel-http", srvR6.URL,
+		"--auth-token", "tok-r6",
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("adapter deactivate with explicit local mirror failed: %v stderr=%s", err, errBuf.String())
+	}
+	mirroredDeact, _, err := train.LoadActiveAdapter(localMirrorDir)
+	if err != nil || mirroredDeact.AdapterPath != "" ||
+		mirroredDeact.Previous == nil || mirroredDeact.Previous.AdapterPath != "artifacts/d3/model_adapters" {
+		t.Fatalf("expected mirrored deactivate to preserve daemon d3 rollback target rather than stale local, got %+v err=%v", mirroredDeact, err)
 	}
 }

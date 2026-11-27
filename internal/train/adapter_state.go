@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,20 +65,24 @@ type AdapterSlot struct {
 // ActiveAdapter records the currently activated local LoRA adapter references for Tier 2
 // (primary SmolLM2 + optional Phase 5 escalation Gemma 2 2B IT) and previous rollback snapshots.
 type ActiveAdapter struct {
-	JobID                   string       `json:"job_id,omitempty"`
-	BaseModel               string       `json:"base_model,omitempty"`
-	AdapterPath             string       `json:"adapter_path,omitempty"`
-	DatasetHash             string       `json:"dataset_hash,omitempty"`
-	ActivatedAt             time.Time    `json:"activated_at,omitempty"`
-	PrimarySeq              uint64       `json:"primary_seq,omitempty"`
-	EscalationSeq           uint64       `json:"escalation_seq,omitempty"`
-	PrimaryMirrorHistory    string       `json:"primary_mirror_history,omitempty"`
-	PrimaryMirrorSeq        uint64       `json:"primary_mirror_seq,omitempty"`
-	EscalationMirrorHistory string       `json:"escalation_mirror_history,omitempty"`
-	EscalationMirrorSeq     uint64       `json:"escalation_mirror_seq,omitempty"`
-	Escalation              *AdapterSlot `json:"escalation,omitempty"`
-	Previous                *AdapterSlot `json:"previous,omitempty"`
-	PreviousEscalation      *AdapterSlot `json:"previous_escalation,omitempty"`
+	JobID                         string       `json:"job_id,omitempty"`
+	BaseModel                     string       `json:"base_model,omitempty"`
+	AdapterPath                   string       `json:"adapter_path,omitempty"`
+	DatasetHash                   string       `json:"dataset_hash,omitempty"`
+	ActivatedAt                   time.Time    `json:"activated_at,omitempty"`
+	PrimarySeq                    uint64       `json:"primary_seq,omitempty"`
+	EscalationSeq                 uint64       `json:"escalation_seq,omitempty"`
+	PrimaryMirrorHistory          string       `json:"primary_mirror_history,omitempty"`
+	PrimaryMirrorSeq              uint64       `json:"primary_mirror_seq,omitempty"`
+	PrimaryMirrorAt               time.Time    `json:"primary_mirror_at,omitempty"`
+	PrimarySupersededHistories    []string     `json:"primary_superseded_histories,omitempty"`
+	EscalationMirrorHistory       string       `json:"escalation_mirror_history,omitempty"`
+	EscalationMirrorSeq           uint64       `json:"escalation_mirror_seq,omitempty"`
+	EscalationMirrorAt            time.Time    `json:"escalation_mirror_at,omitempty"`
+	EscalationSupersededHistories []string     `json:"escalation_superseded_histories,omitempty"`
+	Escalation                    *AdapterSlot `json:"escalation,omitempty"`
+	Previous                      *AdapterSlot `json:"previous,omitempty"`
+	PreviousEscalation            *AdapterSlot `json:"previous_escalation,omitempty"`
 }
 
 // PrimarySlot returns the populated primary AdapterSlot when a primary adapter is active.
@@ -193,7 +198,9 @@ func validateAndNormalizeManifest(state *ActiveAdapter) error {
 
 	if state.AdapterPath == "" && state.Escalation == nil && state.Previous == nil && state.PreviousEscalation == nil &&
 		state.PrimarySeq == 0 && state.EscalationSeq == 0 &&
-		state.PrimaryMirrorSeq == 0 && state.EscalationMirrorSeq == 0 {
+		state.PrimaryMirrorSeq == 0 && state.EscalationMirrorSeq == 0 &&
+		state.PrimaryMirrorAt.IsZero() && state.EscalationMirrorAt.IsZero() &&
+		len(state.PrimarySupersededHistories) == 0 && len(state.EscalationSupersededHistories) == 0 {
 		return fmt.Errorf("adapter_path is required")
 	}
 	return nil
@@ -201,6 +208,12 @@ func validateAndNormalizeManifest(state *ActiveAdapter) error {
 
 func cloneActiveAdapter(state ActiveAdapter) ActiveAdapter {
 	cp := state
+	if len(state.PrimarySupersededHistories) > 0 {
+		cp.PrimarySupersededHistories = append([]string(nil), state.PrimarySupersededHistories...)
+	}
+	if len(state.EscalationSupersededHistories) > 0 {
+		cp.EscalationSupersededHistories = append([]string(nil), state.EscalationSupersededHistories...)
+	}
 	if state.Escalation != nil {
 		esc := *state.Escalation
 		cp.Escalation = &esc
@@ -541,7 +554,9 @@ func DeactivateActiveAdapterSlotWithHash(dataDir, slot string) (ActiveAdapter, [
 		}
 		remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
 			cur.PrimarySeq == 0 && cur.EscalationSeq == 0 &&
-			cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0
+			cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0 &&
+			cur.PrimaryMirrorAt.IsZero() && cur.EscalationMirrorAt.IsZero() &&
+			len(cur.PrimarySupersededHistories) == 0 && len(cur.EscalationSupersededHistories) == 0
 		return remove, true, nil
 	})
 	return updated, hash, changed, hasFile, err
@@ -555,10 +570,115 @@ func DeactivateActiveAdapterSlot(dataDir, slot string) (ActiveAdapter, bool, err
 	return updated, changed, err
 }
 
+const maxSupersededHistories = 8
+
+func parseHistoryEpoch(historyID string) (prefix string, epoch uint64, ok bool) {
+	idx := strings.LastIndex(historyID, "-")
+	if idx <= 0 || idx >= len(historyID)-1 {
+		return "", 0, false
+	}
+	v, err := strconv.ParseUint(historyID[idx+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return historyID[:idx], v, true
+}
+
+func mirrorUpdateAllowed(
+	incomingHistory string,
+	incomingSeq uint64,
+	swappedAt time.Time,
+	curHistory string,
+	curSeq uint64,
+	curMirrorAt time.Time,
+	existingActivatedAt time.Time,
+	superseded []string,
+) bool {
+	if incomingSeq > 0 {
+		if incomingHistory == curHistory {
+			return incomingSeq > curSeq
+		}
+		if curHistory != "" && incomingHistory != "" {
+			if curPref, curEp, ok1 := parseHistoryEpoch(curHistory); ok1 {
+				if incPref, incEp, ok2 := parseHistoryEpoch(incomingHistory); ok2 && curPref == incPref && incEp < curEp {
+					return false
+				}
+			}
+			for _, oldH := range superseded {
+				if oldH == incomingHistory {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	if !swappedAt.IsZero() {
+		if !curMirrorAt.IsZero() && swappedAt.Before(curMirrorAt) {
+			return false
+		}
+		if !existingActivatedAt.IsZero() && swappedAt.Before(existingActivatedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func recordMirrorWatermark(
+	incomingHistory string,
+	incomingSeq uint64,
+	swappedAt time.Time,
+	curHistory *string,
+	curSeq *uint64,
+	curMirrorAt *time.Time,
+	superseded *[]string,
+) {
+	if incomingSeq > 0 {
+		if *curHistory != "" && *curHistory != incomingHistory {
+			already := false
+			for _, h := range *superseded {
+				if h == *curHistory {
+					already = true
+					break
+				}
+			}
+			if !already {
+				*superseded = append(*superseded, *curHistory)
+				if len(*superseded) > maxSupersededHistories {
+					*superseded = append([]string(nil), (*superseded)[len(*superseded)-maxSupersededHistories:]...)
+				}
+			}
+		}
+		*curHistory = incomingHistory
+		*curSeq = incomingSeq
+	}
+	if !swappedAt.IsZero() {
+		*curMirrorAt = swappedAt
+	}
+}
+
+func resolveDaemonPreviousSlot(slotState *SlotStatus, fallbackModel string, swappedAt time.Time) *AdapterSlot {
+	if slotState == nil || strings.TrimSpace(slotState.PreviousAdapterPath) == "" {
+		return nil
+	}
+	prev := AdapterSlot{
+		BaseModel:   strings.TrimSpace(slotState.PreviousBaseModel),
+		AdapterPath: strings.TrimSpace(slotState.PreviousAdapterPath),
+		ActivatedAt: swappedAt,
+	}
+	if prev.BaseModel == "" {
+		prev.BaseModel = strings.TrimSpace(fallbackModel)
+	}
+	if validateAdapterSlotStruct(&prev) != nil {
+		return nil
+	}
+	return &prev
+}
+
 // MirrorDaemonSlotToManifest synchronizes the local manifest's active slot to match a daemon's
 // authoritative AdapterStatusResponse after a remote or separate-directory operation.
-// Uses per-slot operation sequences (`OpSeq`) so rollbacks to older adapters are applied cleanly
-// while delayed activations and deactivations arrive out of order without regressing state.
+// Uses per-slot operation sequences (`OpSeq`), daemon history epochs (`HistoryID`), and
+// timestamp barriers so rollbacks are applied cleanly while superseded histories or delayed
+// out-of-order activations and deactivations cannot regress local state.
 func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fallbackModel, fallbackAdapter, fallbackJob string) (ActiveAdapter, error) {
 	normSlot, err := NormalizeSlot(slot, false)
 	if err != nil {
@@ -583,40 +703,51 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 		incomingSeq = slotState.OpSeq
 		incomingHistory = strings.TrimSpace(slotState.HistoryID)
 	}
+	daemonPrev := resolveDaemonPreviousSlot(slotState, bm, swappedAt)
 	if ap == "" {
 		updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, _ bool) (bool, bool, error) {
 			if normSlot == SlotEscalation {
-				if incomingSeq > 0 && incomingHistory == cur.EscalationMirrorHistory && incomingSeq <= cur.EscalationMirrorSeq {
+				var existingAT time.Time
+				if cur.Escalation != nil {
+					existingAT = cur.Escalation.ActivatedAt
+				}
+				if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.EscalationMirrorHistory, cur.EscalationMirrorSeq, cur.EscalationMirrorAt, existingAT, cur.EscalationSupersededHistories) {
 					return false, false, nil
 				}
-				if cur.Escalation != nil {
+				if daemonPrev != nil {
+					prevCopy := *daemonPrev
+					cur.PreviousEscalation = &prevCopy
+				} else if cur.Escalation != nil {
 					prevCopy := *cur.Escalation
 					cur.PreviousEscalation = &prevCopy
-					cur.Escalation = nil
 				}
-				if incomingSeq > 0 {
-					cur.EscalationMirrorHistory = incomingHistory
-					cur.EscalationMirrorSeq = incomingSeq
-				}
+				cur.Escalation = nil
+				recordMirrorWatermark(incomingHistory, incomingSeq, swappedAt, &cur.EscalationMirrorHistory, &cur.EscalationMirrorSeq, &cur.EscalationMirrorAt, &cur.EscalationSupersededHistories)
 				cur.EscalationSeq++
 			} else {
-				if incomingSeq > 0 && incomingHistory == cur.PrimaryMirrorHistory && incomingSeq <= cur.PrimaryMirrorSeq {
+				var existingAT time.Time
+				if prev, ok := cur.PrimarySlot(); ok {
+					existingAT = prev.ActivatedAt
+				}
+				if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.PrimaryMirrorHistory, cur.PrimaryMirrorSeq, cur.PrimaryMirrorAt, existingAT, cur.PrimarySupersededHistories) {
 					return false, false, nil
 				}
-				if prev, ok := cur.PrimarySlot(); ok {
+				if daemonPrev != nil {
+					prevCopy := *daemonPrev
+					cur.Previous = &prevCopy
+				} else if prev, ok := cur.PrimarySlot(); ok {
 					prevCopy := prev
 					cur.Previous = &prevCopy
-					cur.ClearPrimarySlot()
 				}
-				if incomingSeq > 0 {
-					cur.PrimaryMirrorHistory = incomingHistory
-					cur.PrimaryMirrorSeq = incomingSeq
-				}
+				cur.ClearPrimarySlot()
+				recordMirrorWatermark(incomingHistory, incomingSeq, swappedAt, &cur.PrimaryMirrorHistory, &cur.PrimaryMirrorSeq, &cur.PrimaryMirrorAt, &cur.PrimarySupersededHistories)
 				cur.PrimarySeq++
 			}
 			remove := cur.AdapterPath == "" && cur.Escalation == nil && cur.Previous == nil && cur.PreviousEscalation == nil &&
 				cur.PrimarySeq == 0 && cur.EscalationSeq == 0 &&
-				cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0
+				cur.PrimaryMirrorSeq == 0 && cur.EscalationMirrorSeq == 0 &&
+				cur.PrimaryMirrorAt.IsZero() && cur.EscalationMirrorAt.IsZero() &&
+				len(cur.PrimarySupersededHistories) == 0 && len(cur.EscalationSupersededHistories) == 0
 			return remove, true, nil
 		})
 		return updated, err
@@ -638,40 +769,40 @@ func MirrorDaemonSlotToManifest(dataDir, slot string, slotState *SlotStatus, fal
 	updated, _, _, err := mutateActiveAdapterUnlocked(dataDir, func(cur *ActiveAdapter, exists bool) (bool, bool, error) {
 		switch normSlot {
 		case SlotPrimary:
-			if incomingSeq > 0 {
-				if incomingHistory == cur.PrimaryMirrorHistory && incomingSeq <= cur.PrimaryMirrorSeq {
-					return false, false, nil
-				}
-			} else if existing, ok := cur.PrimarySlot(); ok && !existing.ActivatedAt.IsZero() && next.ActivatedAt.Before(existing.ActivatedAt) {
+			var existingAT time.Time
+			if existing, ok := cur.PrimarySlot(); ok {
+				existingAT = existing.ActivatedAt
+			}
+			if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.PrimaryMirrorHistory, cur.PrimaryMirrorSeq, cur.PrimaryMirrorAt, existingAT, cur.PrimarySupersededHistories) {
 				return false, false, nil
 			}
-			if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
+			if daemonPrev != nil {
+				prevCopy := *daemonPrev
+				cur.Previous = &prevCopy
+			} else if prev, ok := cur.PrimarySlot(); ok && !rollbackSlotsMatch(prev, next) {
 				prevCopy := prev
 				cur.Previous = &prevCopy
 			}
-			if incomingSeq > 0 {
-				cur.PrimaryMirrorHistory = incomingHistory
-				cur.PrimaryMirrorSeq = incomingSeq
-			}
+			recordMirrorWatermark(incomingHistory, incomingSeq, swappedAt, &cur.PrimaryMirrorHistory, &cur.PrimaryMirrorSeq, &cur.PrimaryMirrorAt, &cur.PrimarySupersededHistories)
 			cur.PrimarySeq++
 			next.OpSeq = cur.PrimarySeq
 			cur.SetPrimarySlot(next)
 		case SlotEscalation:
-			if incomingSeq > 0 {
-				if incomingHistory == cur.EscalationMirrorHistory && incomingSeq <= cur.EscalationMirrorSeq {
-					return false, false, nil
-				}
-			} else if cur.Escalation != nil && !cur.Escalation.ActivatedAt.IsZero() && next.ActivatedAt.Before(cur.Escalation.ActivatedAt) {
+			var existingAT time.Time
+			if cur.Escalation != nil {
+				existingAT = cur.Escalation.ActivatedAt
+			}
+			if !mirrorUpdateAllowed(incomingHistory, incomingSeq, swappedAt, cur.EscalationMirrorHistory, cur.EscalationMirrorSeq, cur.EscalationMirrorAt, existingAT, cur.EscalationSupersededHistories) {
 				return false, false, nil
 			}
-			if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
+			if daemonPrev != nil {
+				prevCopy := *daemonPrev
+				cur.PreviousEscalation = &prevCopy
+			} else if cur.Escalation != nil && !rollbackSlotsMatch(*cur.Escalation, next) {
 				prevCopy := *cur.Escalation
 				cur.PreviousEscalation = &prevCopy
 			}
-			if incomingSeq > 0 {
-				cur.EscalationMirrorHistory = incomingHistory
-				cur.EscalationMirrorSeq = incomingSeq
-			}
+			recordMirrorWatermark(incomingHistory, incomingSeq, swappedAt, &cur.EscalationMirrorHistory, &cur.EscalationMirrorSeq, &cur.EscalationMirrorAt, &cur.EscalationSupersededHistories)
 			cur.EscalationSeq++
 			next.OpSeq = cur.EscalationSeq
 			nextCopy := next
