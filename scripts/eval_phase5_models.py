@@ -1269,7 +1269,8 @@ def _atomic_publish_pair(path_a: Path, content_a: str, path_b: Path, content_b: 
     """Serialize paired report replacement and roll back the first swap if the second fails ([22], [27])."""
     path_a.parent.mkdir(parents=True, exist_ok=True)
     path_b.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path_a.parent / ".phase5_report_publish.lock"
+    lock_key = hashlib.sha256(f"{path_a.resolve()}|{path_b.resolve()}".encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"sentinel-publish-{lock_key}.lock"
     tmp_a = path_a.parent / f".{path_a.name}.{os.getpid()}.tmp"
     tmp_b = path_b.parent / f".{path_b.name}.{os.getpid()}.tmp"
     bak_a = path_a.parent / f".{path_a.name}.{os.getpid()}.bak"

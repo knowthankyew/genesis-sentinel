@@ -1,6 +1,6 @@
 <!-- diagram-meta
 last-validated: 2026-11-26
-validated-commit: 67706a9
+validated-commit: d34e661
 covers: [cmd/, internal/]
 -->
 
@@ -93,8 +93,8 @@ flowchart TD
 9. **Phase 5 Gemma 2 2B IT Escalation, Multi-Window Correlation & Live Dual-Slot Hot-Swap (`internal/pipeline/adapter_hotswap.go`, `internal/train/adapter_state.go`, `internal/cli/adapter.go`, `scripts/eval_phase5_models.py`):**
    - Adds optional second-stage reasoning escalation (`escalation_mode=http` targeting loopback `:8001` with <!-- claim:phase5_base_model -->`google/gemma-2-2b-it`<!-- /claim -->) governed by configurable policies (`high_critical`, `strict`, `always`) so routine Tier 2 traffic stays on `SmolLM2-Instruct` while `HIGH`/`CRITICAL`, injection-flagged, `NEEDS-REVIEW`, low-confidence, primary-fallback, or multi-window correlated alerts escalate on demand without blocking Tier 0/1 alert emission.
    - Maintains a bounded per-service multi-window correlator (`serviceCorrelator`, 600s TTL, capped at 64 services and 4 windows per service, wiped atomically by `sentinel burn`) that attaches sanitized prior window context (`CorrelatedWindows` -> `correlated=` inside `BEGIN_UNTRUSTED_LOG_TELEMETRY`) while preserving higher Tier 0/1 severity floors and allowing Gemma escalation to refine or suppress primary-tier false positives.
-   - Extends `active-adapter.json` (`UpdateActiveAdapterSlot`, `RollbackActiveAdapterSlot`, `DeactivateActiveAdapterSlot`) and `/adapter` (`GET` inspection + swap history, `POST` with `slot`, `action`, preflight `/healthz` model check `verify`, and dynamic client creation `enable`, `DELETE` deactivation back to base-only) alongside periodic automatic disk reload (`auto_reload_adapter`, `SyncActiveAdapterFromDisk`) and the `sentinel adapter` CLI (`status`, `swap`, `rollback`, `deactivate`, `history`).
-   - Adds `scripts/eval_phase5_models.py` for isolated offline fine-tuning and side-by-side comparison of `SmolLM2-135M-Instruct` vs `google/gemma-2-2b-it` LoRA adapters (`docs/benchmarks/phase5_gemma_comparison.json`), checked mathematically by `independent_recompute_phase5_comparison`.
+   - Extends `active-adapter.json` (`UpdateActiveAdapterSlotWithHash`, `RollbackActiveAdapterSlotExpected`, `DeactivateActiveAdapterSlotWithHash`, monotonic per-slot `OpSeq` mirror ordering via `MirrorDaemonSlotToManifest`) and `/adapter` (`GET` inspection + bounded wire status + swap history, `POST` with `slot`, `action`, preflight `/healthz` model check `verify`, and dynamic client creation `enable`, `DELETE` deactivation restoring configured base-only models via `ResetAdapterToBase`) alongside CLI-pin-preserving automatic disk reload (`auto_reload_adapter`, `ConfigureAdapterSyncPolicy`, `SetExplicitBaseModels`, `SyncActiveAdapterFromDisk`) and the `sentinel adapter` CLI (`status`, `swap`, `rollback`, `deactivate`, `history`).
+   - Adds `scripts/eval_phase5_models.py` for isolated offline fine-tuning and side-by-side comparison of `SmolLM2-135M-Instruct` vs `google/gemma-2-2b-it` LoRA adapters (`docs/benchmarks/phase5_gemma_comparison.json`), checked mathematically and structurally by `independent_recompute_phase5_comparison`.
 
 ---
 
