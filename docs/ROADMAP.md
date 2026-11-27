@@ -5,8 +5,8 @@
 > **Active Base Model Tier**: **SmolLM2-Instruct** (`HuggingFaceTB/SmolLM2-135M-Instruct` default; `SmolLM2-360M-Instruct` step-up)  
 > **Phase 5 Reasoning Tier**: **Gemma 2 2B IT** (`google/gemma-2-2b-it`)  
 > **Explicitly Excluded**: **BitNet b1.58** (experimental; deferred pending upstream development cycle)  
-> **Status**: 🟢 **PHASES 0–5 COMPLETE** (SmolLM2-135M + Gemma 2 2B IT Hybrid Escalation & Hot-Swap)  
-> **Date**: 2026-11-26
+> **Status**: 🟢 **PHASES 0–5 COMPLETE** (SmolLM2-135M + Gemma 2 2B IT Hybrid Escalation & Hot-Swap) &bull; 🧭 **PHASES 6–7 PLANNED** (Real-World Corpus Hardening → Developer & Power-User Legibility)  
+> **Date**: 2026-11-27
 
 ---
 
@@ -39,6 +39,8 @@ flowchart LR
 | **Phase 3** | **Tier 2 SmolLM2 Triage & FTaaS Loop** | Curated log triage dataset generator (synthetic + redacted local baselines), `internal/triage` loopback LoRA client & fail-closed parser, `sentinel feedback` & `sentinel train`, `POST /adapter` live hot-swap (plus companion updates in `ml`) | **SmolLM2-135M-Instruct** (`360M-Instruct` step-up) | 🟢 **Completed** |
 | **Phase 4** | **Hardening, Benchmarks & Ops** | Hostile-log prompt-injection test harness, live replay benchmark (`cmd/sentinel-bench`), empirical metrics & claims audit (`scripts/audit-claims.py`), `launchd`/`systemd`/Compose units, offline `all-MiniLM-L6-v2` comparison | SmolLM2 | 🟢 **Completed** |
 | **Phase 5** | **Gemma 2 2B IT Upgrade** | High-capacity reasoning adapter training on `google/gemma-2-2b-it`, tiered Smol-to-Gemma escalation for high-severity incidents, side-by-side quality vs. latency benchmark report, live dual-slot hot-swap | **Gemma 2 2B IT** | 🟢 **Completed** |
+| **Phase 6** | **Real-World Corpus Hardening & Quantized Tier 2** | Messy public log corpus benchmarks (LogHub + live macOS Unified Logs), Drain/Laplace-LK field tuning, explicit `reasoning_deferred` backpressure & "Never Output 'All Clear'" summaries, quantized loopback Tier 2 adapter (GGUF / MLX) | **Quantized Gemma 2 2B IT / SmolLM2** | 🧭 **Planned** |
+| **Phase 7** | **Developer & Power-User Legibility** | Embedded zero-CDN `sentinel ui` briefing surface (Proof-of-Work receipt, ranked narrative threads, 1-click `TP`/`FP` feedback), forkable JSON starter "lenses" (`macos-workstation`, `docker-dev`, `homelab-ssh`), redacted incident export (`sentinel export`) | **SmolLM2 + Quantized Gemma 2B** | 🧭 **Planned** |
 
 ---
 
@@ -127,11 +129,44 @@ flowchart LR
 
 ---
 
+### Phase 6: Real-World Corpus Hardening, Backpressure Honesty & Quantized Local Tier 2 (`v0.7.0-phase6` — Planned)
+- **Goal**: Move Sentinel from clean synthetic validation to ugly real-world host and service telemetry, eliminate the ~11 GB / 22s CPU `float32` bottleneck for Gemma 2B escalation on developer laptops, and make degraded/saturated states unmistakably transparent.
+- **Target Audience Alignment**: Typical developers and technically literate power users running local services, containers, or homelab hosts who need signal clarity without standing up a cloud SIEM.
+- **Deliverables**:
+  - **Real-World Messy Corpus Evaluation Suite (`scripts/eval_real_corpora.py` + `cmd/sentinel-bench` corpus mode):** Add reproducible evaluation adapters for public non-synthetic log datasets (e.g., LogHub `OpenSSH`, `Apache`, `Linux`/`BGL`) alongside captured local macOS Unified Log streams (`log stream` piped via Genesis). Commit honest real-world precision, recall, F1, collapse ratio, and false-positive rate side-by-side next to the Track A synthetic benchmarks.
+  - **Drain & Laplace-LK Field Tuning:** Harden template collapsing and surprisal scoring against real-world noise discovered by the corpus suite (multi-line stack traces, high-cardinality container/request IDs, noisy daemon restarts, benign deployment churn) while preserving pure-Go zero-dependency bounds.
+  - **Explicit Backpressure & "Never Output 'All Clear'" Posture:** Surface structured `"reasoning_deferred"` / queue-pressure state fields whenever Tier 2 is saturated, offline, or bypassed, and standardize summary outputs to never claim *"All Clear"* or *"Safe"*—instead reporting exact coverage (*lines scanned, rules evaluated, baseline size, anomalies flagged, escalations deferred*).
+  - **Quantized Local Tier 2 Runtime Option (GGUF / MLX Loopback Backend):** Support talking over the existing loopback-only HTTP boundary to a local quantized inference runtime (`llama-server` GGUF or Apple Silicon MLX serving Q4/Q8 `google/gemma-2-2b-it` / `SmolLM2-Instruct`), paired with an empirical benchmark comparing latency, peak RSS, and holdout triage accuracy against Phase 5 CPU `float32` baselines.
+- **Exit Gate**:
+  - Committed non-synthetic corpus benchmark report in `docs/benchmarks/` with measured precision/recall/F1 and collapse ratio (no synthetic-only claims).
+  - Measured quantized vs. CPU `float32` Gemma 2B comparison documenting RAM and latency reduction alongside holdout accuracy retention.
+  - Explicit `reasoning_deferred` coverage tested under simulated Tier 2 saturation and outage; `make test`, `make race`, and `make audit` pass cleanly.
+
+---
+
+### Phase 7: Developer & Technically Literate Power-User Legibility (`v0.8.0-phase7` — Planned)
+- **Goal**: Make Sentinel's tiered funnel immediately legible and low-friction for daily local operation—turning abstract high-volume log streams into inspectable human-scale evidence without sacrificing local-first simplicity or zero external Go dependencies.
+- **Deliverables**:
+  - **Embedded Zero-CDN Briefing UI (`sentinel ui` via `//go:embed`):** Loopback-only, single-binary HTML/CSS/vanilla JS briefing surface (enforced zero external URLs matching Genesis's `TestUI_ZeroExternalEgress`) focused on clarity rather than chart dashboards:
+    - **Proof-of-Work Receipt:** Always-visible header summarizing ingested volume, template collapse ratio, rolling baseline coverage, dropped count (`0` in `.seg` mode), and Tier 2 / escalation status.
+    - **Ranked Narrative Threads:** Groups `serviceCorrelator` alerts into readable causal timelines (*"rare template X appeared → N minutes later services A & B shifted"*) with one-click drill-down into collapsed templates, Laplace-LK surprisal breakdown in nats, rule hits, and Tier 2 explanations.
+    - **One-Click Human-in-the-Loop Feedback:** Direct `TP` / `FP` / class-relabel controls backed by the existing redacted feedback queue (`internal/feedback/`), removing manual alert-ID copy/paste friction from the adaptive loop.
+  - **Forkable, Auditable Starter "Lenses" (`lenses/`):** Versioned, plain-JSON rule + baseline-hint presets for common developer and power-user environments (`macos-workstation`, `docker-dev`, `homelab-ssh`) that operators can inspect, diff, fork, or disable with zero black-box behavior.
+  - **Redacted Incident Export (`sentinel export`):** Produces a deterministic, PII-scrubbed incident JSON package (collapsed templates, surprisal scores, correlation thread, verdicts, and redaction receipt—never raw untrusted log lines) designed to plug cleanly into a future portfolio-wide offline-verifiable evidence/incident bundle specification (`knowthankyew:bundle:v1`).
+- **Exit Gate**:
+  - `sentinel ui` passes static zero-CDN / zero-external-egress and loopback-bind tests with zero external Go dependencies added to `go.mod`.
+  - All starter lenses validate against strict RE2 compilation and anti-ReDoS/literal-prefilter checks.
+  - `sentinel export` passes automated PII/secret leak negative-control tests; `make test`, `make race`, and `make audit` pass cleanly.
+
+---
+
 ## 4. Explicitly Excluded & Deferred Items
 
-- **BitNet b1.58 (`microsoft/BitNet-b1.58-2B-4T` & `bitnet-embedding-270m`)**: Explicitly excluded from Phases 0–5 (and rejected fail-closed by `internal/model.ValidateBaseModel`). BitNet remains an experimental research track in `ml` awaiting an upstream development cycle to resolve generation context caps (`MAX_SAFE_GENERATE_TOKENS = 16`), native GGUF LoRA adapter conversion/serving, and `float32` MPS training bottlenecks. Re-evaluation requires a future ADR after upstream updates land.
+- **BitNet b1.58 (`microsoft/BitNet-b1.58-2B-4T` & `bitnet-embedding-270m`)**: Explicitly excluded from Phases 0–7 (and rejected fail-closed by `internal/model.ValidateBaseModel`). BitNet remains an experimental research track in `ml` awaiting an upstream development cycle to resolve generation context caps (`MAX_SAFE_GENERATE_TOKENS = 16`), native GGUF LoRA adapter conversion/serving, and `float32` MPS training bottlenecks. Re-evaluation requires a future ADR after upstream updates land.
 - **Autonomous Destructive Response (Firewall Blocking / Process Killing)**: Out of scope. Because logs are untrusted attacker-influenced input, Sentinel operates strictly in **alert, classify, and explain** mode to prevent denial-of-service via spoofed log lines or prompt injection.
-- **Cloud / External API Egress**: Out of scope by default. All ingestion, surprisal scoring, FTaaS training, and inference run over loopback (`127.0.0.1`).
+- **Black-Box Natural-Language-to-LoRA Intent Tuning**: Out of scope. Operator-defined "interesting" criteria should remain explicit, inspectable, reversible JSON rules or lens definitions—not opaque weight updates trained from one-line prose descriptions. FTaaS LoRA fine-tuning remains reserved for accumulated, redacted `TP`/`FP` feedback datasets.
+- **Personal Activity Journal / Broad Lifestyle Surveillance Telemetry**: Out of scope. Sentinel intentionally stays scoped to technical host and service telemetry with crisp `sentinel burn` semantics rather than accumulating a persistent journal of personal user activity.
+- **Cloud / External API Egress**: Out of scope by default. All ingestion, surprisal scoring, FTaaS training, inference, and `sentinel ui` serving run over loopback (`127.0.0.1`).
 
 ---
 
